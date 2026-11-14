@@ -1,0 +1,7 @@
+/target/
+/local/
+*.pdb
+*.gs
+*.gs.xz
+*.gs.zst
+*.p2s

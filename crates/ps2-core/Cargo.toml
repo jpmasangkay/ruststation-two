@@ -1,0 +1,13 @@
+[package]
+name = "ps2-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bitflags.workspace = true
+bytemuck.workspace = true
+ps2-common = { path = "../ps2-common" }
+thiserror.workspace = true
+tracing.workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "ps2-autotest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+clap.workspace = true
+ps2-common = { path = "../ps2-common" }
+ps2-core = { path = "../ps2-core" }
+similar.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
