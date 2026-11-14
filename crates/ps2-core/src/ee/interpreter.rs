@@ -55,11 +55,18 @@ pub enum HleStepResult {
 
 /// Control-flow outcome of a single R5900 instruction execution.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum StepOutcome {
+pub(super) enum StepOutcome {
     /// Normal sequential instruction (`PC = NPC`, `NPC = NPC + 4`, `in_delay_slot = false`).
     Normal,
     /// Unconditional jump or taken conditional branch (`PC = NPC`, `NPC = target`, `in_delay_slot = true`).
     BranchTaken(u32),
+    /// Taken non-likely COP1 branch (`BC1F` / `BC1T`): chains through delay-slot branches
+    /// (`PC = instr_pc + 4`, `NPC = target`, `in_delay_slot = true`).
+    ///
+    /// Reference: `ps2autotests` (`local/ps2autotests/tests/cpu/ee_fpu/branchdelay.cpp` & `branchdelay.expected` line 2).
+    /// TODO(verify): Confirm whether real hardware reaches `target4` due to non-likely `BC1F`/`BC1T`
+    /// delay-slot chaining or a 2-instruction `C.<cond>.S -> BC1` condition-bit pipeline hazard.
+    Cop1BranchTaken(u32),
     /// Non-taken normal conditional branch (`PC = NPC`, `NPC = NPC + 4`, `in_delay_slot = true`).
     BranchNotTaken,
     /// Non-taken Branch Likely (`PC = NPC + 4`, `NPC = NPC + 8`, `in_delay_slot = false`, nullifying the delay slot).
@@ -107,7 +114,8 @@ impl EeCpuState {
             }
             StepOutcome::BranchTaken(target) => {
                 if was_in_delay_slot {
-                    // Branch inside a branch delay slot (`ps2autotests` `tests/cpu/ee/branchdelay.cpp` `test_beq`):
+                    // Branch inside a branch delay slot (`ps2autotests` `tests/cpu/ee/branchdelay.cpp` `test_beq`
+                    // and `tests/cpu/ee_fpu/branchdelay.cpp` `test_bc1tl`):
                     // overwrites the pending branch target and jumps to `target` immediately after this delay slot.
                     self.pc = target;
                     self.next_pc = target.wrapping_add(4);
@@ -117,6 +125,11 @@ impl EeCpuState {
                     self.next_pc = target;
                     self.in_delay_slot = true;
                 }
+            }
+            StepOutcome::Cop1BranchTaken(target) => {
+                self.pc = instr_pc.wrapping_add(4);
+                self.next_pc = target;
+                self.in_delay_slot = true;
             }
             StepOutcome::BranchNotTaken => {
                 self.pc = default_after;
@@ -198,31 +211,14 @@ impl EeCpuState {
             return HleStepResult::Continue;
         }
 
-        // Detect deferred Task 4 instruction categories (`MMI`, `COP1`, `COP2`) explicitly
-        // before `step` raises a generic ReservedInstruction exception.
-        match opcode {
-            0x1C => {
-                return HleStepResult::UnimplementedInstruction {
-                    pc: instr_pc,
-                    instr,
-                    category: "MMI (Task 4)",
-                };
-            }
-            0x11 | 0x31 | 0x39 => {
-                return HleStepResult::UnimplementedInstruction {
-                    pc: instr_pc,
-                    instr,
-                    category: "COP1 / FPU (Task 4)",
-                };
-            }
-            0x12 | 0x32 | 0x3A => {
-                return HleStepResult::UnimplementedInstruction {
-                    pc: instr_pc,
-                    instr,
-                    category: "COP2 / VU0 Macro (Task 4)",
-                };
-            }
-            _ => {}
+        // Detect out-of-scope COP2 / VU0 Macro instructions (`0x12`, `LWC2 = 0x32`, `SWC2 = 0x3A`)
+        // explicitly before `step` raises a generic ReservedInstruction exception.
+        if matches!(opcode, 0x12 | 0x32 | 0x3A) {
+            return HleStepResult::UnimplementedInstruction {
+                pc: instr_pc,
+                instr,
+                category: "COP2 / VU0 Macro (Out of Phase 1 Scope)",
+            };
         }
 
         self.step(bus);
@@ -370,6 +366,9 @@ impl EeCpuState {
             // COP0 (0x10)
             0x10 => self.execute_cop0(instr, instr_pc, rs, rt, rd, funct, simm16, bus),
 
+            // COP1 (0x11)
+            0x11 => self.execute_cop1(instr, instr_pc, simm16),
+
             // BEQL (0x14)
             0x14 => {
                 if self.gpr_u64(rs) == self.gpr_u64(rt) {
@@ -454,6 +453,9 @@ impl EeCpuState {
                 self.set_gpr_u64(rt, merged);
                 StepOutcome::Normal
             }
+
+            // MMI (0x1C)
+            0x1C => self.execute_mmi(instr, instr_pc, rs, rt, rd, shamt, funct),
 
             // LQ (0x1E)
             0x1E => {
@@ -671,6 +673,9 @@ impl EeCpuState {
                 StepOutcome::Normal
             }
 
+            // LWC1 (0x31)
+            0x31 => self.execute_lwc1(rs, rt, simm16, bus),
+
             // LD (0x37)
             0x37 => {
                 let vaddr = self.gpr_u32(rs).wrapping_add(simm16 as u32);
@@ -682,6 +687,9 @@ impl EeCpuState {
                 self.set_gpr_u64(rt, val);
                 StepOutcome::Normal
             }
+
+            // SWC1 (0x39)
+            0x39 => self.execute_swc1(rs, rt, simm16, bus),
 
             // SD (0x3F)
             0x3F => {
@@ -994,7 +1002,8 @@ impl EeCpuState {
             }
 
             // MFSA (0x28)
-            // TODO(verify): Confirm whether MFSA/MTSA expose `SA` in bytes (`0..=15`) or bits (`0..=120`) on hardware.
+            // Reference: `ps2autotests` (`local/ps2autotests/tests/cpu/ee_simd/funnel.expected` lines 16..23):
+            // `MFSA` and `MTSA` expose `SA` as a 4-bit byte shift count (`0..=15`).
             0x28 => {
                 self.set_gpr_u64(rd, u64::from(self.sa & 0xF));
                 StepOutcome::Normal
@@ -1322,7 +1331,8 @@ impl EeCpuState {
             }
 
             // MTSAB (0x18)
-            // TODO(verify): Confirm MTSAB/MTSAH SA unit (bytes vs bits) against hardware/Play!.
+            // Reference: `ps2autotests` (`local/ps2autotests/tests/cpu/ee_simd/funnel.expected` lines 2..14):
+            // `MTSAB` sets `SA = (rs ^ imm) & 0xF` (bytes), `MTSAH` sets `SA = ((rs ^ imm) & 0x7) << 1` (bytes).
             0x18 => {
                 self.sa = (self.gpr_u32(rs) ^ (simm16 as u32)) & 0xF;
                 StepOutcome::Normal
@@ -1510,7 +1520,7 @@ impl EeCpuState {
 }
 
 #[inline(always)]
-const fn branch_target(instr_pc: u32, simm16: i32) -> u32 {
+pub(super) const fn branch_target(instr_pc: u32, simm16: i32) -> u32 {
     instr_pc
         .wrapping_add(4)
         .wrapping_add((simm16 as u32).wrapping_shl(2))

@@ -30,7 +30,7 @@ struct Args {
     bios: PathBuf,
 
     /// Maximum EE cycles to execute per test before timing out.
-    #[arg(long, default_value_t = 5_000_000)]
+    #[arg(long, default_value_t = 50_000_000)]
     max_cycles: u64,
 }
 
@@ -316,28 +316,28 @@ mod tests {
     }
 
     #[test]
-    fn runner_reports_unimplemented_mmi_and_cop1_instructions() {
-        // Immediate COP1 SWC1 instruction (`0xE7AC_0028` = `swc1 $f12, 40($sp)`) at entry point
-        let elf_cop1 = build_synthetic_mips_elf(0x0010_0000, &[0xE7AC_0028], &[]);
-        let rep_cop1 = run_elf_bytes(&elf_cop1, 100).expect("ELF should load");
-        assert_eq!(
-            rep_cop1.stop_reason,
-            RunStopReason::UnimplementedInstruction {
-                pc: 0x0010_0000,
-                instr: 0xE7AC_0028,
-                category: "COP1 / FPU (Task 4)",
-            }
-        );
+    fn runner_executes_mmi_cop1_and_reports_out_of_scope_cop2() {
+        // MMI POR (`0x7010_94A9`), COP1 MTC1 (`0x4480_0000`), followed by Exit(0)
+        let code = [
+            0x7010_94A9, // por $s2, $zero, $s0
+            0x4480_0000, // mtc1 $zero, $f0
+            0x2404_0000, // addiu $a0, $zero, 0
+            0x2403_0004, // addiu $v1, $zero, 0x04 (Exit)
+            0x0000_000C, // syscall
+        ];
+        let elf_ok = build_synthetic_mips_elf(0x0010_0000, &code, &[]);
+        let rep_ok = run_elf_bytes(&elf_ok, 100).expect("ELF should load");
+        assert_eq!(rep_ok.stop_reason, RunStopReason::Exited(0));
 
-        // Immediate MMI POR instruction (`0x7010_94A9`) at entry point
-        let elf_mmi = build_synthetic_mips_elf(0x0010_0000, &[0x7010_94A9], &[]);
-        let rep_mmi = run_elf_bytes(&elf_mmi, 100).expect("ELF should load");
+        // Immediate COP2 / VU0 Macro instruction (`0x4A00_0000`) at entry point
+        let elf_cop2 = build_synthetic_mips_elf(0x0010_0000, &[0x4A00_0000], &[]);
+        let rep_cop2 = run_elf_bytes(&elf_cop2, 100).expect("ELF should load");
         assert_eq!(
-            rep_mmi.stop_reason,
+            rep_cop2.stop_reason,
             RunStopReason::UnimplementedInstruction {
                 pc: 0x0010_0000,
-                instr: 0x7010_94A9,
-                category: "MMI (Task 4)",
+                instr: 0x4A00_0000,
+                category: "COP2 / VU0 Macro (Out of Phase 1 Scope)",
             }
         );
     }

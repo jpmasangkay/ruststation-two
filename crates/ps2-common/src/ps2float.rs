@@ -217,7 +217,10 @@ pub fn mul(a: u32, b: u32) -> Ps2FloatResult {
     let sig2 = 0x80_0000u64 | u64::from(b & 0x7F_FFFF);
 
     // 24-bit * 24-bit = 48-bit product. Leading 1 is at bit 47 (carry = 1) or bit 46 (carry = 0).
-    let prod = sig1 * sig2;
+    // On R5900 hardware (`ps2autotests` `tests/cpu/ee_fpu/muldiv.expected` lines 87, 95, 96, 311,
+    // 316, 317), the Radix-4 Booth multiplier omits the +1 two's-complement hot-one of the lowest
+    // Booth group when `sig2[1:0]` encodes a negative Booth digit (`(sig2 & 3) >= 2`).
+    let prod = (sig1 * sig2).wrapping_sub(u64::from((sig2 & 3) >= 2));
     let carry = ((prod >> 47) & 1) as i32;
     let res_exp = e1 + e2 - 127 + carry;
 
@@ -235,21 +238,36 @@ pub fn mul(a: u32, b: u32) -> Ps2FloatResult {
     )
 }
 
-/// PS2 `MADD.S` / `MADDA.S`: two-stage multiply-accumulate (`acc + (s * t)`).
+/// PS2 `MADD.S` / `MADDA.S`: multiply-accumulate (`acc + (s * t)`).
 ///
-/// Reference: `ps2tek` ("EE FPU -> MADD.S"): multiplies `s * t` using PS2 intermediate saturation
-/// and adds the result to `acc`.
+/// Reference: `ps2tek` ("EE FPU -> MADD.S") & `ps2autotests` (`local/ps2autotests/tests/cpu/ee_fpu/muldiv.expected`
+/// lines 57, 60, 63, 118, 121, 124):
+/// - If `s * t` overflows exponent `0xFF`, the MAC operation immediately saturates to `prod.bits`
+///   (`±0x7FFF_FFFF` with the sign of `s * t`) and sets `O | SO`.
+/// - Otherwise, adds the truncated product `prod.bits` to `acc`.
 pub fn madd(acc: u32, s: u32, t: u32) -> Ps2FloatResult {
     let prod = mul(s, t);
+    if prod.flags.contains(Fcr31Flags::O) {
+        return prod;
+    }
     let sum = add(acc, prod.bits);
     let sticky = (prod.flags | sum.flags) & Fcr31Flags::STICKY_MASK;
     let cause = sum.flags & Fcr31Flags::CAUSE_MASK;
     Ps2FloatResult::new(sum.bits, cause | sticky)
 }
 
-/// PS2 `MSUB.S` / `MSUBA.S`: two-stage multiply-subtract (`acc - (s * t)`).
+/// PS2 `MSUB.S` / `MSUBA.S`: multiply-subtract (`acc - (s * t)`).
+///
+/// Reference: `ps2autotests` (`local/ps2autotests/tests/cpu/ee_fpu/muldiv.expected` lines 178, 181,
+/// 191, 193, 204, 239, 242, 252, 254, 265):
+/// - If `s * t` overflows exponent `0xFF`, the MAC operation immediately saturates to
+///   `prod.bits ^ 0x8000_0000` (`±0x7FFF_FFFF` with the negated sign of `s * t`) and sets `O | SO`.
+/// - Otherwise, subtracts the truncated product `prod.bits` from `acc`.
 pub fn msub(acc: u32, s: u32, t: u32) -> Ps2FloatResult {
     let prod = mul(s, t);
+    if prod.flags.contains(Fcr31Flags::O) {
+        return Ps2FloatResult::new(prod.bits ^ 0x8000_0000, prod.flags);
+    }
     let diff = sub(acc, prod.bits);
     let sticky = (prod.flags | diff.flags) & Fcr31Flags::STICKY_MASK;
     let cause = diff.flags & Fcr31Flags::CAUSE_MASK;
@@ -258,9 +276,10 @@ pub fn msub(acc: u32, s: u32, t: u32) -> Ps2FloatResult {
 
 /// PS2 `DIV.S`: single-precision division (`a / b`) with PS2 divide-by-zero / invalid saturation.
 ///
-/// Reference: `ps2tek` ("EE FPU -> DIV.S & Exceptions"):
+/// Reference: `ps2tek` ("EE FPU -> DIV.S & Exceptions") & `ps2autotests` (`tests/cpu/ee_fpu/muldiv.expected` line 29):
 /// - `0 / 0` sets `I | SI` and saturates to `(sign << 31) | 0x7FFF_FFFF`.
 /// - `nonzero / 0` sets `D | SD` and saturates to `(sign << 31) | 0x7FFF_FFFF`.
+/// - Quotient significand is rounded with 1 guard bit (`((sig1 << (24 + borrow)) / sig2 + 1) >> 1`).
 pub fn div(a: u32, b: u32) -> Ps2FloatResult {
     let res_sign = (a ^ b) & 0x8000_0000;
     let e1 = ((a >> 23) & 0xFF) as i32;
@@ -283,16 +302,24 @@ pub fn div(a: u32, b: u32) -> Ps2FloatResult {
     let sig2 = 0x80_0000u64 | u64::from(b & 0x7F_FFFF);
 
     let borrow = i32::from(sig1 < sig2);
-    let res_exp = e1 - e2 + 127 - borrow;
+    let mut res_exp = e1 - e2 + 127 - borrow;
+
+    let quot_x2 = (sig1 << (24 + borrow)) / sig2;
+    let mut quot = ((quot_x2 + 1) >> 1) as u32;
+    if quot >= 0x100_0000 {
+        quot >>= 1;
+        res_exp += 1;
+    }
 
     if res_exp > 255 {
-        return Ps2FloatResult::new(res_sign | 0x7FFF_FFFF, Fcr31Flags::O | Fcr31Flags::SO);
+        // Reference: `ps2tek` ("EE FPU -> DIV.S"): FDIV instructions only update `I`/`D` flags,
+        // not `O`/`U` (`ps2autotests` `tests/cpu/ee_fpu/fcr.expected` line 48).
+        return Ps2FloatResult::new(res_sign | 0x7FFF_FFFF, Fcr31Flags::empty());
     }
     if res_exp <= 0 {
-        return Ps2FloatResult::new(res_sign, Fcr31Flags::U | Fcr31Flags::SU);
+        return Ps2FloatResult::new(res_sign, Fcr31Flags::empty());
     }
 
-    let quot = ((sig1 << (23 + borrow)) / sig2) as u32;
     let res_mant = quot & 0x7F_FFFF;
     Ps2FloatResult::new(
         res_sign | ((res_exp as u32) << 23) | res_mant,
@@ -324,11 +351,10 @@ const fn isqrt_u128(n: u128) -> u128 {
 
 /// PS2 `SQRT.S`: single-precision square root (`sqrt(|t|)`).
 ///
-/// Reference: `ps2tek` ("EE FPU -> SQRT.S"):
-/// - If `t` has exponent 0, returns `t & 0x8000_0000` (`±0.0`). Negative zero `-0.0` sets `I | SI`
-///   if the sign bit is set (`ps2tek`: negative sign sets Invalid `I`, result is positive `sqrt(|t|)`
-///   except `-0.0` which returns `-0.0`).
+/// Reference: `ps2tek` ("EE FPU -> SQRT.S") & `ps2autotests` (`tests/cpu/ee_fpu/sqrt.expected` lines 44..65):
+/// - If `t` has exponent 0, returns `+0.0` (`0x0000_0000`) and sets `I | SI` if `sign == 1`.
 /// - If `t < 0` (`sign == 1` and `exp > 0`), sets `I | SI` and returns `+sqrt(|t|)`.
+/// - Significand is computed with 1 guard bit (`(isqrt_u128(sig << 2) + 1) >> 1`).
 pub fn sqrt(t: u32) -> Ps2FloatResult {
     let sign = t >> 31;
     let exp = ((t >> 23) & 0xFF) as i32;
@@ -340,7 +366,7 @@ pub fn sqrt(t: u32) -> Ps2FloatResult {
         } else {
             Fcr31Flags::empty()
         };
-        return Ps2FloatResult::new(sign << 31, flags);
+        return Ps2FloatResult::new(0, flags);
     }
 
     let flags = if sign != 0 {
@@ -351,36 +377,79 @@ pub fn sqrt(t: u32) -> Ps2FloatResult {
 
     // Unbiased exponent: e_unbiased = exp - 127.
     let e_unbiased = exp - 127;
-    // Scale significand so we take integer sqrt with 23 fractional bits of precision:
-    // If e_unbiased is odd, multiply significand by 2 and make exponent even.
+    // Scale significand so we take integer sqrt with 24 fractional bits (23 mantissa + 1 guard bit):
     let odd = (e_unbiased & 1) != 0;
-    let res_exp = ((e_unbiased - i32::from(odd)) / 2) + 127;
+    let mut res_exp = ((e_unbiased - i32::from(odd)) / 2) + 127;
 
-    let sig = u128::from(0x80_0000u32 | mant) << (23 + u32::from(odd));
-    let root = isqrt_u128(sig) as u32;
-    let res_mant = root & 0x7F_FFFF;
+    let sig = u128::from(0x80_0000u32 | mant) << (25 + u32::from(odd));
+    let root25 = isqrt_u128(sig);
+    let mut root24 = ((root25 + 1) >> 1) as u32;
+    if root24 >= 0x100_0000 {
+        root24 >>= 1;
+        res_exp += 1;
+    }
+    let res_mant = root24 & 0x7F_FFFF;
 
     Ps2FloatResult::new(((res_exp as u32) << 23) | res_mant, flags)
 }
 
 /// PS2 `RSQRT.S`: single-precision reciprocal square root (`s / sqrt(|t|)`).
 ///
-/// Reference: `ps2tek` ("EE FPU -> RSQRT.S").
+/// Reference: `ps2tek` ("EE FPU -> RSQRT.S") & `ps2autotests` (`tests/cpu/ee_fpu/sqrt.expected` lines 2..41):
+/// - Result sign is always `s & 0x8000_0000` (sign of `s`, ignoring sign of `t`).
+/// - Hardware computes the 24-bit `sqrt(|t|)` significand, takes its 1-guard-bit rounded reciprocal,
+///   and multiplies by `s`.
 pub fn rsqrt(s: u32, t: u32) -> Ps2FloatResult {
-    let exp_t = (t >> 23) & 0xFF;
+    let res_sign = s & 0x8000_0000;
+    let exp_s = ((s >> 23) & 0xFF) as i32;
+    let exp_t = ((t >> 23) & 0xFF) as i32;
+    let flags = if (t >> 31) != 0 {
+        Fcr31Flags::I | Fcr31Flags::SI
+    } else {
+        Fcr31Flags::empty()
+    };
+
     if exp_t == 0 {
-        let res_sign = (s ^ t) & 0x8000_0000;
-        let flags = if (t >> 31) != 0 {
-            Fcr31Flags::I | Fcr31Flags::SI | Fcr31Flags::D | Fcr31Flags::SD
-        } else {
-            Fcr31Flags::D | Fcr31Flags::SD
-        };
-        return Ps2FloatResult::new(res_sign | 0x7FFF_FFFF, flags);
+        return Ps2FloatResult::new(
+            res_sign | 0x7FFF_FFFF,
+            flags | Fcr31Flags::D | Fcr31Flags::SD,
+        );
     }
 
-    let sq = sqrt(t);
-    let dv = div(s, sq.bits);
-    Ps2FloatResult::new(dv.bits, sq.flags | dv.flags)
+    if exp_s == 0 {
+        return Ps2FloatResult::new(res_sign, flags);
+    }
+
+    let mant_t = t & 0x7F_FFFF;
+    let e_t = exp_t - 127;
+    let odd = (e_t & 1) != 0;
+
+    let base_inv_exp = -((e_t - i32::from(odd)) / 2) - 1;
+    let sig_t = u128::from(0x80_0000u32 | mant_t) << (25 + u32::from(odd));
+    let root25 = isqrt_u128(sig_t);
+    let root24 = (root25 + 1) >> 1;
+    let inv_sig_x2 = (1u128 << 48) / root24;
+    let rounded = ((inv_sig_x2 + 1) >> 1) as u64;
+    let (inv_exp, inv_sig) = if rounded >= 0x100_0000 {
+        (base_inv_exp + 1, rounded >> 1)
+    } else {
+        (base_inv_exp, rounded)
+    };
+
+    let sig_s = 0x80_0000u64 | u64::from(s & 0x7F_FFFF);
+    let prod = sig_s * inv_sig;
+    let carry = ((prod >> 47) & 1) as i32;
+    let res_exp = exp_s + inv_exp + carry;
+
+    if res_exp > 255 {
+        return Ps2FloatResult::new(res_sign | 0x7FFF_FFFF, flags);
+    }
+    if res_exp <= 0 {
+        return Ps2FloatResult::new(res_sign, flags);
+    }
+
+    let res_mant = ((prod >> (23 + carry)) & 0x7F_FFFF) as u32;
+    Ps2FloatResult::new(res_sign | ((res_exp as u32) << 23) | res_mant, flags)
 }
 
 /// PS2 `ABS.S`: clears sign bit (Note: on R5900 `ABS.S` does not flush denormals and clears flags).
@@ -572,6 +641,13 @@ mod tests {
         assert_eq!(r.bits, 0x3F80_0002);
         assert!(r.flags.is_empty());
 
+        // Reference: `ps2autotests` (`local/ps2autotests/tests/cpu/ee_fpu/muldiv.expected` lines 308..317):
+        // R5900 Radix-4 Booth multiplier omits the +1 hot-one of the lowest Booth group when `t`
+        // significand bits `[1:0]` >= 2: `1.0 * 0x3FFF_FFFF = 0x3FFF_FFFE`, whereas
+        // `0x3FFF_FFFF * 1.0 = 0x3FFF_FFFF`.
+        assert_eq!(mul(0x3F80_0000, 0x3FFF_FFFF).bits, 0x3FFF_FFFE);
+        assert_eq!(mul(0x3FFF_FFFF, 0x3F80_0000).bits, 0x3FFF_FFFF);
+
         // Minimum normal 2^-126 (0x0080_0000) * 0.5 (0x3F00_0000) underflows to +0.0 and sets U | SU.
         let uf = mul(0x0080_0000, 0x3F00_0000);
         assert_eq!(uf.bits, 0x0000_0000);
@@ -579,13 +655,23 @@ mod tests {
     }
 
     #[test]
-    fn ps2float_madd_intermediate_saturation() {
-        // If s * t overflows to 0x7FFF_FFFF, MADD adds 0x7FFF_FFFF to acc and preserves sticky SO.
-        let r = madd(0xFF80_0000, 0x7F80_0000, 0x4000_0000);
-        assert!(r.flags.contains(Fcr31Flags::SO));
-        assert!(!r.flags.contains(Fcr31Flags::O));
-        // 0x7FFF_FFFF + (-1.0 * 2^128) = +0.9999999 * 2^128 = 0x7F7F_FFFF (shifted by 1 -> 0x7F7F_FFFE).
-        assert_eq!(r.bits, 0x7F7F_FFFE);
+    fn ps2float_madd_overflow_and_two_stage_accumulation() {
+        // Reference: `ps2autotests` (`local/ps2autotests/tests/cpu/ee_fpu/muldiv.expected` lines 57, 178, 191):
+        // When `s * t` overflows exponent `0xFF`, `MADD.S` / `MSUB.S` immediately saturates the
+        // entire MAC result to `±0x7FFF_FFFF` and sets `O | SO`.
+        let r_ov = madd(0xFFFF_FFFF, 0x7FFF_FFFF, 0x7FFF_FFFF);
+        assert_eq!(r_ov.bits, 0x7FFF_FFFF);
+        assert_eq!(r_ov.flags, Fcr31Flags::O | Fcr31Flags::SO);
+
+        let r_msub_ov = msub(0x7F80_0000, 0x7F80_0000, 0x7F80_0000);
+        assert_eq!(r_msub_ov.bits, 0xFFFF_FFFF);
+        assert_eq!(r_msub_ov.flags, Fcr31Flags::O | Fcr31Flags::SO);
+
+        // When `s * t` underflows (`U | SU`), the sticky `SU` flag is preserved while `acc` is returned.
+        let r_uf = madd(0x3F80_0000, 0x0080_0000, 0x3F00_0000);
+        assert_eq!(r_uf.bits, 0x3F80_0000);
+        assert!(r_uf.flags.contains(Fcr31Flags::SU));
+        assert!(!r_uf.flags.contains(Fcr31Flags::U));
     }
 
     #[test]
@@ -604,6 +690,16 @@ mod tests {
         let sq = sqrt(0xC080_0000);
         assert_eq!(sq.bits, 0x4000_0000);
         assert_eq!(sq.flags, Fcr31Flags::I | Fcr31Flags::SI);
+
+        // sqrt(-0.0) and sqrt(-denormal) -> +0.0 (0x0000_0000) with I | SI (`sqrt.expected` lines 45, 55).
+        let sq_neg_zero = sqrt(0x8000_0000);
+        assert_eq!(sq_neg_zero.bits, 0x0000_0000);
+        assert_eq!(sq_neg_zero.flags, Fcr31Flags::I | Fcr31Flags::SI);
+
+        // rsqrt(1.5, 1.5) = 1.5 / sqrt(1.5) = sqrt(1.5) -> 0x3F9C_C470.
+        let rsq = rsqrt(0x3FC0_0000, 0x3FC0_0000);
+        assert_eq!(rsq.bits, 0x3F9C_C470);
+        assert!(rsq.flags.is_empty());
     }
 
     #[test]

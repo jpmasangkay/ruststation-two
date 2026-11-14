@@ -20,6 +20,17 @@ pub const EE_RESET_PC: u32 = 0xBFC0_0000;
 /// R5900 `COP0.PRId` (`$15`) processor revision identifier (`0x0000_2E20`, `ps2tek` `#eecop0`).
 pub const EE_COP0_PRID_DEFAULT: u32 = 0x0000_2E20;
 
+/// R5900 `COP1.FCR0` implementation and revision register (`0x0000_2E30`).
+///
+/// Reference: `ps2autotests` (`local/ps2autotests/tests/cpu/ee_fpu/fcr.expected` line 3).
+pub const EE_COP1_FCR0_DEFAULT: u32 = 0x0000_2E30;
+
+/// R5900 `COP1.FCR31` initial control/status register (`0x0100_0001`: bit 24 `FS` and bit 0 `RM` hardwired to `1`).
+///
+/// Reference: `ps2autotests` (`local/ps2autotests/tests/cpu/ee_fpu/fcr.expected` line 3
+/// & `local/ps2autotests/tests/cpu/ee_fpu/transfer.expected` line 18).
+pub const EE_COP1_FCR31_DEFAULT: u32 = 0x0100_0001;
+
 /// Cache-line-aligned (`64`-byte) Emotion Engine CPU state (`docs/PS2_BLUEPRINT.md` §3 & §12).
 ///
 /// Kept `#[repr(C, align(64))]` so the Phase 3 Cranelift JIT can index hot registers directly
@@ -77,7 +88,8 @@ impl EeCpuState {
     /// - `COP0.PRId` (`$15`) is initialized to `0x0000_2E20`.
     pub const fn new() -> Self {
         let mut cop0_regs = [0u32; 32];
-        cop0_regs[cop0_reg::STATUS] = status_bits::BEV | status_bits::ERL | status_bits::CU0;
+        cop0_regs[cop0_reg::STATUS] =
+            status_bits::BEV | status_bits::ERL | status_bits::CU0 | status_bits::CU1;
         cop0_regs[cop0_reg::PRID] = EE_COP0_PRID_DEFAULT;
 
         Self {
@@ -95,8 +107,8 @@ impl EeCpuState {
             int1_line: false,
             cpcond0: true,
             fpr: [0; 32],
-            fcr0: 0x0000_2E00,
-            fcr31: 0,
+            fcr0: EE_COP1_FCR0_DEFAULT,
+            fcr31: EE_COP1_FCR31_DEFAULT,
             facc: 0,
         }
     }
