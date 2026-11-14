@@ -6,10 +6,12 @@
 
 pub mod bus;
 pub mod ee;
+pub mod elf;
 pub mod mmu;
 pub mod scheduler;
 
 pub use ee::EeCpuState;
+pub use elf::{load_elf32, ElfError, LoadedElf};
 pub use ps2_common::Reg128;
 
 /// Core clock frequencies in Hz (`ps2tek` "Overview -> Clock Speeds").

@@ -21,6 +21,37 @@ use crate::bus::Bus;
 
 use super::cop0::{cause_bits, cop0_reg, Level1ExceptionCode};
 use super::state::EeCpuState;
+use super::syscall::{EeHleState, SyscallError};
+
+/// Writable bit mask for `COP0.Perf.PCCR` (`0x800F_FBFE`: bits `0`, `10`, and `20..=30` are hardwired `0`).
+///
+/// Reference: `ps2autotests` (`local/ps2autotests/tests/cpu/ee_cop0/performance.cpp` & `performance.expected`).
+pub const COP0_PCCR_WRITABLE_MASK: u32 = 0x800F_FBFE;
+
+/// Result of executing a single instruction in HLE test-runner mode (`EeCpuState::step_hle`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HleStepResult {
+    /// Instruction or HLE syscall completed normally; execution continues.
+    Continue,
+    /// Program exited cleanly via HLE `Exit` (`0x04`), `ExitThread` (`0x23`), or `ExitDeleteThread` (`0x24`).
+    Exited(i32),
+    /// Program executed an unimplemented syscall (`$v1` syscall number).
+    UnimplementedSyscall {
+        /// Faulting `SYSCALL` instruction address.
+        pc: u32,
+        /// Signed syscall number from `$v1`.
+        syscall: i16,
+    },
+    /// Program fetched an instruction from an unimplemented ISA extension (`MMI`, `COP1`, or `COP2`).
+    UnimplementedInstruction {
+        /// Address of the unimplemented instruction.
+        pc: u32,
+        /// Raw 32-bit instruction word.
+        instr: u32,
+        /// Subsystem category (`"MMI (Task 4)"`, `"COP1 / FPU (Task 4)"`, or `"COP2 / VU0 Macro (Task 4)"`).
+        category: &'static str,
+    },
+}
 
 /// Control-flow outcome of a single R5900 instruction execution.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -108,6 +139,94 @@ impl EeCpuState {
         self.advance_cop0_count(1);
         bus.step_timers(1);
         self.cycle_countdown -= 1;
+    }
+
+    /// Execute a single R5900 instruction at `self.pc` with HLE kernel syscall interception
+    /// and explicit unimplemented-ISA detection (`MMI`, `COP1`, `COP2`) for `ps2-autotest`.
+    pub fn step_hle(&mut self, bus: &mut Bus, hle: &mut EeHleState) -> HleStepResult {
+        if hle.exited {
+            return HleStepResult::Exited(hle.exit_code);
+        }
+
+        if self.check_and_service_interrupts(bus) {
+            self.advance_cop0_count(1);
+            bus.step_timers(1);
+            self.cycle_countdown -= 1;
+            return HleStepResult::Continue;
+        }
+
+        let instr_pc = self.pc;
+        if (instr_pc & 3) != 0 {
+            self.raise_address_error(instr_pc, false);
+            self.advance_cop0_count(1);
+            bus.step_timers(1);
+            self.cycle_countdown -= 1;
+            return HleStepResult::Continue;
+        }
+
+        let default_after = self.next_pc;
+        let instr = bus.read32(instr_pc);
+        let opcode = instr >> 26;
+        let funct = instr & 0x3F;
+
+        // Intercept `SYSCALL` (`opcode == 0x00, funct == 0x0C`) in HLE runner mode.
+        if opcode == 0x00 && funct == 0x0C {
+            match hle.handle_syscall(self, bus, default_after) {
+                Ok(Some(redirect_pc)) => {
+                    self.pc = redirect_pc;
+                    self.next_pc = redirect_pc.wrapping_add(4);
+                    self.in_delay_slot = false;
+                }
+                Ok(None) => {
+                    self.pc = default_after;
+                    self.next_pc = default_after.wrapping_add(4);
+                    self.in_delay_slot = false;
+                }
+                Err(SyscallError::Unimplemented(syscall)) => {
+                    return HleStepResult::UnimplementedSyscall {
+                        pc: instr_pc,
+                        syscall,
+                    };
+                }
+            }
+            self.advance_cop0_count(1);
+            bus.step_timers(1);
+            self.cycle_countdown -= 1;
+            if hle.exited {
+                return HleStepResult::Exited(hle.exit_code);
+            }
+            return HleStepResult::Continue;
+        }
+
+        // Detect deferred Task 4 instruction categories (`MMI`, `COP1`, `COP2`) explicitly
+        // before `step` raises a generic ReservedInstruction exception.
+        match opcode {
+            0x1C => {
+                return HleStepResult::UnimplementedInstruction {
+                    pc: instr_pc,
+                    instr,
+                    category: "MMI (Task 4)",
+                };
+            }
+            0x11 | 0x31 | 0x39 => {
+                return HleStepResult::UnimplementedInstruction {
+                    pc: instr_pc,
+                    instr,
+                    category: "COP1 / FPU (Task 4)",
+                };
+            }
+            0x12 | 0x32 | 0x3A => {
+                return HleStepResult::UnimplementedInstruction {
+                    pc: instr_pc,
+                    instr,
+                    category: "COP2 / VU0 Macro (Task 4)",
+                };
+            }
+            _ => {}
+        }
+
+        self.step(bus);
+        HleStepResult::Continue
     }
 
     /// Decode and execute `instr` fetched from `instr_pc` using a plain `match` on `opcode` and `funct`.
@@ -1245,14 +1364,21 @@ impl EeCpuState {
 
         match rs {
             // MFC0 / MFPS / MFPC (rs == 0x00)
+            // Reference: `ps2autotests` (`local/ps2autotests/tests/cpu/ee_cop0/performance.cpp`,
+            // `performance.expected`, and `performance.elf` disassembly):
+            // - When `rd == 25` (`COP0.Perf`):
+            //   * `(instr & 1) == 0` is `MFPS rt, reg` (`reg = (instr >> 1) & 0x1F`): reads `PCCR`
+            //     for any specifier `reg` (`0..=31`).
+            //   * `(instr & 1) == 1` is `MFPC rt, reg` (`reg = (instr >> 1) & 0x1F`): even `reg`
+            //     reads `PCR0`, odd `reg` reads `PCR1`.
             0x00 => {
                 if rd == cop0_reg::PERF {
-                    let sel = instr & 0x3F;
-                    let val = match sel {
-                        0 => self.cop0_pccr as i32,
-                        1 => self.cop0_pcr[0] as i32,
-                        3 => self.cop0_pcr[1] as i32,
-                        _ => 0,
+                    let is_pcr = (instr & 1) != 0;
+                    let reg_spec = ((instr >> 1) & 0x1F) as usize;
+                    let val = if is_pcr {
+                        self.cop0_pcr[reg_spec & 1] as i32
+                    } else {
+                        self.cop0_pccr as i32
                     };
                     self.set_gpr_sext32(rt, val);
                 } else {
@@ -1263,15 +1389,22 @@ impl EeCpuState {
             }
 
             // MTC0 / MTPS / MTPC (rs == 0x04)
+            // Reference: `ps2autotests` (`local/ps2autotests/tests/cpu/ee_cop0/performance.cpp`,
+            // `performance.expected`, and `performance.elf` disassembly):
+            // - When `rd == 25` (`COP0.Perf`):
+            //   * `(instr & 1) == 0` is `MTPS rt, reg` (`reg = (instr >> 1) & 0x1F`): writes
+            //     `PCCR = val & 0x800F_FBFE` only when `reg == 0`; any `reg != 0` is a no-op.
+            //   * `(instr & 1) == 1` is `MTPC rt, reg` (`reg = (instr >> 1) & 0x1F`): even `reg`
+            //     writes `PCR0`, odd `reg` writes `PCR1`.
             0x04 => {
                 let val = self.gpr_u32(rt);
                 if rd == cop0_reg::PERF {
-                    let sel = instr & 0x3F;
-                    match sel {
-                        0 => self.cop0_pccr = val,
-                        1 => self.cop0_pcr[0] = val,
-                        3 => self.cop0_pcr[1] = val,
-                        _ => {}
+                    let is_pcr = (instr & 1) != 0;
+                    let reg_spec = ((instr >> 1) & 0x1F) as usize;
+                    if is_pcr {
+                        self.cop0_pcr[reg_spec & 1] = val;
+                    } else if reg_spec == 0 {
+                        self.cop0_pccr = val & COP0_PCCR_WRITABLE_MASK;
                     }
                 } else {
                     self.write_cop0(rd, val);
@@ -1770,5 +1903,73 @@ mod tests {
             (cpu.cop0_regs[cop0_reg::CAUSE] & cause_bits::EXCCODE_MASK) >> 2,
             Level1ExceptionCode::Interrupt as u32
         );
+    }
+
+    #[test]
+    fn ee_cop0_performance_counter_pccr_pcr0_pcr1_specifiers_and_counting() {
+        let mut cpu = EeCpuState::new();
+        let mut bus = Bus::new();
+
+        // Values matching `local/ps2autotests/tests/cpu/ee_cop0/performance.cpp` & `performance.expected`:
+        cpu.set_gpr_sext32(4, 0x7FFF_FFFFu32 as i32); // $a0 = 0x7FFF_FFFF
+        cpu.set_gpr_sext32(5, 4); // $a1 = 4
+        cpu.set_gpr_sext32(6, 5); // $a2 = 5
+                                  // PCCR_CTE (1 << 31) | PCCR_EXL0..U0 (0x1E) | PCCR_EVENT0_PROCESSOR_CYCLE (1 << 5) = 0x8000_003E
+        cpu.set_gpr_sext32(7, 0x8000_003Eu32 as i32);
+
+        load_program(
+            &mut cpu,
+            &mut bus,
+            0x0010_0000,
+            &[
+                // mtps $a0, 0 (0x4084_C800) -> PCCR = 0x7FFF_FFFF & 0x800F_FBFE = 0x000F_FBFE (`performance.expected` line 4)
+                0x4084_C800,
+                // mfps $v0, 31 (0x4002_C83E) -> reads PCCR for any specifier (`performance.expected` line 7)
+                0x4002_C83E,
+                // mtps $zero, 15 (0x4080_C81E) -> non-zero specifier is a no-op (`performance.expected` line 8)
+                0x4080_C81E,
+                // mtpc $a1, 30 (0x4085_C83D) -> even specifier writes PCR0 = 4 (`performance.expected` line 6)
+                0x4085_C83D,
+                // mtpc $a2, 31 (0x4086_C83F) -> odd specifier writes PCR1 = 5 (`performance.expected` line 6)
+                0x4086_C83F,
+                // mfpc $v1, 2 (0x4003_C805) -> even specifier reads PCR0 = 4
+                0x4003_C805,
+                // mfpc $t0, 3 (0x4008_C807) -> odd specifier reads PCR1 = 5
+                0x4008_C807,
+                // mtps $a3, 0 (0x4087_C800) -> enable CTE + PCR0 processor cycles (`performance.expected` line 9)
+                0x4087_C800,
+                // nop (advances PCR0 by 1 while PCR1 stays unchanged)
+                0x0000_0000,
+            ],
+        );
+
+        // Step 1: mtps $a0, 0
+        cpu.step(&mut bus);
+        assert_eq!(cpu.cop0_pccr, 0x000F_FBFE);
+
+        // Step 2: mfps $v0, 31
+        cpu.step(&mut bus);
+        assert_eq!(cpu.gpr_u32(2), 0x000F_FBFE);
+
+        // Step 3: mtps $zero, 15 (no-op)
+        cpu.step(&mut bus);
+        assert_eq!(cpu.cop0_pccr, 0x000F_FBFE);
+
+        // Step 4..7: mtpc / mfpc even/odd specifiers
+        for _ in 0..4 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(cpu.gpr_u32(3), 4);
+        assert_eq!(cpu.gpr_u32(8), 5);
+
+        // Step 8: mtps $a3, 0 (enables PCR0 cycle counting; this step itself increments PCR0 from 4 -> 5)
+        cpu.step(&mut bus);
+        assert_eq!(cpu.cop0_pcr[0], 5);
+        assert_eq!(cpu.cop0_pcr[1], 5);
+
+        // Step 9: nop (increments PCR0 from 5 -> 6, PCR1 unchanged at 5)
+        cpu.step(&mut bus);
+        assert_eq!(cpu.cop0_pcr[0], 6);
+        assert_eq!(cpu.cop0_pcr[1], 5);
     }
 }

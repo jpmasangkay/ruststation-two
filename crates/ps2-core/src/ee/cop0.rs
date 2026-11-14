@@ -206,8 +206,17 @@ impl EeCpuState {
         }
     }
 
-    /// Advance `COP0.Count` (`$9`) by `ee_cycles` and assert `Cause.IP7` (bit 15) if `Count`
-    /// reaches `Compare` (`$11`, `ps2tek` `#eecop0`).
+    /// Advance `COP0.Count` (`$9`) and enabled `COP0.Perf` counters (`PCR0`, `PCR1`) by `ee_cycles`,
+    /// asserting `Cause.IP7` (bit 15) if `Count` reaches `Compare` (`$11`).
+    ///
+    /// Primary source references:
+    /// - `ps2tek` (`https://psi-rockin.github.io/ps2tek/#eecop0`).
+    /// - `ps2autotests` (`local/ps2autotests/tests/cpu/ee_cop0/performance.cpp` & `performance.expected`):
+    ///   * `PCCR.CTE` (bit 31) enables performance counter counting.
+    ///   * `PCR0` increments on processor cycles when `(PCCR & 0x0000_001E) != 0` (at least one mode bit
+    ///     `EXL0 | K0 | S0 | U0` enabled) and `EVENT0` (`(PCCR >> 5) & 0x1F`) is `1` (`Processor cycle`).
+    ///   * `PCR1` increments on processor cycles when `(PCCR & 0x0000_7800) != 0` (at least one mode bit
+    ///     `EXL1 | K1 | S1 | U1` enabled) and `EVENT1` (`(PCCR >> 15) & 0x1F`) is `1` (`Processor cycle`).
     #[inline]
     pub fn advance_cop0_count(&mut self, ee_cycles: u32) {
         let old_count = self.cop0_regs[cop0_reg::COUNT];
@@ -218,6 +227,18 @@ impl EeCpuState {
             self.cop0_regs[cop0_reg::CAUSE] |= cause_bits::IP_TIMER;
         }
         self.cop0_regs[cop0_reg::COUNT] = new_count;
+
+        let pccr = self.cop0_pccr;
+        if (pccr & (1 << 31)) != 0 {
+            let event0 = (pccr >> 5) & 0x1F;
+            if (pccr & 0x0000_001E) != 0 && event0 == 1 {
+                self.cop0_pcr[0] = self.cop0_pcr[0].wrapping_add(ee_cycles);
+            }
+            let event1 = (pccr >> 15) & 0x1F;
+            if (pccr & 0x0000_7800) != 0 && event1 == 1 {
+                self.cop0_pcr[1] = self.cop0_pcr[1].wrapping_add(ee_cycles);
+            }
+        }
     }
 
     /// Raise a Level 1 exception (`ps2tek` `https://psi-rockin.github.io/ps2tek/#eecop0`).
