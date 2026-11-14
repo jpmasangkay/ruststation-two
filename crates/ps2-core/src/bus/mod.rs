@@ -14,18 +14,23 @@
 //!   * `0x1FC0_0000..=0x1FFF_FFFF`: 4 MB System BIOS ROM (Read-Only).
 //!   * `0x7000_0000..=0x7000_3FFF`: 16 KB Scratchpad SRAM (`8`/`16`/`32`/`64`/`128`-bit).
 
+pub mod dmac;
 pub mod gs_stub;
 pub mod intc;
 pub mod rdram_mch;
+pub mod sif;
 pub mod timers;
 
 use ps2_common::Reg128;
 
 use crate::mmu::{Tlb, TlbEntry, TranslatedAddr, Vtlb, VtlbTarget};
+use crate::scheduler::{HardwareEventKind, Scheduler};
 
+pub use dmac::{DmaChannel, EeDmac, UnimplementedDmaTransfer};
 pub use gs_stub::GsPrivilegedStub;
 pub use intc::{EeIntc, IntcFlags};
 pub use rdram_mch::RdramMch;
+pub use sif::SifRegs;
 pub use timers::EeTimers;
 
 /// 32 MB Main RDRAM size in bytes (`ps2tek` `#memorymap`).
@@ -78,9 +83,12 @@ pub struct Bus {
     pub rdram_mch: RdramMch,
     /// GS Privileged Registers (`0x1200_0000..=0x1200_1FFF`).
     pub gs: GsPrivilegedStub,
-    /// DMAC `D_ENABLER` (`0x1000_F520`) / `D_ENABLEW` (`0x1000_F590`) master suspend register
-    /// (initialized to `0x1201` per `ps2tek` `https://psi-rockin.github.io/ps2tek/#dmacio`).
-    pub dmac_enable: u32,
+    /// EE 10-Channel DMA Controller (`0x1000_8000..=0x1000_E060`, `0x1000_F520`, `0x1000_F590`).
+    pub dmac: EeDmac,
+    /// Sub-System Interface (`SIF`) registers (`0x1000_F200..=0x1000_F260`).
+    pub sif: SifRegs,
+    /// Central event-driven hardware scheduler (`294.912 MHz` EE cycle timebase).
+    pub scheduler: Scheduler,
     /// Captured EE serial / console stdout bytes (`KPUTCHAR` `0x1000_F180` + HLE stdout, `ps2tek` `#iomaps`).
     pub stdout_buffer: Vec<u8>,
 }
@@ -106,7 +114,9 @@ impl Bus {
             intc: EeIntc::new(),
             rdram_mch: RdramMch::new(),
             gs: GsPrivilegedStub::new(),
-            dmac_enable: 0x1201,
+            dmac: EeDmac::new(),
+            sif: SifRegs::new(),
+            scheduler: Scheduler::new(),
             stdout_buffer: Vec::new(),
         }
     }
@@ -445,21 +455,29 @@ impl Bus {
         }
     }
 
-    /// Advance active EE hardware timers (`TIM0..TIM3`) by `ee_cycles`, updating `self.intc`.
+    /// Advance active EE hardware timers (`TIM0..TIM3`) and the central hardware [`Scheduler`]
+    /// by `ee_cycles`, updating `self.intc` and completing due DMAC channel events.
     #[inline]
     pub fn step_timers(&mut self, ee_cycles: u32) {
         self.timers.step_ee_cycles(ee_cycles, &mut self.intc);
+        self.scheduler.advance(u64::from(ee_cycles));
+        while let Some(event) = self.scheduler.pop_due_event() {
+            if let HardwareEventKind::DmacChannelComplete(ch) = event.kind {
+                self.dmac.complete_channel(usize::from(ch));
+            }
+        }
     }
 
     #[cold]
     fn read_mmio32(&mut self, paddr: u32) -> u32 {
         match paddr {
             0x1000_0000..=0x1000_1FFF => self.timers.read32(paddr),
+            0x1000_8000..=0x1000_E060 | 0x1000_F520 | 0x1000_F590 => self.dmac.read32(paddr),
             0x1000_F000 => self.intc.read_stat(),
             0x1000_F010 => self.intc.read_mask(),
+            0x1000_F200..=0x1000_F260 => self.sif.read32_ee(paddr),
             0x1000_F430 => self.rdram_mch.read_f430(),
             0x1000_F440 => self.rdram_mch.read_f440(),
-            0x1000_F520 => self.dmac_enable,
             0x1200_0000..=0x1200_1FFF => self.gs.read32(paddr),
             _ => {
                 tracing::trace!(
@@ -498,12 +516,21 @@ impl Bus {
     fn write_mmio32(&mut self, paddr: u32, val: u32) {
         match paddr {
             0x1000_0000..=0x1000_1FFF => self.timers.write32(paddr, val),
+            0x1000_8000..=0x1000_E060 | 0x1000_F520 | 0x1000_F590 => {
+                self.dmac.write32(
+                    paddr,
+                    val,
+                    &mut self.ram,
+                    &mut self.scratchpad,
+                    &mut self.scheduler,
+                );
+            }
             0x1000_F000 => self.intc.write_stat(val),
             0x1000_F010 => self.intc.write_mask(val),
             0x1000_F180 => self.stdout_buffer.push((val & 0xFF) as u8),
+            0x1000_F200..=0x1000_F260 => self.sif.write32_ee(paddr, val),
             0x1000_F430 => self.rdram_mch.write_f430(val),
             0x1000_F440 => self.rdram_mch.write_f440(val),
-            0x1000_F590 => self.dmac_enable = val,
             0x1200_0000..=0x1200_1FFF => self.gs.write32(paddr, val),
             _ => {
                 tracing::trace!(

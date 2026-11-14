@@ -1,4 +1,4 @@
-# Phase 1 `ps2autotests` Suite Status (Task 4 Update)
+# Phase 1 `ps2autotests` Suite Status (Task 5 Update)
 
 `local/ps2autotests/tests/` contains **78 prebuilt test binaries**:
 - **55 EE `.elf` suites** (MIPS R5900 Emotion Engine binaries)
@@ -6,32 +6,29 @@
 
 ---
 
-## Proposed Revised Phase 1 Gate
+## Revised Phase 1 Gate (`35` Hardware Suites)
 
-The blueprint's original `"52/55"` placeholder is replaced with an exact inventory and pass-list verified against `local/ps2autotests/tests/`:
-
-| Scope Bucket | Total Suites | Passing Now (Task 4) | Target Task | Details |
+| Track / Scope Bucket | Total Suites | Passing Now (Task 5) | Target Task / Milestone | Details |
 | :--- | ---: | ---: | :--- | :--- |
-| **In-Scope EE: CPU, COP0, COP1 FPU, MMI SIMD, Memory** | **23 `.elf`** | **`23 / 23 PASS` (100%)** | **Task 4 (Done)** | `cpu/ee` (6), `cpu/ee_cop0` (1), `cpu/ee_fpu` (9), `cpu/ee_simd` (6), `memory/ee` (1). Release run wall time: **`1.456 s`** (`75,856,740` EE cycles). |
-| **In-Scope EE: DMAC & Scratchpad DMA** | **5 `.elf`** | `0 / 5` (`DEFERRED`) | **Task 5** | `dma/dmac/{cpcond,tagintr}`, `dma/spr/{chain,interleave,normal}`. |
-| **In-Scope EE: Kernel Interrupt & Thread HLE** | **10 `.elf`** | `0 / 10` (`DEFERRED`) | **Task 7a** | `kernel/ee/interrupt/{dmac_order,intc_order}`, `kernel/ee/thread/{delete,exit,resume,sleep,stat,suspend,terminate,wakeup}`. |
-| **In-Scope Phase 1 EE Subtotal** | **38 `.elf`** | **`23 / 38 PASS`** | **Tasks 4, 5, 7a** | All 38 Phase 1 EE `.elf` suites must pass by the end of Task 7a. |
-| **In-Scope IOP: R3000A CPU & IOP Kernel/libc** | **23 `.irx`** | `0 / 23` (`DEFERRED`) | **Tasks 5 & 7b** | `cpu/iop` (7) and `kernel/iop` (16). All 23 `.irx` suites must pass by the end of Task 7b. |
-| **Total In-Scope Phase 1 Suites (EE + IOP)** | **61 suites** | **`23 / 61 PASS`** | **End of Phase 1** | **Proposed Phase 1 Gate: `38 / 38` EE `.elf` + `23 / 23` IOP `.irx` (`61 / 61 PASS`)**. |
+| **Phase 1 Hardware Gate — EE CPU, COP0, COP1 FPU, MMI SIMD, Memory** | **23 `.elf`** | **`23 / 23 PASS` (100%)** | **Task 4 (Done)** | `cpu/ee` (6), `cpu/ee_cop0` (1), `cpu/ee_fpu` (9), `cpu/ee_simd` (6), `memory/ee` (1). |
+| **Phase 1 Hardware Gate — EE DMAC & Scratchpad DMA** | **5 `.elf`** | **`5 / 5 PASS` (100%)** | **Task 5 (Done)** | `dma/dmac/{cpcond,tagintr}`, `dma/spr/{chain,interleave,normal}`. |
+| **Phase 1 Hardware Gate — IOP R3000A CPU** | **7 `.irx`** | `0 / 7` (`DEFERRED`) | **Task 6** | `cpu/iop/{alu,branch,branchdelay,hilodelay,lsu,lsudelay,muldiv}.irx`. |
+| **Phase 1 Hardware Gate Total** | **35 suites** | **`28 / 35 PASS` (`100%` of EE)** | **End of Phase 1** | **`28 / 28` EE + DMAC/SPR suites passing in `1.778 s` release wall time (`82,167,799` EE cycles).** |
+| **Kernel Track (Post-LLE BIOS) — EE & IOP Kernel Behavior** | **26 suites** | `0 / 26` (`DEFERRED`) | **Post-LLE BIOS** | `kernel/ee` (10 `.elf`) + `kernel/iop` (16 `.irx`). Not part of the Phase 1 hardware gate; revisit after LLE BIOS boot works. |
 | **Out-of-Scope Phase 2+ EE Suites (VU0, VU1, VIF1, GS)** | **17 `.elf`** | `0 / 17` (`DEFERRED`) | **Phase 2+** | `cpu/vu0_macro` (2), `vu/` (7), `dma/vif` (6), `gs/` (2). |
 
 ---
 
 ## All 55 EE `.elf` Suites — Per-Suite Status Table
 
-### 1. In-Scope EE CPU, COP0, COP1 FPU, MMI SIMD, and Memory Suites (`23 / 23 PASS`)
+### 1. Phase 1 Hardware Gate: EE CPU, COP0, COP1 FPU, MMI SIMD, Memory, and DMAC/SPR Suites (`28 / 28 PASS`)
 
 Release-mode execution command:
 ```powershell
 cargo build --release -p ps2-autotest
-# Runs all 23 suites sequentially and compares stdout against .expected ground truth
+# Runs all 28 in-scope EE & DMAC/SPR suites sequentially and compares stdout against .expected ground truth
 ```
-Total release wall time across all 23 suites: **`1.456 s` (`1456 ms`)** (`75,856,740` emulated EE cycles).
+Total release wall time across all 28 suites: **`1.778 s` (`1778 ms`)** (`82,167,799` emulated EE cycles).
 
 | # | Suite (`tests/...`) | Category | Status | Emulated Cycles | Notes / Verification |
 | ---: | :--- | :--- | :--- | ---: | :--- |
@@ -58,28 +55,30 @@ Total release wall time across all 23 suites: **`1.456 s` (`1456 ms`)** (`75,856
 | 21 | `cpu/ee_simd/muldiv.elf` | EE MMI SIMD | `PASS` | `15,159,284` | Matches `muldiv.expected` (100%, `PMULTH`, `PMULTW`, `PMULTUW`, `PDIVW`, `PDIVUW`, `PDIVBW`, `PMADDH`, `PHMADH`, `PMSUBH`, `PHMSBH`, `PMADDW`, `PMADDUW`, `PMSUBW`, `PMFHL.*`, `PMTHL.LW`). |
 | 22 | `cpu/ee_simd/shuffle.elf` | EE MMI SIMD | `PASS` | `4,294,859` | Matches `shuffle.expected` (100%, `PCPYH`, `PCPYLD`, `PCPYUD`, `PEXCH`, `PEXCW`, `PEXEH`, `PEXEW`, `PEXT*`, `PINTH`, `PINTEH`, `PPAC*`, `PREVH`, `PROT3W`). |
 | 23 | `memory/ee/default.elf` | EE Memory / vtlb | `PASS` | `273,568` | Matches `default.expected` (100%, cached/uncached/UCAB mirrors, scratchpad `0x7000_0000`, and `COP0` TLB remap). |
+| 24 | `dma/dmac/cpcond.elf` | DMAC (`D_PCR` / `CPCOND0`) | `PASS` | `37,654` | Matches `cpcond.expected` (100%, `BC0F`/`BC0T` `CPCOND0` evaluation against `D_PCR.CPC0..9` and `D_STAT.CIS0..9`). |
+| 25 | `dma/dmac/tagintr.elf` | DMAC (DMA Tag IRQ) | `PASS` | `76,112` | Matches `tagintr.expected` (100%, source-chain `REF`/`END` tag execution, `CHCR.TAG` latching, `CHCR.TIE` + `tag.IRQ` early termination, and `D_STAT.CIS9`). |
+| 26 | `dma/spr/chain.elf` | DMAC (`fromSPR` / `toSPR` Chain) | `PASS` | `180,921` | Matches `chain.expected` (100%, `toSPR` source-chain `REFE`, `SADR` `& 0x3FF0` masking, and `QWC = 0` tag zero-transfer behavior). |
+| 27 | `dma/spr/interleave.elf` | DMAC (`fromSPR` / `toSPR` Interleave) | `PASS` | `5,680,034` | Matches `interleave.expected` (100%, `D_SQWC` 8-bit `SQWC`/`TQWC` masking and per-slice `SQWC * 16` `MADR` skip). |
+| 28 | `dma/spr/normal.elf` | DMAC (`fromSPR` / `toSPR` Normal) | `PASS` | `336,338` | Matches `normal.expected` (100%, `fromSPR`/`toSPR` `SADR` `& 0x3FF0` masking, 16 KB wraparound, and `MADR` bit-31 clearing). |
 
 ---
 
-### 2. In-Scope Phase 1 EE Suites Deferred to Task 5 (DMAC) and Task 7a (EE Kernel HLE) (`15 .elf` suites)
+### 2. Kernel Track: EE Kernel Interrupt & Thread Suites (`10 .elf` suites — Post-LLE BIOS Track)
 
-| # | Suite (`tests/...`) | Category | Status | Target Task | Reason / Evidence from Execution |
+These suites test BIOS kernel behavior (`AddIntcHandler`, `AddDmacHandler`, `CreateThread`, `StartThread`, `SleepThread`, etc.) and are outside the 35-suite Phase 1 Hardware Gate.
+
+| # | Suite (`tests/...`) | Category | Status | Track | Reason / Evidence from Execution |
 | ---: | :--- | :--- | :--- | :--- | :--- |
-| 24 | `dma/dmac/cpcond.elf` | DMAC (`D_PCR` / `CPCOND0`) | `DEFERRED` | Task 5 | Polls `BC0F`/`BC0T` against DMAC `D_STAT`/`D_PCR` channel completion bits (`10,000,000` cycle timeout without DMAC engine). |
-| 25 | `dma/dmac/tagintr.elf` | DMAC (DMA Tag IRQ) | `DEFERRED` | Task 5 | Starts source-chain DMA transfer with `IRQ` tag bit and waits for DMAC interrupt (`23 lines` printed; DMA transfers not executed yet). |
-| 26 | `dma/spr/chain.elf` | DMAC (`fromSPR` / `toSPR` Chain) | `DEFERRED` | Task 5 | Triggers `fromSPR` (ch 8) / `toSPR` (ch 9) chain transfers and polls `CHCR.STR` bit 8 to clear (`10,000,000` cycle timeout). |
-| 27 | `dma/spr/interleave.elf` | DMAC (`fromSPR` / `toSPR` Interleave) | `DEFERRED` | Task 5 | Triggers `fromSPR` / `toSPR` interleave transfers (`D_SQWC`) and polls `CHCR.STR` (`10,000,000` cycle timeout). |
-| 28 | `dma/spr/normal.elf` | DMAC (`fromSPR` / `toSPR` Normal) | `DEFERRED` | Task 5 | Triggers `fromSPR` / `toSPR` normal transfers (`SADR`/`MADR`/`QWC`) and polls `CHCR.STR` (`10,000,000` cycle timeout). |
-| 29 | `kernel/ee/interrupt/dmac_order.elf` | EE Kernel + DMAC IRQ | `DEFERRED` | Task 5 & 7a | Stops at `UnimplementedSyscall(pc=0x00101624, syscall=18 / 0x12 AddDmacHandler)` (`25,840` cycles); also uses `AddDmacHandler2` (`0x77`) and `EnableDmac` (`0x16`). |
-| 30 | `kernel/ee/interrupt/intc_order.elf` | EE Kernel (`INTC` Queue) | `DEFERRED` | Task 7a | Registers multiple VBLANK handlers via `AddIntcHandler`/`AddIntcHandler2`, enables VBLANK (`EnableIntc`), and waits on a semaphore (`WaitSema`) signaled by the handlers. |
-| 31 | `kernel/ee/thread/delete.elf` | EE Kernel (Threads) | `DEFERRED` | Task 7a | Stops at `UnimplementedSyscall(pc=0x00104994, syscall=47 / 0x2F GetThreadId)` (`24,522` cycles). |
-| 32 | `kernel/ee/thread/exit.elf` | EE Kernel (Threads) | `DEFERRED` | Task 7a | Stops at `UnimplementedSyscall(pc=0x00104864, syscall=33 / 0x21 DeleteThread)` (`24,259` cycles). |
-| 33 | `kernel/ee/thread/resume.elf` | EE Kernel (Threads) | `DEFERRED` | Task 7a | Stops at `UnimplementedSyscall(pc=0x00104974, syscall=47 / 0x2F GetThreadId)` (`24,515` cycles). |
-| 34 | `kernel/ee/thread/sleep.elf` | EE Kernel (Threads) | `DEFERRED` | Task 7a | Stops at `UnimplementedSyscall(pc=0x00104814, syscall=47 / 0x2F GetThreadId)` (`24,515` cycles). |
-| 35 | `kernel/ee/thread/stat.elf` | EE Kernel (Threads) | `DEFERRED` | Task 7a | Stops at `UnimplementedSyscall(pc=0x001049C4, syscall=48 / 0x30 ReferThreadStatus)` (`24,539` cycles). |
-| 36 | `kernel/ee/thread/suspend.elf` | EE Kernel (Threads) | `DEFERRED` | Task 7a | Stops at `UnimplementedSyscall(pc=0x001049C4, syscall=47 / 0x2F GetThreadId)` (`24,522` cycles). |
-| 37 | `kernel/ee/thread/terminate.elf` | EE Kernel (Threads) | `DEFERRED` | Task 7a | Stops at `UnimplementedSyscall(pc=0x00104A54, syscall=47 / 0x2F GetThreadId)` (`24,522` cycles). |
-| 38 | `kernel/ee/thread/wakeup.elf` | EE Kernel (Threads) | `DEFERRED` | Task 7a | Stops at `UnimplementedSyscall(pc=0x001049A4, syscall=47 / 0x2F GetThreadId)` (`24,515` cycles). |
+| 29 | `kernel/ee/interrupt/dmac_order.elf` | EE Kernel + DMAC IRQ | `DEFERRED` | Kernel Track (Post-LLE BIOS) | Stops at `UnimplementedSyscall(pc=0x00101624, syscall=18 / 0x12 AddDmacHandler)` (`25,840` cycles). |
+| 30 | `kernel/ee/interrupt/intc_order.elf` | EE Kernel (`INTC` Queue) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | Registers multiple VBLANK handlers via `AddIntcHandler`/`AddIntcHandler2` and waits on a semaphore (`WaitSema`). |
+| 31 | `kernel/ee/thread/delete.elf` | EE Kernel (Threads) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | Stops at `UnimplementedSyscall(pc=0x00104994, syscall=47 / 0x2F GetThreadId)` (`24,522` cycles). |
+| 32 | `kernel/ee/thread/exit.elf` | EE Kernel (Threads) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | Stops at `UnimplementedSyscall(pc=0x00104864, syscall=33 / 0x21 DeleteThread)` (`24,259` cycles). |
+| 33 | `kernel/ee/thread/resume.elf` | EE Kernel (Threads) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | Stops at `UnimplementedSyscall(pc=0x00104974, syscall=47 / 0x2F GetThreadId)` (`24,515` cycles). |
+| 34 | `kernel/ee/thread/sleep.elf` | EE Kernel (Threads) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | Stops at `UnimplementedSyscall(pc=0x00104814, syscall=47 / 0x2F GetThreadId)` (`24,515` cycles). |
+| 35 | `kernel/ee/thread/stat.elf` | EE Kernel (Threads) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | Stops at `UnimplementedSyscall(pc=0x001049C4, syscall=48 / 0x30 ReferThreadStatus)` (`24,539` cycles). |
+| 36 | `kernel/ee/thread/suspend.elf` | EE Kernel (Threads) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | Stops at `UnimplementedSyscall(pc=0x001049C4, syscall=47 / 0x2F GetThreadId)` (`24,522` cycles). |
+| 37 | `kernel/ee/thread/terminate.elf` | EE Kernel (Threads) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | Stops at `UnimplementedSyscall(pc=0x00104A54, syscall=47 / 0x2F GetThreadId)` (`24,522` cycles). |
+| 38 | `kernel/ee/thread/wakeup.elf` | EE Kernel (Threads) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | Stops at `UnimplementedSyscall(pc=0x001049A4, syscall=47 / 0x2F GetThreadId)` (`24,515` cycles). |
 
 ---
 
@@ -89,14 +88,14 @@ Total release wall time across all 23 suites: **`1.456 s` (`1456 ms`)** (`75,856
 | ---: | :--- | :--- | :--- | :--- | :--- |
 | 39 | `cpu/vu0_macro/integer.elf` | `COP2` / VU0 Macro | `DEFERRED` | Phase 2 | Hits `COP2` opcode `0x4A00_02FF` at `PC = 0x0010_329C` (`24,254` cycles). VU0 macro mode is out of Phase 1 scope. |
 | 40 | `cpu/vu0_macro/transfer.elf` | `COP2` / VU0 Macro | `DEFERRED` | Phase 2 | Hits `COP2` opcode `0x48B0_0800` (`QMTC2`) at `PC = 0x0010_07FC` (`26,764` cycles). VU0 macro mode is out of Phase 1 scope. |
-| 41 | `dma/vif/basic.elf` | `VIF1` / DMA | `DEFERRED` | Phase 2 | Writes to `VIF1` (`0x1000_3C00`) / `DMA Ch 1` and polls `VIF1_STAT` / `CHCR.STR` (`10,000,000` cycle timeout). |
-| 42 | `dma/vif/intstall.elf` | `VIF1` / DMA | `DEFERRED` | Phase 2 | Tests `VIF1` interrupt stall bit (`VIF1_STAT.INT`) and `VIF1_FBRST` (`27,481` cycles). |
-| 43 | `dma/vif/mskpath3.elf` | `VIF1` / `GIF` PATH3 | `DEFERRED` | Phase 2 | Tests `VIF1` `MSKPATH3` command interaction with `GIF_STAT` (`10,000,000` cycle timeout). |
-| 44 | `dma/vif/stcycl.elf` | `VIF1` (`STCYCL`/`UNPACK`) | `DEFERRED` | Phase 2 | Tests `VIF1` `STCYCL` + `UNPACK` into VU1 memory (`10,000,000` cycle timeout). |
-| 45 | `dma/vif/stmod.elf` | `VIF1` (`STMOD`/`UNPACK`) | `DEFERRED` | Phase 2 | Tests `VIF1` `STMOD` addition decompression into VU1 memory (`10,000,000` cycle timeout). |
-| 46 | `dma/vif/unpack.elf` | `VIF1` (`UNPACK`) | `DEFERRED` | Phase 2 | Tests `VIF1` `UNPACK` formats into VU1 memory (`10,000,000` cycle timeout). |
-| 47 | `gs/label.elf` | `GS` / `GIF` (`LABEL`) | `DEFERRED` | Phase 2 | Sends `GIF` `A+D` packet to `GS_LABEL` via `DMA Ch 2` and reads `GS_SIGLBLID` (`55,615` cycles). |
-| 48 | `gs/signal.elf` | `GS` / `GIF` (`SIGNAL`) | `DEFERRED` | Phase 2 | Sends `GIF` `A+D` packet to `GS_SIGNAL` via `DMA Ch 2` and tests `GS_CSR.SIGNAL` stall behavior (`71,860` cycles). |
+| 41 | `dma/vif/basic.elf` | `VIF1` / DMA | `DEFERRED` | Phase 2 | Writes to `VIF1` (`0x1000_3C00`) / `DMA Ch 1` (`UnimplementedDmaTransfer` / `VIF1_STAT`). |
+| 42 | `dma/vif/intstall.elf` | `VIF1` / DMA | `DEFERRED` | Phase 2 | Tests `VIF1` interrupt stall bit (`VIF1_STAT.INT`) and `VIF1_FBRST`. |
+| 43 | `dma/vif/mskpath3.elf` | `VIF1` / `GIF` PATH3 | `DEFERRED` | Phase 2 | Tests `VIF1` `MSKPATH3` command interaction with `GIF_STAT`. |
+| 44 | `dma/vif/stcycl.elf` | `VIF1` (`STCYCL`/`UNPACK`) | `DEFERRED` | Phase 2 | Tests `VIF1` `STCYCL` + `UNPACK` into VU1 memory. |
+| 45 | `dma/vif/stmod.elf` | `VIF1` (`STMOD`/`UNPACK`) | `DEFERRED` | Phase 2 | Tests `VIF1` `STMOD` addition decompression into VU1 memory. |
+| 46 | `dma/vif/unpack.elf` | `VIF1` (`UNPACK`) | `DEFERRED` | Phase 2 | Tests `VIF1` `UNPACK` formats into VU1 memory. |
+| 47 | `gs/label.elf` | `GS` / `GIF` (`LABEL`) | `DEFERRED` | Phase 2 | Sends `GIF` `A+D` packet to `GS_LABEL` via `DMA Ch 2` (`UnimplementedDmaTransfer(ch=2 [GIF])`). |
+| 48 | `gs/signal.elf` | `GS` / `GIF` (`SIGNAL`) | `DEFERRED` | Phase 2 | Sends `GIF` `A+D` packet to `GS_SIGNAL` via `DMA Ch 2` (`UnimplementedDmaTransfer(ch=2 [GIF])`). |
 | 49 | `vu/games/triace.elf` | `VU0`/`VU1` Micro + `COP2` | `DEFERRED` | Phase 2 | Hits `COP2` opcode `0x4A00_02FF` at `PC = 0x0010_3DBC` (`25,640` cycles). |
 | 50 | `vu/lower/branch.elf` | `VU0`/`VU1` Micro + `COP2` | `DEFERRED` | Phase 2 | Hits `COP2` opcode `0x4A00_02FF` at `PC = 0x0010_3E7C` (`25,727` cycles). |
 | 51 | `vu/lower/efu.elf` | `VU1` EFU + `COP2` | `DEFERRED` | Phase 2 | Hits `COP2` opcode `0x4A00_02FF` at `PC = 0x0010_B70C` (`26,782` cycles). |
@@ -107,30 +106,37 @@ Total release wall time across all 23 suites: **`1.456 s` (`1456 ms`)** (`75,856
 
 ---
 
-## All 23 IOP `.irx` Suites — Per-Suite Status Table (Deferred to Tasks 5 & 7b)
+## All 23 IOP `.irx` Suites — Per-Suite Status Table
+
+### 1. Phase 1 Hardware Gate: IOP R3000A CPU Suites (`7 .irx` suites — Deferred to Task 6)
 
 | # | Suite (`tests/...`) | Category | Status | Target Task | Dependency |
 | ---: | :--- | :--- | :--- | :--- | :--- |
-| 1 | `cpu/iop/alu.irx` | IOP R3000A ALU | `DEFERRED` | Task 5 & 7b | R3000A interpreter (Task 5) + `.irx` loader & IOP `stdio` HLE (Task 7b). |
-| 2 | `cpu/iop/branch.irx` | IOP R3000A Branch | `DEFERRED` | Task 5 & 7b | R3000A interpreter (Task 5) + `.irx` loader & IOP `stdio` HLE (Task 7b). |
-| 3 | `cpu/iop/branchdelay.irx` | IOP R3000A Branch Delay | `DEFERRED` | Task 5 & 7b | R3000A interpreter (Task 5) + `.irx` loader & IOP `stdio` HLE (Task 7b). |
-| 4 | `cpu/iop/hilodelay.irx` | IOP R3000A HI/LO Delay | `DEFERRED` | Task 5 & 7b | R3000A interpreter (Task 5) + `.irx` loader & IOP `stdio` HLE (Task 7b). |
-| 5 | `cpu/iop/lsu.irx` | IOP R3000A Load/Store | `DEFERRED` | Task 5 & 7b | R3000A interpreter (Task 5) + `.irx` loader & IOP `stdio` HLE (Task 7b). |
-| 6 | `cpu/iop/lsudelay.irx` | IOP R3000A LSU Delay | `DEFERRED` | Task 5 & 7b | R3000A interpreter (Task 5) + `.irx` loader & IOP `stdio` HLE (Task 7b). |
-| 7 | `cpu/iop/muldiv.irx` | IOP R3000A Mul/Div | `DEFERRED` | Task 5 & 7b | R3000A interpreter (Task 5) + `.irx` loader & IOP `stdio` HLE (Task 7b). |
-| 8 | `kernel/iop/eventflag/delete.irx` | IOP Kernel (`thevent`) | `DEFERRED` | Task 5 & 7b | IOP `thevent` module HLE (Task 7b). |
-| 9 | `kernel/iop/eventflag/poll.irx` | IOP Kernel (`thevent`) | `DEFERRED` | Task 5 & 7b | IOP `thevent` module HLE (Task 7b). |
-| 10 | `kernel/iop/interrupt/register.irx` | IOP Kernel (`intrman`) | `DEFERRED` | Task 5 & 7b | IOP `intrman` module HLE (Task 7b). |
-| 11 | `kernel/iop/interrupt/release.irx` | IOP Kernel (`intrman`) | `DEFERRED` | Task 5 & 7b | IOP `intrman` module HLE (Task 7b). |
-| 12 | `kernel/iop/libc/sprintf.irx` | IOP Kernel (`sysclib`) | `DEFERRED` | Task 5 & 7b | IOP `sysclib` module HLE (Task 7b). |
-| 13 | `kernel/iop/libc/strtok.irx` | IOP Kernel (`sysclib`) | `DEFERRED` | Task 5 & 7b | IOP `sysclib` module HLE (Task 7b). |
-| 14 | `kernel/iop/messagebox/poll.irx` | IOP Kernel (`thmsgbx`) | `DEFERRED` | Task 5 & 7b | IOP `thmsgbx` module HLE (Task 7b). |
-| 15 | `kernel/iop/messagebox/receive.irx` | IOP Kernel (`thmsgbx`) | `DEFERRED` | Task 5 & 7b | IOP `thmsgbx` module HLE (Task 7b). |
-| 16 | `kernel/iop/messagebox/send.irx` | IOP Kernel (`thmsgbx`) | `DEFERRED` | Task 5 & 7b | IOP `thmsgbx` module HLE (Task 7b). |
-| 17 | `kernel/iop/thread/cancelwakeup.irx` | IOP Kernel (`thbase`) | `DEFERRED` | Task 5 & 7b | IOP `thbase` module HLE (Task 7b). |
-| 18 | `kernel/iop/thread/create.irx` | IOP Kernel (`thbase`) | `DEFERRED` | Task 5 & 7b | IOP `thbase` module HLE (Task 7b). |
-| 19 | `kernel/iop/thread/delete.irx` | IOP Kernel (`thbase`) | `DEFERRED` | Task 5 & 7b | IOP `thbase` module HLE (Task 7b). |
-| 20 | `kernel/iop/thread/releasewait.irx` | IOP Kernel (`thbase`) | `DEFERRED` | Task 5 & 7b | IOP `thbase` module HLE (Task 7b). |
-| 21 | `kernel/iop/thread/stat.irx` | IOP Kernel (`thbase`) | `DEFERRED` | Task 5 & 7b | IOP `thbase` module HLE (Task 7b). |
-| 22 | `kernel/iop/vpool/create.irx` | IOP Kernel (`thvpool`) | `DEFERRED` | Task 5 & 7b | IOP `thvpool` module HLE (Task 7b). |
-| 23 | `kernel/iop/vpool/pallocate.irx` | IOP Kernel (`thvpool`) | `DEFERRED` | Task 5 & 7b | IOP `thvpool` module HLE (Task 7b). |
+| 1 | `cpu/iop/alu.irx` | IOP R3000A ALU | `DEFERRED` | Task 6 | R3000A interpreter + `.irx` runner. |
+| 2 | `cpu/iop/branch.irx` | IOP R3000A Branch | `DEFERRED` | Task 6 | R3000A interpreter + `.irx` runner. |
+| 3 | `cpu/iop/branchdelay.irx` | IOP R3000A Branch Delay | `DEFERRED` | Task 6 | R3000A interpreter + `.irx` runner. |
+| 4 | `cpu/iop/hilodelay.irx` | IOP R3000A HI/LO Delay | `DEFERRED` | Task 6 | R3000A interpreter + `.irx` runner. |
+| 5 | `cpu/iop/lsu.irx` | IOP R3000A Load/Store | `DEFERRED` | Task 6 | R3000A interpreter + `.irx` runner. |
+| 6 | `cpu/iop/lsudelay.irx` | IOP R3000A LSU Delay | `DEFERRED` | Task 6 | R3000A interpreter + `.irx` runner. |
+| 7 | `cpu/iop/muldiv.irx` | IOP R3000A Mul/Div | `DEFERRED` | Task 6 | R3000A interpreter + `.irx` runner. |
+
+### 2. Kernel Track: IOP Kernel Module Suites (`16 .irx` suites — Post-LLE BIOS Track)
+
+| # | Suite (`tests/...`) | Category | Status | Track | Dependency |
+| ---: | :--- | :--- | :--- | :--- | :--- |
+| 8 | `kernel/iop/eventflag/delete.irx` | IOP Kernel (`thevent`) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | IOP `thevent` module behavior. |
+| 9 | `kernel/iop/eventflag/poll.irx` | IOP Kernel (`thevent`) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | IOP `thevent` module behavior. |
+| 10 | `kernel/iop/interrupt/register.irx` | IOP Kernel (`intrman`) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | IOP `intrman` module behavior. |
+| 11 | `kernel/iop/interrupt/release.irx` | IOP Kernel (`intrman`) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | IOP `intrman` module behavior. |
+| 12 | `kernel/iop/libc/sprintf.irx` | IOP Kernel (`sysclib`) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | IOP `sysclib` module behavior. |
+| 13 | `kernel/iop/libc/strtok.irx` | IOP Kernel (`sysclib`) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | IOP `sysclib` module behavior. |
+| 14 | `kernel/iop/messagebox/poll.irx` | IOP Kernel (`thmsgbx`) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | IOP `thmsgbx` module behavior. |
+| 15 | `kernel/iop/messagebox/receive.irx` | IOP Kernel (`thmsgbx`) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | IOP `thmsgbx` module behavior. |
+| 16 | `kernel/iop/messagebox/send.irx` | IOP Kernel (`thmsgbx`) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | IOP `thmsgbx` module behavior. |
+| 17 | `kernel/iop/thread/cancelwakeup.irx` | IOP Kernel (`thbase`) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | IOP `thbase` module behavior. |
+| 18 | `kernel/iop/thread/create.irx` | IOP Kernel (`thbase`) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | IOP `thbase` module behavior. |
+| 19 | `kernel/iop/thread/delete.irx` | IOP Kernel (`thbase`) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | IOP `thbase` module behavior. |
+| 20 | `kernel/iop/thread/releasewait.irx` | IOP Kernel (`thbase`) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | IOP `thbase` module behavior. |
+| 21 | `kernel/iop/thread/stat.irx` | IOP Kernel (`thbase`) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | IOP `thbase` module behavior. |
+| 22 | `kernel/iop/vpool/create.irx` | IOP Kernel (`thvpool`) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | IOP `thvpool` module behavior. |
+| 23 | `kernel/iop/vpool/pallocate.irx` | IOP Kernel (`thvpool`) | `DEFERRED` | Kernel Track (Post-LLE BIOS) | IOP `thvpool` module behavior. |

@@ -17,7 +17,7 @@
 //!   * `LWR` sign-extends bit 31 into bits `32..=63` only when `(addr & 3) == 0`; for `(addr & 3) != 0`
 //!     it replaces only the low `(4 - (addr & 3))` bytes, preserving bits `24..=63` (`lsu.expected`).
 
-use crate::bus::Bus;
+use crate::bus::{Bus, UnimplementedDmaTransfer};
 
 use super::cop0::{cause_bits, cop0_reg, Level1ExceptionCode};
 use super::state::EeCpuState;
@@ -51,6 +51,8 @@ pub enum HleStepResult {
         /// Subsystem category (`"MMI (Task 4)"`, `"COP1 / FPU (Task 4)"`, or `"COP2 / VU0 Macro (Task 4)"`).
         category: &'static str,
     },
+    /// Program started a DMA transfer on an unimplemented peripheral channel (`0..=7`).
+    UnimplementedDmaTransfer(UnimplementedDmaTransfer),
 }
 
 /// Control-flow outcome of a single R5900 instruction execution.
@@ -222,6 +224,9 @@ impl EeCpuState {
         }
 
         self.step(bus);
+        if let Some(info) = bus.dmac.unimplemented_transfer.take() {
+            return HleStepResult::UnimplementedDmaTransfer(info);
+        }
         HleStepResult::Continue
     }
 
@@ -1424,7 +1429,7 @@ impl EeCpuState {
 
             // BC0 (rs == 0x08): BC0F (0), BC0T (1), BC0FL (2), BC0TL (3) (`ps2tek` `#eeinstructions`)
             0x08 => {
-                let cond = self.cpcond0;
+                let cond = self.cpcond0 && bus.dmac.cpcond0();
                 match rt {
                     // BC0F
                     0x00 => {

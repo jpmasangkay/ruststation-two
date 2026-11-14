@@ -36,6 +36,8 @@ pub enum HardwareEventKind {
     IopTimeslice,
     /// Step active 128-bit EE DMAC channels.
     DmacTick,
+    /// Complete a scheduled EE DMAC channel transfer (`channel_index`: `0..=9`).
+    DmacChannelComplete(u8),
     /// EE hardware timer compare/overflow check (`timer_index`: `0..=3`).
     EeTimer(u8),
     /// IOP hardware timer compare/overflow check (`timer_index`: `0..=5`).

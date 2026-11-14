@@ -166,7 +166,7 @@ impl EeCpuState {
                 if bus.intc.int0_pending() {
                     cause |= cause_bits::IP_INT0;
                 }
-                if self.int1_line {
+                if self.int1_line || bus.dmac.int1_pending() {
                     cause |= cause_bits::IP_INT1;
                 }
                 cause

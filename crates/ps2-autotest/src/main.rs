@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use ps2_core::bus::Bus;
+use ps2_core::bus::{Bus, UnimplementedDmaTransfer};
 use ps2_core::ee::{EeCpuState, EeHleState, HleStepResult};
 use ps2_core::{load_elf32, ElfError, LoadedElf};
 use similar::TextDiff;
@@ -49,6 +49,8 @@ pub enum RunStopReason {
         instr: u32,
         category: &'static str,
     },
+    /// Attempted a DMA transfer on an unimplemented peripheral channel (`0..=7`).
+    UnimplementedDmaTransfer(UnimplementedDmaTransfer),
 }
 
 impl std::fmt::Display for RunStopReason {
@@ -68,6 +70,11 @@ impl std::fmt::Display for RunStopReason {
             } => write!(
                 f,
                 "UnimplementedInstruction(pc=0x{pc:08X}, instr=0x{instr:08X}, category={category})"
+            ),
+            Self::UnimplementedDmaTransfer(info) => write!(
+                f,
+                "UnimplementedDmaTransfer(ch={} [{}], chcr=0x{:08X}, madr=0x{:08X}, qwc=0x{:04X}, tadr=0x{:08X})",
+                info.channel, info.channel_name, info.chcr, info.madr, info.qwc, info.tadr
             ),
         }
     }
@@ -116,6 +123,9 @@ pub fn run_elf_bytes(elf_bytes: &[u8], max_cycles: u64) -> Result<ElfRunReport, 
                     instr,
                     category,
                 };
+            }
+            HleStepResult::UnimplementedDmaTransfer(info) => {
+                break RunStopReason::UnimplementedDmaTransfer(info);
             }
         }
     };
