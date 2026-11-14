@@ -1,16 +1,25 @@
 //! Graphics Synthesizer (GS) Privileged Registers Stub (`0x1200_0000..=0x1200_1FFF`).
 //!
-//! Primary source reference:
-//! - `ps2tek` ("GS Privileged Registers"):
-//!   * Mapped into the EE physical address space at `0x1200_0000` in 64-bit register slots.
-//!   * `GS_CSR` (`0x1200_1000`):
-//!     - Bits `0..=4` (`SIGNAL`, `FINISH`, `HSINT`, `VSINT`, `EDWINT`): writing `1` clears
-//!       the corresponding interrupt status bit.
-//!     - Bit `13` (`FIELD`): toggles every VBlank (`0` = Even, `1` = Odd).
-//!     - Bits `14..=15` (`FIFO`): `0b01` = FIFO empty (so BIOS/game wait loops do not stall).
-//!     - Bits `16..=23` (`REV` = `0x1B`), Bits `24..=31` (`ID` = `0x55`).
+//! Primary source references:
+//! - `ps2tek` (`https://psi-rockin.github.io/ps2tek/#iomaps` & `https://psi-rockin.github.io/ps2tek/#gs`):
+//!   * Mapped into the EE physical address space at `0x1200_0000` in 64-bit register slots:
+//!     `0x1200_0000` `PMODE`, `0x1200_0010` `SMODE1`, `0x1200_0020` `SMODE2`, `0x1200_0030` `SRFSH`,
+//!     `0x1200_0040` `SYNCH1`, `0x1200_0050` `SYNCH2`, `0x1200_0060` `SYNCV`, `0x1200_0070` `DISPFB1`,
+//!     `0x1200_0080` `DISPLAY1`, `0x1200_0090` `DISPFB2`, `0x1200_00A0` `DISPLAY2`, `0x1200_00B0` `EXTBUF`,
+//!     `0x1200_00C0` `EXTDATA`, `0x1200_00D0` `EXTWRITE`, `0x1200_00E0` `BGCOLOR`, `0x1200_1000` `GS_CSR`,
+//!     `0x1200_1010` `GS_IMR`, `0x1200_1040` `BUSDIR`, `0x1200_1080` `SIGLBLID`.
+//! - `ps2autotests` (`tests/gs/gsregs.h` & `tests/gs/signal.cpp`):
+//!   * `GS_CSR` (`0x1200_1000`) bit 0 is `SIGNAL` (acknowledged/cleared by writing `1` to bit 0).
+//!
+//! Unverified claims marked with `TODO(verify)`:
+//! - Exact bit positions in `GS_CSR` (`0x1200_1000`) for `FINISH` (bit 1), `HSINT` (bit 2),
+//!   `VSINT` (bit 3), `EDWINT` (bit 4), `FIELD` (bit 13), `FIFO` (bits 14..15),
+//!   `REV` (`0x1B`, bits 16..23), and `ID` (`0x55`, bits 24..31) are not tabulated in `ps2tek`
+//!   or `ps2autotests`.
 
-/// Default read-only `REV` (`0x1B`) and `ID` (`0x55`) plus `FIFO = Empty` (`1 << 14`) in `GS_CSR` (`ps2tek`).
+// TODO(verify): Exact GS_CSR bit positions for FIFO (bits 14..15 = 0b01), REV (0x1B at bits 16..23),
+// and ID (0x55 at bits 24..31) are from memory and not tabulated in ps2tek or ps2autotests.
+/// Default read-only `REV` (`0x1B`) and `ID` (`0x55`) plus `FIFO = Empty` (`1 << 14`) in `GS_CSR`.
 const GS_CSR_FIXED_BITS: u64 = (0x55u64 << 24) | (0x1Bu64 << 16) | (1u64 << 14);
 
 /// Stub state for the GS Privileged Registers in Phase 1 (before full `ps2-gs` arrives in Phase 2).
@@ -68,14 +77,16 @@ impl GsPrivilegedStub {
         }
     }
 
-    /// Toggle `GS_CSR.FIELD` (bit 13) and set `GS_CSR.VSINT` (bit 3) on VBlank start (`ps2tek`).
+    // TODO(verify): GS_CSR.FIELD (bit 13) and GS_CSR.VSINT (bit 3) bit positions are not tabulated in ps2tek.
+    /// Toggle `GS_CSR.FIELD` (bit 13) and set `GS_CSR.VSINT` (bit 3) on VBlank start.
     #[inline(always)]
     pub fn on_vblank_start(&mut self) {
         self.csr ^= 1 << 13;
         self.csr |= 1 << 3;
     }
 
-    /// Set `GS_CSR.HSINT` (bit 2) on HBlank (`ps2tek`).
+    // TODO(verify): GS_CSR.HSINT (bit 2) bit position is not tabulated in ps2tek.
+    /// Set `GS_CSR.HSINT` (bit 2) on HBlank.
     #[inline(always)]
     pub fn on_hblank(&mut self) {
         self.csr |= 1 << 2;
@@ -126,7 +137,8 @@ impl GsPrivilegedStub {
             0x00D0 => self.extwrite = val,
             0x00E0 => self.bgcolor = val,
             0x1000 => {
-                // Writing 1 to bits 0..=4 clears those interrupt flags (`ps2tek`).
+                // Bit 0 (SIGNAL) write-1-to-clear is verified in ps2autotests (tests/gs/signal.cpp).
+                // TODO(verify): Bits 1..=4 (FINISH, HSINT, VSINT, EDWINT) write-1-to-clear are from memory.
                 let clear_mask = val & 0x1F;
                 self.csr = (self.csr & !clear_mask) | GS_CSR_FIXED_BITS;
             }

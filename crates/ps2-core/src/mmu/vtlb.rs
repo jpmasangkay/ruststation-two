@@ -1,14 +1,15 @@
 //! Software 4 KB Virtual-to-Physical Page Table (`vtlb`).
 //!
 //! Primary source references:
-//! - `ps2tek` ("EE Memory Map" & "EE COP0 -> TLB"):
+//! - `ps2tek` (`https://psi-rockin.github.io/ps2tek/#memorymap` & `https://psi-rockin.github.io/ps2tek/#eecop0memorymanagement`):
 //!   * `KSEG0` (`0x8000_0000..=0x9FFF_FFFF`) and `KSEG1` (`0xA000_0000..=0xBFFF_FFFF`) are
 //!     architecturally unmapped segments where `paddr = vaddr & 0x1FFF_FFFF`.
-//!   * `KUSEG` (`0x0000_0000..=0x7FFF_FFFF`) is TLB-mapped. The PS2 kernel default TLB layout
-//!     maps Main RDRAM at `0x0000_0000..=0x01FF_FFFF` (Cached), `0x2000_0000..=0x21FF_FFFF`
-//!     (Uncached), and `0x3010_0000..=0x31FF_FFFF` (Uncached Accelerated / UCAB), identity-maps
-//!     I/O, VU memory, GS Privileged registers, IOP RAM, and BIOS ROM in `0x1000_0000..=0x1FFF_FFFF`,
-//!     and maps the 16 KB Scratchpad SRAM at `0x7000_0000..=0x7000_3FFF` via `EntryLo0.S = 1`.
+//!   * `KUSEG` (`0x0000_0000..=0x7FFF_FFFF`) is TLB-mapped.
+//! - `ps2autotests` (`tests/memory/ee/default.cpp`):
+//!   * Verifies that the default PS2 kernel TLB layout mirrors 32 MB Main RDRAM at
+//!     `0x0000_0000..=0x01FF_FFFF` (Cached), `0x2000_0000..=0x21FF_FFFF` (Uncached),
+//!     and `0x3010_0000..=0x31FF_FFFF` (Uncached Accelerated / UCAB), and maps the 16 KB
+//!     Scratchpad SRAM at `0x7000_0000..=0x7000_3FFF` via `EntryLo0.S = 1`.
 
 use ps2_common::vmem::{GUEST_PAGE_MASK, GUEST_PAGE_SHIFT, GUEST_PAGE_SIZE, VTLB_PAGE_COUNT};
 

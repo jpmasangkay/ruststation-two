@@ -1,12 +1,12 @@
 //! Emotion Engine Interrupt Controller (`INTC`, `0x1000_F000` / `0x1000_F010`).
 //!
 //! Primary source reference:
-//! - `ps2tek` ("EE Interrupt Controller (INTC)"):
+//! - `ps2tek` (`https://psi-rockin.github.io/ps2tek/#eeintc`):
 //!   * `INTC_STAT` (`0x1000_F000`): Bits `0..=14` indicate pending interrupt causes.
 //!     Writing `1` to any bit **clears** that bit (`stat &= !val`).
 //!   * `INTC_MASK` (`0x1000_F010`): Bits `0..=14` enable/disable interrupt causes.
-//!     Writing `1` to any bit **toggles (flips)** that bit (`mask ^= val`).
-//!   * The `INT0` interrupt line to EE `COP0` (`Cause.IP2`, bit 10) is asserted whenever
+//!     Writing `1` to any bit **reverses (toggles)** that bit (`mask ^= val`).
+//!   * The `INT0` interrupt line to EE `COP0` (`Cause` bit 10) is asserted whenever
 //!     `(INTC_STAT & INTC_MASK) != 0`.
 
 use bitflags::bitflags;

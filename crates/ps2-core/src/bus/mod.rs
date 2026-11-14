@@ -1,14 +1,14 @@
 //! Emotion Engine System Bus, Physical/Virtual Memory Dispatch, and Core I/O Map.
 //!
-//! Primary source reference:
-//! - `ps2tek` ("EE Memory Map" & "EE I/O Registers"):
+//! Primary source references:
+//! - `ps2tek` (`https://psi-rockin.github.io/ps2tek/#memorymap` & `https://psi-rockin.github.io/ps2tek/#iomaps`):
 //!   * `0x0000_0000..=0x01FF_FFFF`: 32 MB Main RDRAM (`8`/`16`/`32`/`64`/`128`-bit).
-//!   * `0x1000_0000..=0x1000_FFFF`: 64 KB EE I/O Registers (`Timers`, `INTC`, `DMAC`, `SIF`, `MCH`, `EE_SIO`).
+//!   * `0x1000_0000..=0x1000_FFFF`: 64 KB EE I/O Registers (`Timers`, `INTC`, `DMAC`, `SIF`, `MCH`, `KPUTCHAR`).
 //!   * `0x1100_0000..=0x1100_FFFF`: 64 KB VU0/VU1 Micro & Data Memory window:
-//!     - `0x1100_0000..=0x1100_3FFF`: 4 KB VU0 Micro Memory (mirrored 4x).
-//!     - `0x1100_4000..=0x1100_7FFF`: 4 KB VU0 Data Memory (mirrored 4x).
-//!     - `0x1100_8000..=0x1100_BFFF`: 16 KB VU1 Micro Memory.
-//!     - `0x1100_C000..=0x1100_FFFF`: 16 KB VU1 Data Memory.
+//!     - `0x1100_0000..=0x1100_0FFF`: 4 KB VU0 Micro Memory (`ps2tek` `#memorymap`).
+//!     - `0x1100_4000..=0x1100_4FFF`: 4 KB VU0 Data Memory (`ps2tek` `#memorymap`).
+//!     - `0x1100_8000..=0x1100_BFFF`: 16 KB VU1 Micro Memory (`ps2tek` `#memorymap`).
+//!     - `0x1100_C000..=0x1100_FFFF`: 16 KB VU1 Data Memory (`ps2tek` `#memorymap`).
 //!   * `0x1200_0000..=0x1200_1FFF`: 8 KB GS Privileged Registers (`64`-bit slots).
 //!   * `0x1C00_0000..=0x1C1F_FFFF`: 2 MB IOP Main RAM mirror.
 //!   * `0x1FC0_0000..=0x1FFF_FFFF`: 4 MB System BIOS ROM (Read-Only).
@@ -17,6 +17,7 @@
 pub mod gs_stub;
 pub mod intc;
 pub mod rdram_mch;
+pub mod timers;
 
 use ps2_common::Reg128;
 
@@ -25,19 +26,22 @@ use crate::mmu::{Tlb, TlbEntry, TranslatedAddr, Vtlb, VtlbTarget};
 pub use gs_stub::GsPrivilegedStub;
 pub use intc::{EeIntc, IntcFlags};
 pub use rdram_mch::RdramMch;
+pub use timers::EeTimers;
 
-/// 32 MB Main RDRAM size in bytes (`ps2tek`).
+/// 32 MB Main RDRAM size in bytes (`ps2tek` `#memorymap`).
 pub const EE_RAM_SIZE: usize = 32 * 1024 * 1024;
-/// 16 KB Scratchpad SRAM size in bytes (`ps2tek`).
+/// 16 KB Scratchpad SRAM size in bytes (`ps2tek` `#memorymap`).
 pub const SCRATCHPAD_SIZE: usize = 16 * 1024;
-/// 4 MB System BIOS ROM size in bytes (`ps2tek`).
+/// 4 MB System BIOS ROM size in bytes (`ps2tek` `#memorymap`).
 pub const BIOS_SIZE: usize = 4 * 1024 * 1024;
-/// 2 MB IOP Main RAM size in bytes (`ps2tek`).
+/// 2 MB IOP Main RAM size in bytes (`ps2tek` `#memorymap`).
 pub const IOP_RAM_SIZE: usize = 2 * 1024 * 1024;
-/// 64 KB VU0/1 memory window (`ps2tek`).
+/// 64 KB VU0/1 memory window (`ps2tek` `#memorymap`).
 pub const VU_MEM_WINDOW_SIZE: usize = 64 * 1024;
 
-/// Normalize a 16-bit offset within `0x1100_0000..=0x1100_FFFF` to account for 4 KB VU0 Micro/Data mirroring (`ps2tek`).
+// TODO(verify): 4x mirroring of 4 KB VU0 Micro (0x1100_0000..=0x1100_3FFF) and 4 KB VU0 Data
+// (0x1100_4000..=0x1100_7FFF) across the 16 KB windows is not explicitly stated in ps2tek #memorymap.
+/// Normalize a 16-bit offset within `0x1100_0000..=0x1100_FFFF` to account for 4 KB VU0 Micro/Data mirroring.
 #[inline(always)]
 const fn normalize_vu_mem_offset(offset: u32) -> usize {
     let off = (offset & 0xFFFF) as usize;
@@ -66,6 +70,8 @@ pub struct Bus {
     pub tlb: Tlb,
     /// Software 4 KB virtual-to-physical page table (`1,048,576` entries).
     pub vtlb: Vtlb,
+    /// EE 16-bit Hardware Timers (`TIM0..TIM3`, `0x1000_0000..=0x1000_1FFF`).
+    pub timers: EeTimers,
     /// EE Interrupt Controller (`0x1000_F000` / `0x1000_F010`).
     pub intc: EeIntc,
     /// RDRAM initialization handshake registers (`0x1000_F430` / `0x1000_F440`).
@@ -73,9 +79,9 @@ pub struct Bus {
     /// GS Privileged Registers (`0x1200_0000..=0x1200_1FFF`).
     pub gs: GsPrivilegedStub,
     /// DMAC `D_ENABLER` (`0x1000_F520`) / `D_ENABLEW` (`0x1000_F590`) master suspend register
-    /// (initialized to `0x1201` per `ps2tek` "EE DMAC -> D_ENABLER").
+    /// (initialized to `0x1201` per `ps2tek` `https://psi-rockin.github.io/ps2tek/#dmacio`).
     pub dmac_enable: u32,
-    /// Captured EE serial / console stdout bytes (`EE_SIO` `0x1000_F180` TX register + HLE stdout).
+    /// Captured EE serial / console stdout bytes (`KPUTCHAR` `0x1000_F180` + HLE stdout, `ps2tek` `#iomaps`).
     pub stdout_buffer: Vec<u8>,
 }
 
@@ -96,6 +102,7 @@ impl Bus {
             vu_mem: vec![0u8; VU_MEM_WINDOW_SIZE].into_boxed_slice(),
             tlb: Tlb::new(),
             vtlb: Vtlb::new(),
+            timers: EeTimers::new(),
             intc: EeIntc::new(),
             rdram_mch: RdramMch::new(),
             gs: GsPrivilegedStub::new(),
@@ -438,13 +445,20 @@ impl Bus {
         }
     }
 
+    /// Advance active EE hardware timers (`TIM0..TIM3`) by `ee_cycles`, updating `self.intc`.
+    #[inline]
+    pub fn step_timers(&mut self, ee_cycles: u32) {
+        self.timers.step_ee_cycles(ee_cycles, &mut self.intc);
+    }
+
     #[cold]
     fn read_mmio32(&mut self, paddr: u32) -> u32 {
         match paddr {
+            0x1000_0000..=0x1000_1FFF => self.timers.read32(paddr),
             0x1000_F000 => self.intc.read_stat(),
             0x1000_F010 => self.intc.read_mask(),
-            0x1000_F430 => self.rdram_mch.read_ricm(),
-            0x1000_F440 => self.rdram_mch.read_drcm(),
+            0x1000_F430 => self.rdram_mch.read_f430(),
+            0x1000_F440 => self.rdram_mch.read_f440(),
             0x1000_F520 => self.dmac_enable,
             0x1200_0000..=0x1200_1FFF => self.gs.read32(paddr),
             _ => {
@@ -472,7 +486,8 @@ impl Bus {
     #[cold]
     fn write_mmio8(&mut self, paddr: u32, val: u8) {
         if paddr == 0x1000_F180 {
-            // EE_SIO TX FIFO register (`ps2tek` "EE SIO"): captures kernel serial character output.
+            // KPUTCHAR register (`ps2tek` `https://psi-rockin.github.io/ps2tek/#iomaps`):
+            // captures kernel serial console character output.
             self.stdout_buffer.push(val);
             return;
         }
@@ -482,11 +497,12 @@ impl Bus {
     #[cold]
     fn write_mmio32(&mut self, paddr: u32, val: u32) {
         match paddr {
+            0x1000_0000..=0x1000_1FFF => self.timers.write32(paddr, val),
             0x1000_F000 => self.intc.write_stat(val),
             0x1000_F010 => self.intc.write_mask(val),
             0x1000_F180 => self.stdout_buffer.push((val & 0xFF) as u8),
-            0x1000_F430 => self.rdram_mch.write_ricm(val),
-            0x1000_F440 => self.rdram_mch.write_drcm(val),
+            0x1000_F430 => self.rdram_mch.write_f430(val),
+            0x1000_F440 => self.rdram_mch.write_f440(val),
             0x1000_F590 => self.dmac_enable = val,
             0x1200_0000..=0x1200_1FFF => self.gs.write32(paddr, val),
             _ => {

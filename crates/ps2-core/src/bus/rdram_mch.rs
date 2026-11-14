@@ -1,82 +1,82 @@
-//! RDRAM Memory Controller Handshake Registers (`MCH_RICM` `0x1000_F430` / `MCH_DRCM` `0x1000_F440`).
+//! RDRAM Memory Controller Handshake Registers (`0x1000_F430` / `0x1000_F440`).
 //!
 //! Primary source reference:
-//! - `ps2tek` ("EE I/O Registers -> MCH_RICM / MCH_DRCM"):
-//!   * During early BIOS initialization, the Emotion Engine probes RDRAM modules by writing commands
-//!     to `MCH_RICM` (`0x1000_F430`) and `MCH_DRCM` (`0x1000_F440`) and reading back `MCH_DRCM`.
-//!   * `MCH_RICM` (`0x1000_F430`) always reads `0`.
-//!   * On write to `MCH_RICM`: if `SA == 0x21` (`(val >> 16) & 0xFFF == 0x21`), `SOP == 1`
-//!     (`(val >> 6) & 0xF == 1`), and `(drcm >> 7) & 1 == 0`, the RDRAM device counter `sdevid_sr`
-//!     resets to `0`. Bit 31 (busy flag) is cleared immediately.
-//!   * On read from `MCH_DRCM` (`0x1000_F440`):
-//!     - If `SOP == 0` (`(ricm >> 6) & 0xF == 0`), returns `0x0D0D_0000`.
-//!     - If `SOP == 1`, switches on `SA = (ricm >> 16) & 0xFFF`:
-//!       * `0x21` -> `0x1F`
-//!       * `0x23` -> `0x0D0D`
-//!       * `0x24` -> `0x0090 | ((ricm & 0x100) >> 3)`
-//!       * `0x40` -> returns `sdevid_sr` and increments `sdevid_sr` if `< 2` (for two 16 MB RDRAM modules = 32 MB).
+//! - `ps2tek` (`https://psi-rockin.github.io/ps2tek/#eerdram` & `https://psi-rockin.github.io/ps2tek/#iomaps`):
+//!   * During early BIOS initialization, the Emotion Engine initializes RDRAM via `0x1000_F430`
+//!     and `0x1000_F440`.
+//!   * Reading `0x1000_F430` always returns `0`.
+//!   * Writing `data` to `0x1000_F430`:
+//!     - `SA = (data >> 16) & 0xFFF`, `SBC = (data >> 6) & 0xF`.
+//!     - If `SA == 0x21 && SBC == 1 && ((MCH_DRD >> 7) & 1) == 0`, resets `rdram_sdevid = 0`.
+//!     - Stores `MCH_RICM = data & !0x8000_0000`.
+//!   * Writing `data` to `0x1000_F440` stores `MCH_DRD = data`.
+//!   * Reading `0x1000_F440`:
+//!     - `SOP = (MCH_RICM >> 6) & 0xF`, `SA = (MCH_RICM >> 16) & 0xFFF`.
+//!     - If `SOP == 0`:
+//!       * `SA == 0x21`: if `rdram_sdevid < 2`, increments `rdram_sdevid` and returns `0x1F`; else `0`.
+//!       * `SA == 0x23`: returns `0x0D0D`.
+//!       * `SA == 0x24`: returns `0x0090`.
+//!       * `SA == 0x40`: returns `MCH_RICM & 0x1F`.
+//!       * Otherwise returns `0`.
 
-/// Emotion Engine RDRAM controller (`MCH_RICM` / `MCH_DRCM`) state machine.
+/// Emotion Engine RDRAM controller (`MCH_RICM` / `MCH_DRD`) state machine (`ps2tek` `#eerdram`).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct RdramMch {
     pub ricm: u32,
-    pub drcm: u32,
-    pub sdevid_sr: u32,
+    pub drd: u32,
+    pub rdram_sdevid: u32,
 }
 
 impl RdramMch {
     pub const fn new() -> Self {
         Self {
             ricm: 0,
-            drcm: 0,
-            sdevid_sr: 0,
+            drd: 0,
+            rdram_sdevid: 0,
         }
     }
 
-    /// Read `MCH_RICM` (`0x1000_F430`): always returns `0` (`ps2tek`).
+    /// Read `0x1000_F430`: always returns `0` (`ps2tek` `#eerdram`).
     #[inline(always)]
-    pub const fn read_ricm(&self) -> u32 {
+    pub const fn read_f430(&self) -> u32 {
         0
     }
 
-    /// Write `MCH_RICM` (`0x1000_F430`).
+    /// Write `0x1000_F430` (`ps2tek` `#eerdram`).
     #[inline]
-    pub fn write_ricm(&mut self, val: u32) {
-        let sa = (val >> 16) & 0xFFF;
-        let sop = (val >> 6) & 0xF;
-        if sa == 0x21 && sop == 1 && ((self.drcm >> 7) & 1) == 0 {
-            self.sdevid_sr = 0;
+    pub fn write_f430(&mut self, data: u32) {
+        let sa = (data >> 16) & 0xFFF;
+        let sbc = (data >> 6) & 0xF;
+        if sa == 0x21 && sbc == 1 && ((self.drd >> 7) & 1) == 0 {
+            self.rdram_sdevid = 0;
         }
-        // Clear bit 31 (busy bit) immediately.
-        self.ricm = val & !0x8000_0000;
+        self.ricm = data & !0x8000_0000;
     }
 
-    /// Write `MCH_DRCM` (`0x1000_F440`).
+    /// Write `0x1000_F440` (`ps2tek` `#eerdram`).
     #[inline(always)]
-    pub fn write_drcm(&mut self, val: u32) {
-        self.drcm = val;
+    pub fn write_f440(&mut self, data: u32) {
+        self.drd = data;
     }
 
-    /// Read `MCH_DRCM` (`0x1000_F440`), mutating `sdevid_sr` when probing `SA == 0x40` (`ps2tek`).
+    /// Read `0x1000_F440`, mutating `rdram_sdevid` when probing `SA == 0x21` with `SOP == 0` (`ps2tek` `#eerdram`).
     #[inline]
-    pub fn read_drcm(&mut self) -> u32 {
+    pub fn read_f440(&mut self) -> u32 {
         let sop = (self.ricm >> 6) & 0xF;
+        let sa = (self.ricm >> 16) & 0xFFF;
         if sop == 0 {
-            return 0x0D0D_0000;
-        }
-        if sop == 1 {
-            let sa = (self.ricm >> 16) & 0xFFF;
             match sa {
-                0x21 => 0x1F,
-                0x23 => 0x0D0D,
-                0x24 => 0x0090 | ((self.ricm & 0x100) >> 3),
-                0x40 => {
-                    let x = self.sdevid_sr;
-                    if self.sdevid_sr < 2 {
-                        self.sdevid_sr += 1;
+                0x21 => {
+                    if self.rdram_sdevid < 2 {
+                        self.rdram_sdevid += 1;
+                        0x1F
+                    } else {
+                        0
                     }
-                    x
                 }
+                0x23 => 0x0D0D,
+                0x24 => 0x0090,
+                0x40 => self.ricm & 0x1F,
                 _ => 0,
             }
         } else {
@@ -93,21 +93,25 @@ mod tests {
     fn rdram_mch_bios_init_sequence_enumerates_two_16mb_modules() {
         let mut mch = RdramMch::new();
 
-        // SOP == 0 returns 0x0D0D_0000.
-        mch.write_ricm(0);
-        assert_eq!(mch.read_ricm(), 0);
-        assert_eq!(mch.read_drcm(), 0x0D0D_0000);
+        // Reset rdram_sdevid via SA=0x21, SBC=1, drd bit 7 == 0.
+        mch.write_f440(0);
+        mch.write_f430((0x21 << 16) | (1 << 6) | 0x8000_0000);
+        assert_eq!(mch.read_f430(), 0);
+        // SOP != 0 returns 0.
+        assert_eq!(mch.read_f440(), 0);
 
-        // Reset sdevid_sr via SA=0x21, SOP=1, drcm bit 7 == 0.
-        mch.write_drcm(0);
-        mch.write_ricm((0x21 << 16) | (1 << 6) | 0x8000_0000);
-        assert_eq!(mch.read_drcm(), 0x1F);
+        // Probe SA=0x21 with SOP=0 three times: returns 0x1F twice (2 modules), then 0.
+        mch.write_f430(0x21 << 16);
+        assert_eq!(mch.read_f440(), 0x1F);
+        assert_eq!(mch.read_f440(), 0x1F);
+        assert_eq!(mch.read_f440(), 0);
 
-        // Probe SA=0x40 three times: returns 0, 1, 2, and stays at 2 (two 16 MB modules = 32 MB).
-        mch.write_ricm((0x40 << 16) | (1 << 6));
-        assert_eq!(mch.read_drcm(), 0);
-        assert_eq!(mch.read_drcm(), 1);
-        assert_eq!(mch.read_drcm(), 2);
-        assert_eq!(mch.read_drcm(), 2);
+        // SA=0x23 -> 0x0D0D, SA=0x24 -> 0x0090, SA=0x40 -> ricm & 0x1F.
+        mch.write_f430(0x23 << 16);
+        assert_eq!(mch.read_f440(), 0x0D0D);
+        mch.write_f430(0x24 << 16);
+        assert_eq!(mch.read_f440(), 0x0090);
+        mch.write_f430((0x40 << 16) | 0x15);
+        assert_eq!(mch.read_f440(), 0x15);
     }
 }

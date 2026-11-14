@@ -1,12 +1,12 @@
 //! Architectural 48-entry R5900 COP0 Translation Lookaside Buffer (TLB).
 //!
 //! Primary source reference:
-//! - `ps2tek` ("EE COP0 -> TLB"):
+//! - `ps2tek` (`https://psi-rockin.github.io/ps2tek/#eecop0memorymanagement`):
 //!   * 48 dual-page entries (`0..48`), each mapping an Even and an Odd page of size
 //!     `4 KB`, `16 KB`, `64 KB`, `256 KB`, `1 MB`, `4 MB`, or `16 MB` according to the
-//!     12-bit `PageMask` field (`bits 24..13`).
-//!   * `EntryLo0` bit 31 (`S` bit) enables the 16 KB Scratchpad SRAM mapping (`0x7000_0000`).
-//!   * `PFN` (Physical Frame Number) occupies bits `25..6` of `EntryLo0` and `EntryLo1`.
+//!     12-bit `MASK` field (`bits 24..13`) of `COP0.PageMask` (`$5`).
+//!   * `EntryLo0` (`$2`) bit 31 (`S` bit) enables the 16 KB Scratchpad SRAM mapping (`0x7000_0000`).
+//!   * `PFN` (Physical Frame Number) occupies bits `25..6` of `EntryLo0` (`$2`) and `EntryLo1` (`$3`).
 
 /// Number of hardware TLB entries in the R5900 COP0 MMU (`ps2tek`).
 pub const TLB_ENTRY_COUNT: usize = 48;

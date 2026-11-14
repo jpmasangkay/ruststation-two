@@ -5,9 +5,11 @@
 //! 10-channel DMAC, and SIF subsystems.
 
 pub mod bus;
+pub mod ee;
 pub mod mmu;
 pub mod scheduler;
 
+pub use ee::EeCpuState;
 pub use ps2_common::Reg128;
 
 /// Core clock frequencies in Hz (`ps2tek` "Overview -> Clock Speeds").

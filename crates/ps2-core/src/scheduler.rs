@@ -1,13 +1,12 @@
 //! Event-driven downcounting hardware scheduler.
 //!
 //! Primary source references:
-//! - `ps2tek` ("Overview -> Clock Speeds" & "EE Timers"):
+//! - `ps2tek` (`https://psi-rockin.github.io/ps2tek/#eetimers`):
+//!   * BUSCLK runs at `~147.456 MHz`, which is half the speed of the Emotion Engine (`294.912 MHz`).
+//! - `docs/PS2_BLUEPRINT.md` (§1.1 & §3):
 //!   * Emotion Engine (EE): `294.912 MHz` (`1` EE cycle = base scheduler tick).
 //!   * System Bus / DMAC / GS: `147.456 MHz` (`2` EE cycles per Bus cycle).
 //!   * I/O Processor (IOP): `36.864 MHz` (`8` EE cycles per IOP cycle).
-//!   * NTSC Horizontal Scanline (HBlank): `9,370` Bus cycles = `18,740` EE cycles (`15,734.26 Hz`).
-//!   * NTSC Vertical Frame (262.5 scanlines): `240` active scanlines (`4,497,600` EE cycles)
-//!     until `VBlankStart`, plus `22.5` VBlank scanlines (`421,650` EE cycles) until `VBlankEnd`.
 
 /// Maximum number of concurrently scheduled events in the inline priority queue.
 /// Keeps the scheduler 100% free of heap allocations in the hot path (`AGENTS.md`).
@@ -19,7 +18,9 @@ pub const DEFAULT_MAX_EE_BATCH: u64 = 256;
 /// Default IOP execution timeslice in EE cycles (`256` EE cycles = `32` IOP cycles).
 pub const IOP_TIMESLICE_EE_CYCLES: u64 = 256;
 
-/// NTSC HBlank interval in EE cycles (`9,370` Bus cycles * 2 = `18,740` EE cycles, `ps2tek`).
+// TODO(verify): Exact NTSC HBlank/VBlank scanline cycle counts (9,370 Bus cycles = 18,740 EE cycles,
+// 240 active scanlines, 22.5 VBlank scanlines) are not tabulated in ps2tek.
+/// NTSC HBlank interval in EE cycles (`9,370` Bus cycles * 2 = `18,740` EE cycles).
 pub const NTSC_HBLANK_EE_CYCLES: u64 = 18_740;
 
 /// NTSC active display duration before `VBlankStart` (`240` scanlines * `18,740` EE cycles).
@@ -251,5 +252,82 @@ mod tests {
         );
         assert!(sched.is_empty());
         assert_eq!(sched.next_event_cycle, u64::MAX);
+    }
+
+    #[test]
+    fn scheduler_same_cycle_fifo_tie_breaking() {
+        let mut sched = Scheduler {
+            current_ee_cycle: 0,
+            next_event_cycle: u64::MAX,
+            events: [ScheduledEvent::default(); MAX_SCHEDULED_EVENTS],
+            len: 0,
+        };
+
+        sched.schedule(50, HardwareEventKind::EeTimer(0));
+        sched.schedule(50, HardwareEventKind::EeTimer(1));
+        sched.schedule(50, HardwareEventKind::EeTimer(2));
+        sched.schedule(50, HardwareEventKind::EeTimer(3));
+
+        sched.advance(50);
+        assert_eq!(
+            sched.pop_due_event(),
+            Some(ScheduledEvent {
+                trigger_cycle: 50,
+                kind: HardwareEventKind::EeTimer(0),
+            })
+        );
+        assert_eq!(
+            sched.pop_due_event(),
+            Some(ScheduledEvent {
+                trigger_cycle: 50,
+                kind: HardwareEventKind::EeTimer(1),
+            })
+        );
+        assert_eq!(
+            sched.pop_due_event(),
+            Some(ScheduledEvent {
+                trigger_cycle: 50,
+                kind: HardwareEventKind::EeTimer(2),
+            })
+        );
+        assert_eq!(
+            sched.pop_due_event(),
+            Some(ScheduledEvent {
+                trigger_cycle: 50,
+                kind: HardwareEventKind::EeTimer(3),
+            })
+        );
+        assert!(sched.pop_due_event().is_none());
+    }
+
+    #[test]
+    fn scheduler_event_cancellation() {
+        let mut sched = Scheduler {
+            current_ee_cycle: 0,
+            next_event_cycle: u64::MAX,
+            events: [ScheduledEvent::default(); MAX_SCHEDULED_EVENTS],
+            len: 0,
+        };
+
+        sched.schedule(80, HardwareEventKind::DmacTick);
+        sched.schedule(120, HardwareEventKind::EeTimer(1));
+        sched.schedule(160, HardwareEventKind::DmacTick);
+        sched.schedule(240, HardwareEventKind::HBlank);
+
+        assert_eq!(sched.next_event_cycle, 80);
+        sched.cancel_by_kind(HardwareEventKind::DmacTick);
+        assert_eq!(sched.len(), 2);
+        assert_eq!(sched.next_event_cycle, 120);
+
+        sched.advance(200);
+        assert_eq!(
+            sched.pop_due_event(),
+            Some(ScheduledEvent {
+                trigger_cycle: 120,
+                kind: HardwareEventKind::EeTimer(1),
+            })
+        );
+        assert!(sched.pop_due_event().is_none());
+        assert_eq!(sched.next_event_cycle, 240);
     }
 }
