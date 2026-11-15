@@ -9,8 +9,8 @@
 - **Phase 1 Gate (`35` suites)**: `82,167,799` EE cycles + `30,724` IOP cycles = **`82,198,523` cycles in `1.408 s` (`58.38 Mcycles/s`)**.
 
 ## Phase 2a Gate (`17` New Suites -> `51 / 52` Passing, `1` Deferred)
-- **Hardware Gate**: **`51 / 52 PASSED, 1 DEFERRED, 0 FAILED`** (`gs/label.elf` and `gs/signal.elf` passing; `vu/lower/efu.elf` `DEFERRED` on `wip/efu`).
-- **Workspace Unit Tests**: **`94 / 94 PASS`** (`11` `ps2-common`, `78` `ps2-core`, `5` `ps2-autotest`).
+- **Hardware Gate**: **`51 / 52 PASSED, 1 DEFERRED, 0 FAILED`** (`gs/label.elf` and `gs/signal.elf` passing; `vu/lower/efu.elf` `DEFERRED` with **`184 / 208`** EFU test vectors matching across all 13 instructions on `efu-redo`).
+- **Workspace Unit Tests**: **`107 / 107 PASS`** (`11` `ps2-common`, `91` `ps2-core`, `5` `ps2-autotest`).
 - **`cpu/vu0_macro` (2)**: `integer.elf`, `transfer.elf`.
 - **`vu/` Micro & EFU (7)**: `games/triace.elf`, `lower/{branch,efu,fdivdelay,integer,random}.elf`, `upper/clip.elf`.
 - **`dma/vif` (6)**: `basic.elf`, `intstall.elf`, `mskpath3.elf`, `stcycl.elf`, `stmod.elf`, `unpack.elf`.
@@ -27,6 +27,7 @@
 - **Inferred Test-Vector Behaviors (`fits test vectors; may not generalize`)**:
   - `BC1F`/`BC1T` back-to-back delay-slot chaining (`ee/interpreter.rs`, `cpu/ee_fpu/branchdelay.elf`).
   - `ps2float` `MUL.S`/`MULA.S` low-Booth-group truncation, `MADD.S`/`MSUB.S` product-overflow immediate saturation, and `(q25 + 1) >> 1` rounding in `DIV.S`/`SQRT.S`/`RSQRT.S` (`ps2-common/src/ps2float.rs`).
+  - `VU1` `EFU` (`vu/efu.rs`, `vu/lower/efu.elf`, `184/208` matching — `5` ops `16/16`, `8` ops `PARTIAL`): `vu_mul_rtz` without EE COP1 Booth `-1`, `x^2` odd-power stepping, and RTZ `pi/4` (`0x3F49_0FDA`); remaining `1..5` ULP & `EATAN(0)` `0x33e6_0000` gaps left un-fitted (see `HARDWARE_NOTES.md` §12).
 
 ## Known timing debt (Phase 4)
 - **VU timing shortcuts (`bus/mod.rs`, `vu/pipeline.rs`)**:
