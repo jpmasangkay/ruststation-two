@@ -1,4 +1,4 @@
-# Phase 1 `ps2autotests` Suite Status (Task 6a Update)
+# Phase 1 `ps2autotests` & LLE BIOS Boot Status (`phase1-done`)
 
 `local/ps2autotests/tests/` contains **78 prebuilt test binaries**:
 - **55 EE `.elf` suites** (MIPS R5900 Emotion Engine binaries)
@@ -6,16 +6,33 @@
 
 ---
 
-## Revised Phase 1 Gate (`35` Hardware Suites — `35 / 35 PASS`)
+## Phase 1 Summary (`35 / 35` Hardware Gate PASS, LLE BIOS Boot `PARTIAL`)
 
-| Track / Scope Bucket | Total Suites | Passing Now (Task 6a) | Target Task / Milestone | Details |
+| Track / Scope Bucket | Total Suites | Status | Target Task / Milestone | Details |
 | :--- | ---: | ---: | :--- | :--- |
 | **Phase 1 Hardware Gate — EE CPU, COP0, COP1 FPU, MMI SIMD, Memory** | **23 `.elf`** | **`23 / 23 PASS` (100%)** | **Task 4 (Done)** | `cpu/ee` (6), `cpu/ee_cop0` (1), `cpu/ee_fpu` (9), `cpu/ee_simd` (6), `memory/ee` (1). |
 | **Phase 1 Hardware Gate — EE DMAC & Scratchpad DMA** | **5 `.elf`** | **`5 / 5 PASS` (100%)** | **Task 5 (Done)** | `dma/dmac/{cpcond,tagintr}`, `dma/spr/{chain,interleave,normal}`. |
 | **Phase 1 Hardware Gate — IOP R3000A CPU** | **7 `.irx`** | **`7 / 7 PASS` (100%)** | **Task 6a (Done)** | `cpu/iop/{alu,branch,branchdelay,hilodelay,lsu,lsudelay,muldiv}.irx`. |
-| **Phase 1 Hardware Gate Total** | **35 suites** | **`35 / 35 PASS` (100%)** | **Task 6a (Done)** | **`35 / 35` EE + DMAC/SPR + IOP suites passing in `1.892 s` release wall time (`82,167,799` EE cycles + `30,724` IOP cycles).** |
-| **Kernel Track (Post-LLE BIOS) — EE & IOP Kernel Behavior** | **26 suites** | `0 / 26` (`DEFERRED`) | **Post-LLE BIOS** | `kernel/ee` (10 `.elf`) + `kernel/iop` (16 `.irx`). Not part of the Phase 1 hardware gate; revisit after LLE BIOS boot works. |
-| **Out-of-Scope Phase 2+ EE Suites (VU0, VU1, VIF1, GS)** | **17 `.elf`** | `0 / 17` (`DEFERRED`) | **Phase 2+** | `cpu/vu0_macro` (2), `vu/` (7), `dma/vif` (6), `gs/` (2). |
+| **Phase 1 Hardware Gate Total** | **35 suites** | **`35 / 35 PASS` (100%)** | **Task 6a (Done)** | **`35 / 35` EE + DMAC/SPR + IOP suites passing in `1.408 s` release wall time (`82,167,799` EE cycles + `30,724` IOP cycles = `82,198,523` total cycles, `58.38 Mcycles/s`).** |
+| **LLE BIOS Boot (`Task 6b`)** | **Coupled EE+IOP** | **`PARTIAL`** | **Task 6b (Done) / Phase 3** | **IOP kernel init reached `EECONF` (`272,558` IOP cycles); blocked on CDVD S-commands `0x40`/`0x41`/`0x43` and NVM config data; EE parked after the first RDRAM-init message (`2,180,464` EE cycles).** |
+| **Kernel Track (Post-LLE BIOS) — EE & IOP Kernel Behavior** | **26 suites** | `0 / 26` (`DEFERRED`) | **Post-LLE BIOS (Phase 3)** | `kernel/ee` (10 `.elf`) + `kernel/iop` (16 `.irx`). Not part of the Phase 1 hardware gate; revisit after full LLE BIOS boot works. |
+| **Out-of-Scope Phase 2+ EE Suites (VU0, VU1, VIF1, GS)** | **17 `.elf`** | `0 / 17` (`DEFERRED`) | **Phase 2a** | `cpu/vu0_macro` (2), `vu/` (7), `dma/vif` (6), `gs/` (2). |
+
+---
+
+## LLE BIOS Boot Status (`PARTIAL`) & Phase 3 Resume Point
+
+- **Current Status**: **`PARTIAL`**
+  - **EE Progress**: `2,180,464` cycles (`EE PC = 0x9FC4_17B4`). Completed RDRAM MCH initialization (`0x1000_F430` / `0x1000_F440`), configured `EE_SIO` (`0x1000_F100..=0x1000_F180`), printed the first RDRAM-init serial banner, and is scrubbing RDRAM prior to SIF synchronization.
+  - **IOP Progress**: `272,558` cycles (`IOP PC = 0x0000_AFA0`). Completed ROM bootstrap (`GM_IF`, `SSBUSC`, `POST2`, `KSEG2` Cache Control, `COP0.SR.IsC` cache isolation) and initialized `SYSMEM`, `LOADCORE`, `EXCEPMAN`, `INTRMAN`, `SSBUSC`, and `DMACMAN` in IOP RAM before stopping in `EECONF._start`.
+- **Exact Resume Point**:
+  - **CPU & PC**: `IOP` at `PC = 0x0000_AFA0` (`EE PC = 0x9FC4_17B4`, `ee_cycles = 2,180,464`, `iop_cycles = 272,558`).
+  - **Blocker**: `UnimplementedIopRegister(paddr = 0x1F40_2005, width = 1, is_write = false, value = 0)` (`CDVD N command status` read in `EECONF._start`, immediately followed by CDVD S-commands `0x40` `OpenConfig`, `0x41` `ReadConfig`, and `0x43` `CloseConfig` on `0x1F40_2016..=0x1F40_2018`).
+- **Deferred to Phase 3 (`ps2-cdvd`, `ps2-spu2`, I/O & Kernel Track)**:
+  1. **CDVD S-command FIFO and NVM config (`ps2-cdvd`, `0x1F40_2004..=0x1F40_2018`)**: S-command parameter/result FIFO state machine (`0x1F40_2016`, `0x1F40_2017` bit 6 data-available transition, `0x1F40_2018`) and NVM/EEPROM configuration blocks (`0x40`/`0x41`/`0x43`).
+  2. **SIF DMA handshake (`SIF0` / `SIF1`, IOP `0x1D00_0000..=0x1D00_0060` & EE `0x1000_F200..=0x1000_F260`)**: bidirectional transfer between IOP DMA Ch 9 / EE DMA Ch 5 (`SIF0`) and EE DMA Ch 6 / IOP DMA Ch 10 (`SIF1`).
+  3. **SIO2 pad and memory card controller (`0x1F80_8200..=0x1F80_8280`, IOP DMA Ch 11/12)**.
+  4. **SPU2 (`ps2-spu2`, `0x1F90_0000..=0x1F90_07FF`, IOP DMA Ch 4/7)**.
 
 ---
 

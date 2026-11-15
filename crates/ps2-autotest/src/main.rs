@@ -739,31 +739,25 @@ fn print_disasm_window(bus: &Bus, is_iop: bool, center_pc: u32) {
     }
 }
 
-fn run_bios_boot(bios_path: &Path, max_ee_cycles: u64) -> ExitCode {
-    let resolved_path = if bios_path.is_dir() {
-        bios_path.join("scph10000.bin")
-    } else {
-        bios_path.to_path_buf()
-    };
+struct BiosBootReport {
+    stop_cpu: &'static str,
+    stop_pc: u32,
+    stop_reason: RunStopReason,
+    ee_cycles: u64,
+    iop_cycles: u64,
+    ee_pc: u32,
+    iop_pc: u32,
+    bus: Bus,
+}
 
-    let bios_bytes = match fs::read(&resolved_path) {
-        Ok(b) => b,
-        Err(err) => {
-            eprintln!(
-                "ERROR: failed to read BIOS image at {}: {err}",
-                resolved_path.display()
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-
+fn run_bios_boot_bytes(
+    bios_bytes: &[u8],
+    max_ee_cycles: u64,
+) -> Result<BiosBootReport, &'static str> {
     let mut ee = EeCpuState::new();
     let mut iop = IopCpuState::new();
     let mut bus = Bus::new();
-    if let Err(err) = bus.load_bios(&bios_bytes) {
-        eprintln!("ERROR: {err}");
-        return ExitCode::FAILURE;
-    }
+    bus.load_bios(bios_bytes)?;
 
     let mut ee_cycles = 0u64;
     let mut iop_cycles = 0u64;
@@ -841,27 +835,72 @@ fn run_bios_boot(bios_path: &Path, max_ee_cycles: u64) -> ExitCode {
         }
     };
 
+    Ok(BiosBootReport {
+        stop_cpu,
+        stop_pc,
+        stop_reason,
+        ee_cycles,
+        iop_cycles,
+        ee_pc: ee.pc,
+        iop_pc: iop.pc,
+        bus,
+    })
+}
+
+fn run_bios_boot(bios_path: &Path, max_ee_cycles: u64) -> ExitCode {
+    let resolved_path = if bios_path.is_dir() {
+        bios_path.join("scph10000.bin")
+    } else {
+        bios_path.to_path_buf()
+    };
+
+    let bios_bytes = match fs::read(&resolved_path) {
+        Ok(b) => b,
+        Err(err) => {
+            eprintln!(
+                "ERROR: failed to read BIOS image at {}: {err}",
+                resolved_path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let report = match run_bios_boot_bytes(&bios_bytes, max_ee_cycles) {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("ERROR: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     println!("=== LLE BIOS BOOT REPORT ===");
-    println!("Stopped on: {stop_cpu} at PC = 0x{stop_pc:08X}");
-    println!("Stop reason: {stop_reason}");
     println!(
-        "Progress: ee_cycles = {ee_cycles}, iop_cycles = {iop_cycles} (current EE PC = 0x{:08X}, IOP PC = 0x{:08X})",
-        ee.pc, iop.pc
+        "Stopped on: {} at PC = 0x{:08X}",
+        report.stop_cpu, report.stop_pc
     );
-    if stop_cpu == "EE" || stop_cpu == "EE/IOP" {
-        println!("EE Disassembly around 0x{:08X}:", stop_pc);
-        print_disasm_window(&bus, false, stop_pc);
+    println!("Stop reason: {}", report.stop_reason);
+    println!(
+        "Progress: ee_cycles = {}, iop_cycles = {} (current EE PC = 0x{:08X}, IOP PC = 0x{:08X})",
+        report.ee_cycles, report.iop_cycles, report.ee_pc, report.iop_pc
+    );
+    if report.stop_cpu == "EE" || report.stop_cpu == "EE/IOP" {
+        println!("EE Disassembly around 0x{:08X}:", report.stop_pc);
+        print_disasm_window(&report.bus, false, report.stop_pc);
     }
-    if stop_cpu == "IOP" || stop_cpu == "EE/IOP" {
-        let pc_to_show = if stop_cpu == "IOP" { stop_pc } else { iop.pc };
+    if report.stop_cpu == "IOP" || report.stop_cpu == "EE/IOP" {
+        let pc_to_show = if report.stop_cpu == "IOP" {
+            report.stop_pc
+        } else {
+            report.iop_pc
+        };
         println!("IOP Disassembly around 0x{:08X}:", pc_to_show);
-        print_disasm_window(&bus, true, pc_to_show);
+        print_disasm_window(&report.bus, true, pc_to_show);
     }
-    if !bus.stdout_buffer.is_empty() {
-        let out = String::from_utf8_lossy(&bus.stdout_buffer);
+    if !report.bus.stdout_buffer.is_empty() {
+        let out = String::from_utf8_lossy(&report.bus.stdout_buffer);
         println!(
             "Console output ({} bytes):\n{}",
-            bus.stdout_buffer.len(),
+            report.bus.stdout_buffer.len(),
             out
         );
     }
@@ -1076,6 +1115,54 @@ mod tests {
                 pc: 0x0001_0014,
                 module: "stdio".to_owned(),
                 index: 99,
+            })
+        );
+    }
+
+    #[test]
+    fn bios_boot_regression_guard_reaches_eeconf_if_local_bios_present() {
+        let bios_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../local/bios");
+        let mut bios_bytes: Option<Vec<u8>> = None;
+        if let Ok(entries) = fs::read_dir(&bios_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Ok(meta) = path.metadata() {
+                        if meta.len() == 4 * 1024 * 1024 {
+                            if let Ok(bytes) = fs::read(&path) {
+                                bios_bytes = Some(bytes);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let Some(bytes) = bios_bytes else {
+            println!("skipped");
+            return;
+        };
+
+        let report =
+            run_bios_boot_bytes(&bytes, 5_000_000).expect("4 MB BIOS image should load cleanly");
+        assert!(
+            report.ee_cycles >= 2_180_464,
+            "expected ee_cycles >= 2,180,464, got {}",
+            report.ee_cycles
+        );
+        assert!(
+            report.iop_cycles >= 272_558,
+            "expected iop_cycles >= 272,558, got {}",
+            report.iop_cycles
+        );
+        assert_eq!(
+            report.stop_reason,
+            RunStopReason::UnimplementedIopRegister(UnimplementedIopRegister {
+                paddr: 0x1F40_2005,
+                width: 1,
+                is_write: false,
+                value: 0,
             })
         );
     }
