@@ -15,6 +15,7 @@
 //!   * `0x7000_0000..=0x7000_3FFF`: 16 KB Scratchpad SRAM (`8`/`16`/`32`/`64`/`128`-bit).
 
 pub mod dmac;
+pub mod gif_stub;
 pub mod gs_stub;
 pub mod intc;
 pub mod rdram_mch;
@@ -25,10 +26,12 @@ use ps2_common::Reg128;
 
 use crate::mmu::{Tlb, TlbEntry, TranslatedAddr, Vtlb, VtlbTarget};
 use crate::scheduler::{HardwareEventKind, Scheduler};
+use crate::vif::{VifKind, VifUnit};
 use crate::vu::micro::{exec_macro_op, step_micro_liw};
 use crate::vu::{VuState, VU0_TPC_MASK, VU1_TPC_MASK, VU_REVISION_ID};
 
 pub use dmac::{DmaChannel, EeDmac, UnimplementedDmaTransfer};
+pub use gif_stub::GifStub;
 pub use gs_stub::GsPrivilegedStub;
 pub use intc::{EeIntc, IntcFlags, IopIntc, IopIrqFlags};
 pub use rdram_mch::RdramMch;
@@ -365,8 +368,16 @@ pub struct Bus {
     // TODO(verify): `ps2tek` `#memorymap` line 106 (`FETCHED`) lists `FFFE0000h (KSEG2) Cache control` without
     // per-offset bitfields (`0xFFFE_0130` `BIU_CONFIG` and `0xFFFE_0140..=0xFFFE_014F`).
     pub iop_cache_ctrl: [u32; 8],
+    /// Graphics Synthesizer Interface (`GIF`) Path-2 stub (`0x1000_3000..=0x1000_30AF`, `0x1000_6000..=0x1000_6FFF`).
+    pub gif: GifStub,
+    /// Vector Unit Interface 0 (`VIF0`, `0x1000_3800..=0x1000_3970`, `0x1000_4000..=0x1000_4FFF`).
+    pub vif0: VifUnit,
+    /// Vector Unit Interface 1 (`VIF1`, `0x1000_3C00..=0x1000_3D70`, `0x1000_5000..=0x1000_5FFF`).
+    pub vif1: VifUnit,
     /// Central event-driven hardware scheduler (`294.912 MHz` EE cycle timebase).
     pub scheduler: Scheduler,
+    /// Tracks whether a `HardwareEventKind::DmacTick` is currently queued in `scheduler`.
+    dmac_tick_scheduled: bool,
     /// Captured EE/IOP serial & console stdout bytes (`KPUTCHAR` `0x1000_F180` + HLE stdout, `ps2tek` `#iomaps`, `FETCHED`).
     pub stdout_buffer: Vec<u8>,
     /// Diagnostic error set if the EE reads or writes an unimplemented EE MMIO register.
@@ -408,7 +419,11 @@ impl Bus {
             iop_gm_if: 0,
             iop_post2: 0,
             iop_cache_ctrl: [0; 8],
+            gif: GifStub::new(),
+            vif0: VifUnit::new(VifKind::Vif0),
+            vif1: VifUnit::new(VifKind::Vif1),
             scheduler: Scheduler::new(),
+            dmac_tick_scheduled: false,
             stdout_buffer: Vec::new(),
             pending_ee_mmio_error: None,
             pending_iop_mmio_error: None,
@@ -537,9 +552,15 @@ impl Bus {
                 read_le_reg128(&self.vu_mem, normalize_vu_mem_offset(offset & !0xF))
             }
             VtlbTarget::Mmio => {
-                let lo = self.read_mmio64(offset & !0xF);
-                let hi = self.read_mmio64((offset & !0xF).wrapping_add(8));
-                Reg128::from_u64_pair(lo, hi)
+                let addr = offset & !0xF;
+                match addr {
+                    0x1000_4000..=0x1000_6FFF => Reg128::ZERO,
+                    _ => {
+                        let lo = self.read_mmio64(addr);
+                        let hi = self.read_mmio64(addr.wrapping_add(8));
+                        Reg128::from_u64_pair(lo, hi)
+                    }
+                }
             }
             VtlbTarget::Unmapped => {
                 tracing::debug!(vaddr = format_args!("0x{vaddr:08X}"), "Unmapped read128");
@@ -718,8 +739,26 @@ impl Bus {
                 );
             }
             VtlbTarget::Mmio => {
-                self.write_mmio64(offset & !0xF, val.lo_u64());
-                self.write_mmio64((offset & !0xF).wrapping_add(8), val.hi_u64());
+                let addr = offset & !0xF;
+                match addr {
+                    0x1000_4000..=0x1000_4FFF => {
+                        let _ = self.vif0.push_cpu_fifo_qwc(val);
+                        self.step_vifs();
+                        self.schedule_dmac_tick_if_needed();
+                    }
+                    0x1000_5000..=0x1000_5FFF => {
+                        let _ = self.vif1.push_cpu_fifo_qwc(val);
+                        self.step_vifs();
+                        self.schedule_dmac_tick_if_needed();
+                    }
+                    0x1000_6000..=0x1000_6FFF => {
+                        self.gif.push_fifo_qwc(val);
+                    }
+                    _ => {
+                        self.write_mmio64(addr, val.lo_u64());
+                        self.write_mmio64(addr.wrapping_add(8), val.hi_u64());
+                    }
+                }
             }
             VtlbTarget::Unmapped => {
                 self.record_unimplemented_ee_reg(vaddr, 16, true, val.lo_u64() as u32);
@@ -734,6 +773,8 @@ impl Bus {
     pub fn step_timers(&mut self, ee_cycles: u32) {
         self.timers.step_ee_cycles(ee_cycles, &mut self.intc);
         if self.vu0.running || self.vu1.running {
+            let vu0_was_running = self.vu0.running;
+            let vu1_was_running = self.vu1.running;
             let vu_steps = 1.max(ee_cycles / 2);
             for _ in 0..vu_steps {
                 if self.vu0.running {
@@ -754,12 +795,92 @@ impl Bus {
                     break;
                 }
             }
+            if (vu0_was_running && !self.vu0.running) || (vu1_was_running && !self.vu1.running) {
+                self.step_vifs();
+                self.schedule_dmac_tick_if_needed();
+            }
         }
         self.scheduler.advance(u64::from(ee_cycles));
         while let Some(event) = self.scheduler.pop_due_event() {
-            if let HardwareEventKind::DmacChannelComplete(ch) = event.kind {
-                self.dmac.complete_channel(usize::from(ch));
+            match event.kind {
+                HardwareEventKind::DmacChannelComplete(ch) => {
+                    self.dmac.complete_channel(usize::from(ch));
+                    if usize::from(ch) == dmac::dmac_ch::FROM_SPR {
+                        self.schedule_dmac_tick_if_needed();
+                    }
+                }
+                HardwareEventKind::DmacTick => {
+                    self.dmac_tick_scheduled = false;
+                    let progressed = self.tick_dmac_once();
+                    if progressed && self.can_any_vif_dma_progress() {
+                        self.dmac_tick_scheduled = true;
+                        self.scheduler
+                            .schedule_at(event.trigger_cycle + 2, HardwareEventKind::DmacTick);
+                    }
+                }
+                _ => {}
             }
+        }
+    }
+
+    /// Advance both `VIF0` and `VIF1` decoders/FIFOs and forward `INT` interrupts to `INTC`.
+    #[inline]
+    pub fn step_vifs(&mut self) {
+        let (vu0_half, vu1_half) = self.vu_mem.split_at_mut(0x8000);
+        let (vu0_code_space, vu0_data_space) = vu0_half.split_at_mut(0x4000);
+        let (vu1_micro, vu1_data) = vu1_half.split_at_mut(0x4000);
+
+        if self.vif0.step(
+            &mut self.vu0,
+            &mut vu0_code_space[..0x1000],
+            &mut vu0_data_space[..0x1000],
+            None,
+        ) {
+            self.intc.raise_irq(IntcFlags::VIF0);
+        }
+        if self
+            .vif1
+            .step(&mut self.vu1, vu1_micro, vu1_data, Some(&mut self.gif))
+        {
+            self.intc.raise_irq(IntcFlags::VIF1);
+        }
+    }
+
+    /// Advance scheduler-driven peripheral DMAC channels (`VIF0`, `VIF1`) by 1 BUSCLK beat.
+    #[inline]
+    fn tick_dmac_once(&mut self) -> bool {
+        let mut progressed = false;
+        progressed |= self.dmac.step_vif_channel(
+            dmac::dmac_ch::VIF0,
+            &mut self.vif0,
+            &self.ram,
+            &self.scratchpad,
+        );
+        progressed |= self.dmac.step_vif_channel(
+            dmac::dmac_ch::VIF1,
+            &mut self.vif1,
+            &self.ram,
+            &self.scratchpad,
+        );
+        self.step_vifs();
+        progressed
+    }
+
+    #[inline]
+    fn can_any_vif_dma_progress(&self) -> bool {
+        self.dmac
+            .vif_channel_can_step(dmac::dmac_ch::VIF0, &self.vif0)
+            || self
+                .dmac
+                .vif_channel_can_step(dmac::dmac_ch::VIF1, &self.vif1)
+    }
+
+    /// Schedule the next BUSCLK `DmacTick` if an active `VIF` DMA can currently make progress.
+    #[inline]
+    fn schedule_dmac_tick_if_needed(&mut self) {
+        if !self.dmac_tick_scheduled && self.can_any_vif_dma_progress() {
+            self.dmac_tick_scheduled = true;
+            self.scheduler.schedule(2, HardwareEventKind::DmacTick);
         }
     }
 
@@ -859,6 +980,10 @@ impl Bus {
                 if (val & 0x0200) != 0 {
                     self.vu1.reset_unit();
                 }
+                if (val & 0x0303) != 0 {
+                    self.step_vifs();
+                    self.schedule_dmac_tick_if_needed();
+                }
             }
             29 | 30 => {}
             31 => {
@@ -875,6 +1000,10 @@ impl Bus {
     fn read_mmio8(&mut self, paddr: u32) -> u8 {
         match paddr & !3 {
             0x1000_0000..=0x1000_1FFF
+            | 0x1000_3000..=0x1000_30FF
+            | 0x1000_3800..=0x1000_39FF
+            | 0x1000_3C00..=0x1000_3DFF
+            | 0x1000_4000..=0x1000_6FFF
             | 0x1000_8000..=0x1000_E060
             | 0x1000_F000
             | 0x1000_F010
@@ -906,6 +1035,10 @@ impl Bus {
     fn read_mmio16(&mut self, paddr: u32) -> u16 {
         match paddr & !3 {
             0x1000_0000..=0x1000_1FFF
+            | 0x1000_3000..=0x1000_30FF
+            | 0x1000_3800..=0x1000_39FF
+            | 0x1000_3C00..=0x1000_3DFF
+            | 0x1000_4000..=0x1000_6FFF
             | 0x1000_8000..=0x1000_E060
             | 0x1000_F000
             | 0x1000_F010
@@ -937,6 +1070,10 @@ impl Bus {
     fn read_mmio32(&mut self, paddr: u32) -> u32 {
         match paddr {
             0x1000_0000..=0x1000_1FFF => self.timers.read32(paddr),
+            0x1000_3000..=0x1000_30FF => self.gif.read32(paddr),
+            0x1000_3800..=0x1000_39FF => self.vif0.read32(paddr),
+            0x1000_3C00..=0x1000_3DFF => self.vif1.read32(paddr),
+            0x1000_4000..=0x1000_6FFF => 0,
             0x1000_8000..=0x1000_E060 | 0x1000_F500 | 0x1000_F520 | 0x1000_F590 => {
                 self.dmac.read32(paddr)
             }
@@ -982,6 +1119,10 @@ impl Bus {
         }
         match paddr & !3 {
             0x1000_0000..=0x1000_1FFF
+            | 0x1000_3000..=0x1000_30FF
+            | 0x1000_3800..=0x1000_39FF
+            | 0x1000_3C00..=0x1000_3DFF
+            | 0x1000_4000..=0x1000_6FFF
             | 0x1000_8000..=0x1000_E060
             | 0x1000_F000
             | 0x1000_F010
@@ -1006,6 +1147,10 @@ impl Bus {
     fn write_mmio16(&mut self, paddr: u32, val: u16) {
         match paddr & !3 {
             0x1000_0000..=0x1000_1FFF
+            | 0x1000_3000..=0x1000_30FF
+            | 0x1000_3800..=0x1000_39FF
+            | 0x1000_3C00..=0x1000_3DFF
+            | 0x1000_4000..=0x1000_6FFF
             | 0x1000_8000..=0x1000_E060
             | 0x1000_F000
             | 0x1000_F010
@@ -1031,6 +1176,32 @@ impl Bus {
     fn write_mmio32(&mut self, paddr: u32, val: u32) {
         match paddr {
             0x1000_0000..=0x1000_1FFF => self.timers.write32(paddr, val),
+            0x1000_3000..=0x1000_30FF => {
+                self.gif.write32(paddr, val);
+                self.step_vifs();
+                self.schedule_dmac_tick_if_needed();
+            }
+            0x1000_3800..=0x1000_39FF => {
+                self.vif0.write32(paddr, val);
+                self.step_vifs();
+                self.schedule_dmac_tick_if_needed();
+            }
+            0x1000_3C00..=0x1000_3DFF => {
+                self.vif1.write32(paddr, val);
+                self.step_vifs();
+                self.schedule_dmac_tick_if_needed();
+            }
+            0x1000_4000..=0x1000_4FFF => {
+                let _ = self.vif0.push_cpu_fifo_word(val);
+                self.step_vifs();
+                self.schedule_dmac_tick_if_needed();
+            }
+            0x1000_5000..=0x1000_5FFF => {
+                let _ = self.vif1.push_cpu_fifo_word(val);
+                self.step_vifs();
+                self.schedule_dmac_tick_if_needed();
+            }
+            0x1000_6000..=0x1000_6FFF => {}
             0x1000_8000..=0x1000_E060 | 0x1000_F500 | 0x1000_F520 | 0x1000_F590 => {
                 self.dmac.write32(
                     paddr,
@@ -1039,6 +1210,12 @@ impl Bus {
                     &mut self.scratchpad,
                     &mut self.scheduler,
                 );
+                if paddr == 0x1000_8000 || paddr == 0x1000_9000 {
+                    self.dmac_tick_scheduled =
+                        self.dmac.has_active_vif_transfer() && self.dmac.dma_enabled();
+                } else {
+                    self.schedule_dmac_tick_if_needed();
+                }
             }
             0x1000_F000 => self.intc.write_stat(val),
             0x1000_F010 => self.intc.write_mask(val),
@@ -1788,5 +1965,69 @@ mod tests {
         assert_eq!(bus.iop_read32(0xBF80_1528), 0x0000_0701);
         assert_eq!(bus.iop_read32(0xBF80_152C), 0x0001_2340);
         assert_eq!(bus.pending_iop_mmio_error, None);
+    }
+
+    #[test]
+    fn bus_vif0_and_vif1_scheduler_driven_dma_and_no_read_advances_time() {
+        let mut bus = Bus::new();
+        let ram_addr = 0x1000u32;
+
+        // Place VIF0 packet in RDRAM: STCYCL(1,1), UNPACK V4-32 at VU0 Data[0] = [1, 2, 3, 4], MARK
+        let packet = [
+            (0x01u32 << 24) | 0x0101,    // STCYCL CL=1, WL=1
+            (0x6Cu32 << 24) | (1 << 16), // UNPACK V4-32 NUM=1 addr=0
+            1,
+            2,
+            3,
+            4,
+            (0x07u32 << 24) | 0xCAFE, // MARK 0xCAFE
+            0,
+        ];
+        for (i, w) in packet.iter().enumerate() {
+            bus.write32(0x8000_0000 | (ram_addr + (i as u32) * 4), *w);
+        }
+
+        // Program DMAC D0 (`VIF0`) Normal mode QWC=2
+        bus.write32(0xB000_8010, ram_addr);
+        bus.write32(0xB000_8020, 2);
+        bus.write32(0xB000_8000, dmac::chcr_bits::STR | dmac::chcr_bits::DIR);
+
+        // Poll `VIF0_STAT` and `VIF0_MARK` before any `step_timers`: must NOT advance time!
+        let before_cycle = bus.scheduler.current_ee_cycle;
+        for _ in 0..10 {
+            assert_eq!(bus.read32(0xB000_3830), 0);
+            let _ = bus.read32(0xB000_3800);
+        }
+        assert_eq!(bus.scheduler.current_ee_cycle, before_cycle);
+        assert_eq!(bus.read32(0xB000_8020), 2); // QWC untouched until scheduler ticks
+
+        // Step 6 EE cycles (3 BUSCLK beats): QWC 0..2 finish and update VU0 Data Mem + MARK
+        bus.step_timers(6);
+        assert_eq!(bus.read32(0xB000_3830), 0xCAFE);
+        assert_eq!(bus.read32(0xB100_4000), 1);
+        assert_eq!(bus.read32(0xB100_4004), 2);
+        assert_eq!(bus.read32(0xB100_4008), 3);
+        assert_eq!(bus.read32(0xB100_400C), 4);
+        assert_eq!(bus.read32(0xB000_8020), 0);
+        assert_eq!(bus.pending_ee_mmio_error, None);
+
+        // Also test direct 128-bit `VIF1_FIFO` write forwarding `DIRECT` + `MSKPATH3` to `GifStub`.
+        bus.write128(
+            0xB000_5000,
+            Reg128::from_u32x4(
+                (0x06u32 << 24) | 0x8000, // MSKPATH3(1)
+                0,                        // NOP
+                0,                        // NOP
+                (0x50u32 << 24) | 1,      // DIRECT qwc=1 (payload begins at QWC 1)
+            ),
+        );
+        bus.write128(0xB000_5000, Reg128::from_u32x4(10, 20, 30, 40));
+        assert_eq!(bus.read32(0xB000_3020) & (1 << 1), 1 << 1); // `GIF_STAT.M3P == 1`
+        assert_eq!(bus.gif.total_packets, 1);
+        let meta = bus.gif.last_packet().expect("DIRECT packet stored");
+        assert_eq!(
+            bus.gif.read_packet_qwc(&meta, 0),
+            Some(Reg128::from_u32x4(10, 20, 30, 40))
+        );
     }
 }

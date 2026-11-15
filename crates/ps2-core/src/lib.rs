@@ -10,6 +10,7 @@ pub mod elf;
 pub mod iop;
 pub mod mmu;
 pub mod scheduler;
+pub mod vif;
 pub mod vu;
 
 pub use ee::EeCpuState;

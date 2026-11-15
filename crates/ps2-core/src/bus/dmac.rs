@@ -23,6 +23,7 @@
 //!     on `MADR` after every slice, including the final slice).
 
 use crate::scheduler::{HardwareEventKind, Scheduler};
+use crate::vif::VifUnit;
 
 use super::{EE_RAM_SIZE, SCRATCHPAD_SIZE};
 
@@ -189,6 +190,40 @@ impl DmaChannel {
     }
 }
 
+/// Per-channel state for scheduler-driven incremental `VIF0`/`VIF1` DMA transfers.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+enum VifDmaPhase {
+    #[default]
+    Idle,
+    /// Source Chain (`MOD == 1`): ready to fetch next DMAtag from `TADR`.
+    ReadTag,
+    /// Source Chain (`MOD == 1`, `CHCR.TTE == 1`): waiting to send tag bits `64..=127` to VIF.
+    SendTte { lo: u32, hi: u32 },
+    /// Streaming `ch.qwc` 128-bit quadwords from `ch.madr` (RDRAM or Scratchpad via bit 31).
+    TransferData,
+}
+
+/// Resumable DMAC transfer cursor for `D0` (`VIF0`) and `D1` (`VIF1`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct VifDmaState {
+    phase: VifDmaPhase,
+    chain_end: bool,
+}
+
+/// Outcome of advancing one Source Chain tag via [`EeDmac::step_source_chain_tag`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum SourceChainTagStep {
+    /// `REFS` stall (`D_CTRL.STD` check failed against `D_STADR`; `D_STAT.SIS` asserted).
+    Stalled,
+    /// DMAtag parsed and channel `CHCR.TAG` / `QWC` / `MADR` / `TADR` / `ASR` updated.
+    Advanced {
+        tte_lo: u32,
+        tte_hi: u32,
+        qwc: u32,
+        end_chain: bool,
+    },
+}
+
 /// Emotion Engine 10-Channel DMA Controller (`DMAC`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EeDmac {
@@ -218,6 +253,8 @@ pub struct EeDmac {
     pub d_enable: u32,
     /// Pending unimplemented peripheral DMA transfer error (channels `0..=7`), if triggered by guest code.
     pub unimplemented_transfer: Option<UnimplementedDmaTransfer>,
+    /// Incremental BUSCLK state for `D0` (`VIF0`) and `D1` (`VIF1`).
+    vif_dma: [VifDmaState; 2],
 }
 
 impl Default for EeDmac {
@@ -249,6 +286,10 @@ impl EeDmac {
             d_f500: 0,
             d_enable: 0x1201,
             unimplemented_transfer: None,
+            vif_dma: [VifDmaState {
+                phase: VifDmaPhase::Idle,
+                chain_end: false,
+            }; 2],
         }
     }
 
@@ -451,6 +492,163 @@ impl EeDmac {
         }
     }
 
+    /// Return `true` when EE DMAC master enable is active (`D_CTRL.DMAE == 1` and `D_ENABLE.CPND == 0`).
+    #[inline(always)]
+    pub const fn dma_enabled(&self) -> bool {
+        (self.d_ctrl & d_ctrl_bits::DMAE) != 0 && (self.d_enable & (1 << 16)) == 0
+    }
+
+    /// Return `true` when `VIF0` (`D0`) or `VIF1` (`D1`) currently has `CHCR.STR == 1`.
+    #[inline(always)]
+    pub const fn has_active_vif_transfer(&self) -> bool {
+        ((self.channels[dmac_ch::VIF0].chcr | self.channels[dmac_ch::VIF1].chcr) & chcr_bits::STR)
+            != 0
+    }
+
+    /// Return `true` if `ch_idx` (`VIF0` or `VIF1`) is active and not currently blocked on VIF FIFO / `REFS`.
+    pub fn vif_channel_can_step(&self, ch_idx: usize, vif: &VifUnit) -> bool {
+        if !self.dma_enabled() || ch_idx > dmac_ch::VIF1 {
+            return false;
+        }
+        let ch = &self.channels[ch_idx];
+        if (ch.chcr & chcr_bits::STR) == 0 {
+            return false;
+        }
+        if ch_idx == dmac_ch::VIF1 && vif.fdr && (ch.chcr & chcr_bits::DIR) == 0 {
+            return false;
+        }
+        match self.vif_dma[ch_idx].phase {
+            VifDmaPhase::Idle => false,
+            VifDmaPhase::ReadTag => true,
+            VifDmaPhase::SendTte { .. } => vif.can_accept_tte(),
+            VifDmaPhase::TransferData => ch.qwc == 0 || vif.can_accept_qwc(),
+        }
+    }
+
+    /// Advance `ch_idx` (`dmac_ch::VIF0` or `dmac_ch::VIF1`) by at most one BUSCLK beat (`1` tag or `1` QWC).
+    ///
+    /// Returns `true` if the channel advanced or completed (so another BUSCLK tick may be needed),
+    /// or `false` if blocked (DMAC disabled/suspended, VIF FIFO full, or `REFS` stall).
+    pub fn step_vif_channel(
+        &mut self,
+        ch_idx: usize,
+        vif: &mut VifUnit,
+        ram: &[u8],
+        scratchpad: &[u8],
+    ) -> bool {
+        if !self.dma_enabled() || ch_idx > dmac_ch::VIF1 {
+            return false;
+        }
+        if (self.channels[ch_idx].chcr & chcr_bits::STR) == 0 {
+            self.vif_dma[ch_idx] = VifDmaState::default();
+            return false;
+        }
+        if ch_idx == dmac_ch::VIF1 && vif.fdr && (self.channels[ch_idx].chcr & chcr_bits::DIR) == 0
+        {
+            return false;
+        }
+
+        // Recover phase if channel was already busy (`STR == 1`) before `start_channel_transfer` ran.
+        if self.vif_dma[ch_idx].phase == VifDmaPhase::Idle {
+            let is_chain = self.channels[ch_idx].mode() == 1;
+            self.vif_dma[ch_idx] = VifDmaState {
+                phase: if is_chain {
+                    VifDmaPhase::ReadTag
+                } else {
+                    VifDmaPhase::TransferData
+                },
+                chain_end: !is_chain,
+            };
+        }
+
+        match self.vif_dma[ch_idx].phase {
+            VifDmaPhase::Idle => false,
+            VifDmaPhase::ReadTag => {
+                match self.step_source_chain_tag(ch_idx, true, ram, scratchpad) {
+                    SourceChainTagStep::Stalled => false,
+                    SourceChainTagStep::Advanced {
+                        tte_lo,
+                        tte_hi,
+                        qwc,
+                        end_chain,
+                    } => {
+                        self.vif_dma[ch_idx].chain_end = end_chain;
+                        if self.channels[ch_idx].tte() {
+                            if vif.can_accept_tte() {
+                                vif.push_dma_tte(tte_lo, tte_hi);
+                                self.finish_or_advance_after_tag(ch_idx, qwc, end_chain);
+                            } else {
+                                self.vif_dma[ch_idx].phase = VifDmaPhase::SendTte {
+                                    lo: tte_lo,
+                                    hi: tte_hi,
+                                };
+                            }
+                        } else {
+                            self.finish_or_advance_after_tag(ch_idx, qwc, end_chain);
+                        }
+                        true
+                    }
+                }
+            }
+            VifDmaPhase::SendTte { lo, hi } => {
+                if !vif.can_accept_tte() {
+                    return false;
+                }
+                vif.push_dma_tte(lo, hi);
+                let qwc = self.channels[ch_idx].qwc;
+                let end_chain = self.vif_dma[ch_idx].chain_end;
+                self.finish_or_advance_after_tag(ch_idx, qwc, end_chain);
+                true
+            }
+            VifDmaPhase::TransferData => {
+                let qwc_left = self.channels[ch_idx].qwc;
+                if qwc_left == 0 {
+                    if self.vif_dma[ch_idx].chain_end {
+                        self.complete_channel(ch_idx);
+                        self.vif_dma[ch_idx] = VifDmaState::default();
+                    } else {
+                        self.vif_dma[ch_idx].phase = VifDmaPhase::ReadTag;
+                    }
+                    return true;
+                }
+                if !vif.can_accept_qwc() {
+                    return false;
+                }
+                let src_addr = self.channels[ch_idx].madr;
+                let qwc_bytes = read_source_qwc(ram, scratchpad, src_addr, true);
+                let qwc = ps2_common::Reg128::from_u128(u128::from_le_bytes(qwc_bytes));
+                vif.push_dma_qwc(qwc);
+
+                let ch = &mut self.channels[ch_idx];
+                // Preserve bit 31 Scratchpad selector across sequential QWC increments.
+                let spr_bit = src_addr & 0x8000_0000;
+                ch.madr = spr_bit | (src_addr.wrapping_add(16) & 0x7FFF_FFF0);
+                ch.qwc = qwc_left - 1;
+                if ch.qwc == 0 {
+                    if self.vif_dma[ch_idx].chain_end {
+                        self.complete_channel(ch_idx);
+                        self.vif_dma[ch_idx] = VifDmaState::default();
+                    } else {
+                        self.vif_dma[ch_idx].phase = VifDmaPhase::ReadTag;
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    #[inline]
+    fn finish_or_advance_after_tag(&mut self, ch_idx: usize, qwc: u32, end_chain: bool) {
+        if qwc > 0 {
+            self.vif_dma[ch_idx].phase = VifDmaPhase::TransferData;
+        } else if end_chain {
+            self.complete_channel(ch_idx);
+            self.vif_dma[ch_idx] = VifDmaState::default();
+        } else {
+            self.vif_dma[ch_idx].phase = VifDmaPhase::ReadTag;
+        }
+    }
+
     fn start_channel_transfer(
         &mut self,
         ch_idx: usize,
@@ -458,8 +656,20 @@ impl EeDmac {
         scratchpad: &mut [u8],
         scheduler: &mut Scheduler,
     ) {
+        if ch_idx <= dmac_ch::VIF1 {
+            let is_chain = self.channels[ch_idx].mode() == 1;
+            self.vif_dma[ch_idx] = VifDmaState {
+                phase: if is_chain {
+                    VifDmaPhase::ReadTag
+                } else {
+                    VifDmaPhase::TransferData
+                },
+                chain_end: !is_chain,
+            };
+        }
+
         // Check master DMA enable (`D_CTRL.DMAE`) and master suspend (`D_ENABLE.CPND` bit 16).
-        if (self.d_ctrl & d_ctrl_bits::DMAE) == 0 || (self.d_enable & (1 << 16)) != 0 {
+        if !self.dma_enabled() {
             return;
         }
 
@@ -467,6 +677,12 @@ impl EeDmac {
         scheduler.cancel_by_kind(HardwareEventKind::DmacChannelComplete(ch_idx as u8));
 
         match ch_idx {
+            dmac_ch::VIF0 | dmac_ch::VIF1 => {
+                // Scheduler-driven 1 QWC per BUSCLK (2 EE cycles): transfer runs incrementally
+                // in `step_vif_channel` and honors VIF FIFO backpressure mid-packet.
+                scheduler.cancel_by_kind(HardwareEventKind::DmacTick);
+                scheduler.schedule(2, HardwareEventKind::DmacTick);
+            }
             dmac_ch::FROM_SPR => {
                 let (bus_cycles, stalled) = self.execute_from_spr(ram, scratchpad);
                 if !stalled {
@@ -489,8 +705,8 @@ impl EeDmac {
                 }
             }
             _ => {
-                // Channels 0..=7 (`VIF0`, `VIF1`, `GIF`, `fromIPU`, `toIPU`, `SIF0`, `SIF1`, `SIF2`)
-                // are register-level only in Task 5; record an explicit unimplemented-transfer error.
+                // Channels 2..=7 (`GIF`, `fromIPU`, `toIPU`, `SIF0`, `SIF1`, `SIF2`)
+                // are not yet wired in Step 3; record an explicit unimplemented-transfer error.
                 let ch = &self.channels[ch_idx];
                 self.unimplemented_transfer = Some(UnimplementedDmaTransfer {
                     channel: ch_idx as u8,
@@ -619,131 +835,158 @@ impl EeDmac {
         }
     }
 
+    /// Shared Source Chain tag walker used by `toSPR` (`D9`), `VIF0` (`D0`), and `VIF1` (`D1`).
+    fn step_source_chain_tag(
+        &mut self,
+        ch_idx: usize,
+        allow_spr_src: bool,
+        ram: &[u8],
+        scratchpad: &[u8],
+    ) -> SourceChainTagStep {
+        let addr_mask = if allow_spr_src {
+            0xFFFF_FFF0
+        } else {
+            0x7FFF_FFF0
+        };
+        let tadr = self.channels[ch_idx].tadr & addr_mask;
+        let tag_bytes = read_source_qwc(ram, scratchpad, tadr, allow_spr_src);
+        let tag_lo = read_le_u32(&tag_bytes, 0);
+        let tag_addr = read_le_u32(&tag_bytes, 4) & addr_mask;
+        let tte_lo = read_le_u32(&tag_bytes, 8);
+        let tte_hi = read_le_u32(&tag_bytes, 12);
+
+        let qwc = tag_lo & 0xFFFF;
+        let tag_id = (tag_lo >> 28) & 0x7;
+        let tag_irq = (tag_lo & (1 << 31)) != 0;
+
+        // Stall check on `REFS` (`tag_id == 4`) when stall control drain is active (`ps2tek` `#dmactags`):
+        // if the transfer region exceeds `D_STADR`, set `D_STAT.SIS` and pause before consuming the tag.
+        let std_val = (self.d_ctrl & d_ctrl_bits::STD_MASK) >> 6;
+        let stall_drain_enabled = (ch_idx == dmac_ch::TO_SPR && std_val != 0)
+            || (ch_idx == dmac_ch::VIF1 && std_val == 1);
+        if tag_id == 4 && stall_drain_enabled && (tag_addr & 0x8000_0000) == 0 {
+            let end_addr = tag_addr.wrapping_add(qwc.wrapping_mul(16));
+            if end_addr > self.d_stadr {
+                self.d_stat |= d_stat_bits::SIS;
+                return SourceChainTagStep::Stalled;
+            }
+        }
+
+        // Latch upper 16 bits of the tag into `CHCR[31:16]` and set `QWC`.
+        {
+            let ch = &mut self.channels[ch_idx];
+            ch.chcr = (ch.chcr & !chcr_bits::TAG_MASK) | (tag_lo & chcr_bits::TAG_MASK);
+            ch.qwc = qwc;
+        }
+
+        let spr_bit = tadr & 0x8000_0000;
+        let next_seq = spr_bit | (tadr.wrapping_add(16) & 0x7FFF_FFF0);
+        let mut end_chain = false;
+        match tag_id {
+            // 0: REFE — transfer `QWC` qwords from `ADDR`, `TADR += 16`, then end chain.
+            0 => {
+                let ch = &mut self.channels[ch_idx];
+                ch.madr = tag_addr;
+                ch.tadr = next_seq;
+                end_chain = true;
+            }
+            // 1: CNT — transfer `QWC` qwords following the tag (`TADR + 16`), `TADR = MADR + QWC * 16`.
+            1 => {
+                let next_tadr =
+                    spr_bit | (next_seq.wrapping_add(qwc.wrapping_mul(16)) & 0x7FFF_FFF0);
+                let ch = &mut self.channels[ch_idx];
+                ch.madr = next_seq;
+                ch.tadr = next_tadr;
+            }
+            // 2: NEXT — transfer `QWC` qwords following the tag (`TADR + 16`), `TADR = ADDR`.
+            2 => {
+                let ch = &mut self.channels[ch_idx];
+                ch.madr = next_seq;
+                ch.tadr = tag_addr;
+            }
+            // 3: REF / 4: REFS — transfer `QWC` qwords from `ADDR`, `TADR += 16`.
+            3 | 4 => {
+                let ch = &mut self.channels[ch_idx];
+                ch.madr = tag_addr;
+                ch.tadr = next_seq;
+            }
+            // 5: CALL — transfer `QWC` qwords following the tag (`TADR + 16`), push `MADR + QWC * 16`
+            //    onto `ASR0`/`ASR1` (up to depth 2), and set `TADR = ADDR` (`ps2tek` `#dmactags`).
+            5 => {
+                let ret_addr =
+                    spr_bit | (next_seq.wrapping_add(qwc.wrapping_mul(16)) & 0x7FFF_FFF0);
+                let ch = &mut self.channels[ch_idx];
+                ch.madr = next_seq;
+                match ch.asp() {
+                    0 => {
+                        ch.asr0 = ret_addr;
+                        ch.set_asp(1);
+                        ch.tadr = tag_addr;
+                    }
+                    1 => {
+                        ch.asr1 = ret_addr;
+                        ch.set_asp(2);
+                        ch.tadr = tag_addr;
+                    }
+                    _ => {
+                        // Stack overflow (`ASP == 2`): terminate chain after transferring `QWC`.
+                        end_chain = true;
+                    }
+                }
+            }
+            // 6: RET — transfer `QWC` qwords following the tag (`TADR + 16`), pop `TADR` from `ASR1`/`ASR0`
+            //    or end chain if `ASP == 0` (`ps2tek` `#dmactags`).
+            6 => {
+                let ch = &mut self.channels[ch_idx];
+                ch.madr = next_seq;
+                match ch.asp() {
+                    2 => {
+                        ch.tadr = ch.asr1;
+                        ch.set_asp(1);
+                    }
+                    1 => {
+                        ch.tadr = ch.asr0;
+                        ch.set_asp(0);
+                    }
+                    _ => {
+                        end_chain = true;
+                    }
+                }
+            }
+            // 7: END — transfer `QWC` qwords following the tag (`TADR + 16`), leave `TADR` unchanged,
+            //    and end chain (`ps2autotests` `dma/dmac/tagintr.expected` lines 5, 7, 9: `TADR offset: 00000020`).
+            7 => {
+                let ch = &mut self.channels[ch_idx];
+                ch.madr = next_seq;
+                end_chain = true;
+            }
+            _ => unreachable!(),
+        }
+
+        let stop_on_irq = self.channels[ch_idx].tie() && tag_irq;
+        SourceChainTagStep::Advanced {
+            tte_lo,
+            tte_hi,
+            qwc,
+            end_chain: end_chain || stop_on_irq,
+        }
+    }
+
     /// Execute Source Chain mode on `D9` (`toSPR`), supporting all 8 architectural DMATag IDs
-    /// (`REFE`, `CNT`, `NEXT`, `REF`, `REFS`, `CALL`, `RET`, `END`), `ASR0`/`ASR1` 2-level call stack,
-    /// `TIE` + `tag.IRQ` early termination, and `REFS` stall control against `D_STADR`.
+    /// via [`Self::step_source_chain_tag`].
     fn execute_source_chain_to_spr(&mut self, ram: &[u8], scratchpad: &mut [u8]) -> (u32, bool) {
         let mut total_bus_cycles = 0u32;
-        let stall_drain_enabled = ((self.d_ctrl & d_ctrl_bits::STD_MASK) >> 6) != 0;
 
         for _ in 0..MAX_CHAIN_TAGS_PER_TRANSFER {
-            let tadr = self.channels[dmac_ch::TO_SPR].tadr & 0x7FFF_FFF0;
-            let ram_off = (tadr as usize) & (EE_RAM_SIZE - 16);
-            let tag_lo = read_le_u32(ram, ram_off);
-            let tag_addr = read_le_u32(ram, ram_off + 4) & 0x7FFF_FFF0;
-
-            let qwc = tag_lo & 0xFFFF;
-            let tag_id = (tag_lo >> 28) & 0x7;
-            let tag_irq = (tag_lo & (1 << 31)) != 0;
-
-            // Stall check on `REFS` (`tag_id == 4`) when stall control drain is active (`ps2tek` `#dmactags`):
-            // if the transfer region exceeds `D_STADR`, set `D_STAT.SIS` and pause before executing the tag.
-            if tag_id == 4 && stall_drain_enabled {
-                let end_addr = tag_addr.wrapping_add(qwc.wrapping_mul(16));
-                if end_addr > self.d_stadr {
-                    self.d_stat |= d_stat_bits::SIS;
-                    return (total_bus_cycles.max(1), true);
-                }
-            }
-
-            // Latch upper 16 bits of the tag into `CHCR[31:16]` and set `QWC`.
-            {
-                let ch = &mut self.channels[dmac_ch::TO_SPR];
-                ch.chcr = (ch.chcr & !chcr_bits::TAG_MASK) | (tag_lo & chcr_bits::TAG_MASK);
-                ch.qwc = qwc;
-            }
-
-            let mut end_chain = false;
-            match tag_id {
-                // 0: REFE — transfer `QWC` qwords from `ADDR`, `TADR += 16`, then end chain.
-                0 => {
-                    let ch = &mut self.channels[dmac_ch::TO_SPR];
-                    ch.madr = tag_addr;
-                    ch.tadr = tadr.wrapping_add(16) & 0x7FFF_FFF0;
-                    end_chain = true;
-                }
-                // 1: CNT — transfer `QWC` qwords following the tag (`TADR + 16`), `TADR = MADR + QWC * 16`.
-                1 => {
-                    let payload_addr = tadr.wrapping_add(16) & 0x7FFF_FFF0;
-                    let next_tadr = payload_addr.wrapping_add(qwc.wrapping_mul(16)) & 0x7FFF_FFF0;
-                    let ch = &mut self.channels[dmac_ch::TO_SPR];
-                    ch.madr = payload_addr;
-                    ch.tadr = next_tadr;
-                }
-                // 2: NEXT — transfer `QWC` qwords following the tag (`TADR + 16`), `TADR = ADDR`.
-                2 => {
-                    let payload_addr = tadr.wrapping_add(16) & 0x7FFF_FFF0;
-                    let ch = &mut self.channels[dmac_ch::TO_SPR];
-                    ch.madr = payload_addr;
-                    ch.tadr = tag_addr;
-                }
-                // 3: REF / 4: REFS — transfer `QWC` qwords from `ADDR`, `TADR += 16`.
-                3 | 4 => {
-                    let ch = &mut self.channels[dmac_ch::TO_SPR];
-                    ch.madr = tag_addr;
-                    ch.tadr = tadr.wrapping_add(16) & 0x7FFF_FFF0;
-                }
-                // 5: CALL — transfer `QWC` qwords following the tag (`TADR + 16`), push `MADR + QWC * 16`
-                //    onto `ASR0`/`ASR1` (up to depth 2), and set `TADR = ADDR` (`ps2tek` `#dmactags`).
-                5 => {
-                    let payload_addr = tadr.wrapping_add(16) & 0x7FFF_FFF0;
-                    let ret_addr = payload_addr.wrapping_add(qwc.wrapping_mul(16)) & 0x7FFF_FFF0;
-                    let ch = &mut self.channels[dmac_ch::TO_SPR];
-                    ch.madr = payload_addr;
-                    match ch.asp() {
-                        0 => {
-                            ch.asr0 = ret_addr;
-                            ch.set_asp(1);
-                            ch.tadr = tag_addr;
-                        }
-                        1 => {
-                            ch.asr1 = ret_addr;
-                            ch.set_asp(2);
-                            ch.tadr = tag_addr;
-                        }
-                        _ => {
-                            // Stack overflow (`ASP == 2`): terminate chain after transferring `QWC`.
-                            end_chain = true;
-                        }
+            match self.step_source_chain_tag(dmac_ch::TO_SPR, false, ram, scratchpad) {
+                SourceChainTagStep::Stalled => return (total_bus_cycles.max(1), true),
+                SourceChainTagStep::Advanced { qwc, end_chain, .. } => {
+                    self.transfer_slice_to_spr(qwc, ram, scratchpad);
+                    total_bus_cycles = total_bus_cycles.saturating_add(1 + qwc);
+                    if end_chain {
+                        break;
                     }
                 }
-                // 6: RET — transfer `QWC` qwords following the tag (`TADR + 16`), pop `TADR` from `ASR1`/`ASR0`
-                //    or end chain if `ASP == 0` (`ps2tek` `#dmactags`).
-                6 => {
-                    let payload_addr = tadr.wrapping_add(16) & 0x7FFF_FFF0;
-                    let ch = &mut self.channels[dmac_ch::TO_SPR];
-                    ch.madr = payload_addr;
-                    match ch.asp() {
-                        2 => {
-                            ch.tadr = ch.asr1;
-                            ch.set_asp(1);
-                        }
-                        1 => {
-                            ch.tadr = ch.asr0;
-                            ch.set_asp(0);
-                        }
-                        _ => {
-                            end_chain = true;
-                        }
-                    }
-                }
-                // 7: END — transfer `QWC` qwords following the tag (`TADR + 16`), leave `TADR` unchanged,
-                //    and end chain (`ps2autotests` `dma/dmac/tagintr.expected` lines 5, 7, 9: `TADR offset: 00000020`).
-                7 => {
-                    let payload_addr = tadr.wrapping_add(16) & 0x7FFF_FFF0;
-                    let ch = &mut self.channels[dmac_ch::TO_SPR];
-                    ch.madr = payload_addr;
-                    end_chain = true;
-                }
-                _ => unreachable!(),
-            }
-
-            self.transfer_slice_to_spr(qwc, ram, scratchpad);
-            total_bus_cycles = total_bus_cycles.saturating_add(1 + qwc);
-
-            let stop_on_irq = self.channels[dmac_ch::TO_SPR].tie() && tag_irq;
-            if end_chain || stop_on_irq {
-                break;
             }
         }
 
@@ -786,6 +1029,20 @@ impl EeDmac {
             ch.qwc = ch.qwc.wrapping_sub(1) & 0xFFFF;
         }
     }
+}
+
+/// Read one 16-byte aligned quadword from EE RAM or Scratchpad (`bit 31` when `allow_spr`).
+#[inline]
+fn read_source_qwc(ram: &[u8], scratchpad: &[u8], addr: u32, allow_spr: bool) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    if allow_spr && (addr & 0x8000_0000) != 0 {
+        let off = (addr as usize) & (SCRATCHPAD_SIZE - 16);
+        out.copy_from_slice(&scratchpad[off..off + 16]);
+    } else {
+        let off = (addr as usize) & (EE_RAM_SIZE - 16);
+        out.copy_from_slice(&ram[off..off + 16]);
+    }
+    out
 }
 
 #[inline(always)]
@@ -927,5 +1184,132 @@ mod tests {
                 tadr: 0,
             })
         );
+    }
+
+    #[test]
+    fn dmac_vif0_fifo_backpressure_stalls_and_resumes_mid_packet() {
+        use crate::vif::{VifKind, VifUnit};
+        use crate::vu::VuState;
+
+        let mut dmac = EeDmac::new();
+        let mut ram = vec![0u8; EE_RAM_SIZE];
+        let mut spr = vec![0u8; SCRATCHPAD_SIZE];
+        let mut sched = Scheduler::new();
+        let mut vif0 = VifUnit::new(VifKind::Vif0);
+        let mut vu0 = VuState::new();
+        let mut vu0_micro = vec![0u8; 0x1000];
+        let mut vu0_data = vec![0u8; 0x1000];
+
+        // Pack 20 QWCs in RAM: `NOP(I)` followed by `STMASK` (triggers `VIS` stall at word 1),
+        // followed by 19 more QWCs ending with `MARK(0xCAFE)`.
+        let q0 = [0x8000_0000u32, 0x20 << 24, 0x1234_5678, 0];
+        for (i, w) in q0.iter().enumerate() {
+            ram[0x1000 + i * 4..0x1004 + i * 4].copy_from_slice(&w.to_le_bytes());
+        }
+        for q in 1..20u32 {
+            let base = 0x1000 + (q as usize) * 16;
+            let w0 = if q == 19 { (0x07u32 << 24) | 0xCAFE } else { 0 };
+            ram[base..base + 4].copy_from_slice(&w0.to_le_bytes());
+        }
+
+        dmac.write32(0x1000_8010, 0x1000, &mut ram, &mut spr, &mut sched); // MADR
+        dmac.write32(0x1000_8020, 20, &mut ram, &mut spr, &mut sched); // QWC = 20
+        dmac.write32(
+            0x1000_8000,
+            chcr_bits::STR | chcr_bits::DIR,
+            &mut ram,
+            &mut spr,
+            &mut sched,
+        );
+
+        // Must NOT transfer synchronously! Scheduler holds `DmacTick` for cycle 2.
+        assert_eq!(dmac.channels[dmac_ch::VIF0].qwc, 20);
+        assert_eq!(sched.pop_due_event(), None);
+        sched.advance(2);
+        assert_eq!(
+            sched.pop_due_event(),
+            Some(crate::scheduler::ScheduledEvent {
+                trigger_cycle: 2,
+                kind: HardwareEventKind::DmacTick
+            })
+        );
+
+        // Step DMAC beat by beat alongside VIF0:
+        // `work_words` holds 4 QWCs (QWCs 0..3) and `dma_fifo` holds 8 QWCs (QWCs 4..11).
+        // Starting at QWC 12, DMAC must stall mid-packet with `STR == 1` and `QWC == 8`.
+        for _ in 0..30 {
+            dmac.step_vif_channel(dmac_ch::VIF0, &mut vif0, &ram, &spr);
+            vif0.step(&mut vu0, &mut vu0_micro, &mut vu0_data, None);
+        }
+        assert!(vif0.stat_vis);
+        assert_eq!(vif0.fqc(), 8);
+        assert_eq!(dmac.channels[dmac_ch::VIF0].qwc, 8);
+        assert_ne!(dmac.channels[dmac_ch::VIF0].chcr & chcr_bits::STR, 0);
+
+        // Clear `VIS` via `FBRST.STC`, resume ticking, and confirm packet completes mid-stream!
+        vif0.write32(0x1000_3810, 0x08);
+        for _ in 0..30 {
+            vif0.step(&mut vu0, &mut vu0_micro, &mut vu0_data, None);
+            dmac.step_vif_channel(dmac_ch::VIF0, &mut vif0, &ram, &spr);
+        }
+        vif0.step(&mut vu0, &mut vu0_micro, &mut vu0_data, None);
+        assert_eq!(dmac.channels[dmac_ch::VIF0].qwc, 0);
+        assert_eq!(dmac.channels[dmac_ch::VIF0].chcr & chcr_bits::STR, 0);
+        assert_ne!(dmac.d_stat & 1, 0);
+        assert_eq!(vif0.mask, 0x1234_5678);
+        assert_eq!(vif0.mark, 0xCAFE);
+    }
+
+    #[test]
+    fn dmac_vif1_chain_tte_and_scratchpad_bit31_source() {
+        use crate::bus::gif_stub::GifStub;
+        use crate::vif::{VifKind, VifUnit};
+        use crate::vu::VuState;
+
+        let mut dmac = EeDmac::new();
+        let mut ram = vec![0u8; EE_RAM_SIZE];
+        let mut spr = vec![0u8; SCRATCHPAD_SIZE];
+        let mut sched = Scheduler::new();
+        let mut vif1 = VifUnit::new(VifKind::Vif1);
+        let mut vu1 = VuState::new();
+        let mut vu1_micro = vec![0u8; 0x4000];
+        let mut vu1_data = vec![0u8; 0x4000];
+        let mut gif = GifStub::new();
+
+        // Place DMAtag in Scratchpad at offset `0x0100` (`TADR = 0x8000_0100`):
+        // `END` (id=7, qwc=1), TTE words = `[STCYCL(0x0101), UNPACK V4-32 NUM=1 addr=4]`,
+        // payload immediately after in Scratchpad at `0x0110` = `[0x11, 0x22, 0x33, 0x44]`.
+        let lo = 1u32 | (7u32 << 28);
+        let tte0 = (0x01u32 << 24) | 0x0101;
+        let tte1 = (0x6Cu32 << 24) | (1u32 << 16) | 4;
+        spr[0x0100..0x0104].copy_from_slice(&lo.to_le_bytes());
+        spr[0x0104..0x0108].copy_from_slice(&0u32.to_le_bytes());
+        spr[0x0108..0x010C].copy_from_slice(&tte0.to_le_bytes());
+        spr[0x010C..0x0110].copy_from_slice(&tte1.to_le_bytes());
+        for (i, v) in [0x11u32, 0x22, 0x33, 0x44].iter().enumerate() {
+            spr[0x0110 + i * 4..0x0114 + i * 4].copy_from_slice(&v.to_le_bytes());
+        }
+
+        dmac.write32(0x1000_9030, 0x8000_0100, &mut ram, &mut spr, &mut sched); // TADR in SPR
+        dmac.write32(
+            0x1000_9000,
+            chcr_bits::DIR | (1 << 2) | chcr_bits::TTE | chcr_bits::STR,
+            &mut ram,
+            &mut spr,
+            &mut sched,
+        );
+
+        for _ in 0..8 {
+            dmac.step_vif_channel(dmac_ch::VIF1, &mut vif1, &ram, &spr);
+            vif1.step(&mut vu1, &mut vu1_micro, &mut vu1_data, Some(&mut gif));
+        }
+
+        assert_eq!(dmac.channels[dmac_ch::VIF1].chcr & chcr_bits::STR, 0);
+        assert_ne!(dmac.d_stat & (1 << 1), 0);
+        assert_eq!(vif1.cycle, 0x0101);
+        for i in 0..4usize {
+            let word = read_le_u32(&vu1_data, 4 * 16 + i * 4);
+            assert_eq!(word, [0x11u32, 0x22, 0x33, 0x44][i]);
+        }
     }
 }

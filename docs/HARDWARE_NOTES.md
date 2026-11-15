@@ -347,4 +347,49 @@ Implemented in `crates/ps2-core/src/vu/pipeline.rs` (`VuPipeline`) and integrate
 | Delay-slot RAW stalls draining `FDIV`/`CLIP` across branches | `before_liw` drains stall cycles cleanly with `branch_delay_active` | **Sourced (`FETCHED`)** | `fdivdelay.cpp` (`PerformStalledBranch`) |
 | Instantaneous stall drain per `step_micro_liw` in `Bus::step_timers` | `1.max(ee_cycles / 2)` LIW steps without slowing EE clock | **`inferred; fits test vectors, may not generalize`** | Untested against cycle-accurate EE/VU race tests |
 
+---
+
+## 10. `VIF0`/`VIF1` Registers & Known Resolutions (Step 3)
+
+### 10.1 Verified Register Map (`FETCHED`)
+
+Primary sources verified directly (`FETCHED`):
+- `local/ps2tek/index.html` `#vifioregisters` (`lines 2395..=2501`), `#vifcommands` (`lines 2505..=2590`), `#gifio` (`lines 1265..=1355`)
+- `local/ps2autotests/tests/dma/vif/vifregs.h` (`lines 1..=125`)
+
+| `VIF0` Addr | `VIF1` Addr | Name | Access | Verified Bit Layout (`FETCHED`) |
+| :--- | :--- | :--- | :--- | :--- |
+| `0x1000_3800` | `0x1000_3C00` | `VIFn_STAT` | `R` | `0..=1`: `VPS` (`0=Idle`, `1=DataWait`, `2=Decoding`, `3=Transferring`); `2`: `VEW`; `3`: `VGW` (`VIF1`); `6`: `MRK`; `7`: `DBF` (`VIF1`); `8`: `VSS`; `9`: `VFS`; `10`: `VIS`; `11`: `INT`; `12`: `ER0`; `13`: `ER1`; `23`: `FDR` (`VIF1`, `0=Mem->VIF`, `1=VIF->Mem`); `24..=28`: `FQC` (max `8` `VIF0`, `16` `VIF1`) |
+| `0x1000_3810` | `0x1000_3C10` | `VIFn_FBRST` | `W` | `0`: `RST`; `1`: `FBK`; `2`: `STP`; `3`: `STC` (clears `VSS`, `VFS`, `VIS`, `INT`, `ER0`, `ER1`) |
+| `0x1000_3820` | `0x1000_3C20` | `VIFn_ERR` | `R/W` | `0`: `MII`; `1`: `ME0`; `2`: `ME1` |
+| `0x1000_3830` | `0x1000_3C30` | `VIFn_MARK` | `R/W` | `0..=15`: `MARK` (writes clear `STAT.MRK`) |
+| `0x1000_3840` | `0x1000_3C40` | `VIFn_CYCLE` | `R` | `0..=7`: `CL`; `8..=15`: `WL` |
+| `0x1000_3850` | `0x1000_3C50` | `VIFn_MODE` | `R` | `0..=1`: `MODE` (`0=Normal`, `1=Offset`, `2=Difference`, `3=Write-through to ROW (writes both VU data memory and ROW on 00 Data lanes per stmod.expected)`) |
+| `0x1000_3860` | `0x1000_3C60` | `VIFn_NUM` | `R` | `0..=7` (`VIF0`) / `0..=8` (`VIF1`, up to `256` per `unpack.expected` line 54 vs `ps2tek` `0..=7`): untransferred `MPG`/`UNPACK` unit count |
+| `0x1000_3870` | `0x1000_3C70` | `VIFn_MASK` | `R` | `0..=31`: 16 x 2-bit lane write mask fields (`0=Data`, `1=ROW`, `2=COL`, `3=WriteProtect`) |
+| `0x1000_3880` | `0x1000_3C80` | `VIFn_CODE` | `R` | `0..=15`: `IMMEDIATE`; `16..=23`: `NUM`; `24..=31`: `CMD` |
+| `0x1000_3890` | `0x1000_3C90` | `VIFn_ITOPS` | `R` | `0..=9`: `ITOPS` |
+| — | `0x1000_3CA0` | `VIF1_BASE` | `R` | `0..=9`: `BASE` (`VIF1` only) |
+| — | `0x1000_3CB0` | `VIF1_OFST` | `R` | `0..=9`: `OFST` (`VIF1` only) |
+| — | `0x1000_3CC0` | `VIF1_TOPS` | `R` | `0..=9`: `TOPS` (`VIF1` only: `BASE` when `DBF=0`, `BASE + OFST` when `DBF=1`) |
+| `0x1000_38D0` | `0x1000_3CD0` | `VIFn_ITOP` | `R` | `0..=9`: `ITOP` (latched on `MSCAL`/`MSCALF`/`MSCNT`) |
+| — | `0x1000_3CE0` | `VIF1_TOP` | `R` | `0..=9`: `TOP` (`VIF1` only, latched & `DBF` toggled on `MSCAL`/`MSCALF`/`MSCNT`) |
+| `0x1000_3900..=3930` | `0x1000_3D00..=3D30` | `VIFn_R0..R3` | `R` | `16`-byte stride; 4 x 32-bit row fill values |
+| `0x1000_3940..=3970` | `0x1000_3D40..=3D70` | `VIFn_C0..C3` | `R` | `16`-byte stride; 4 x 32-bit column fill values |
+| `0x1000_4000..=4FFF` | `0x1000_5000..=5FFF` | `VIFn_FIFO` | `W` (`R` if `FDR=1`) | Direct FIFO aperture (`8` QWC max for `VIF0`, `16` QWC max for `VIF1`) |
+
+### 10.2 `MPG` (`0x4A`) vs Unresolved `0x46` (`emit_vifcode.cpp`)
+
+- **`MPG` (`0x4A`, `ps2tek` `#vifcommands`, `FETCHED`)**: Uploads `NUM * 8` bytes (`2048` bytes if `NUM == 0`, i.e., `NUM * 2` 32-bit words) starting at byte address `(IMMEDIATE * 8)` in VU micro memory (`4 KB` for `VU0`, `16 KB` for `VU1`), wrapping cleanly at VU micro memory size. Wait-for-VU (`VEW`) stalls before starting if VU is executing.
+- **No `ps2autotests` hardware suite exercises `MPG`**: Neither `basic.cpp`, `intstall.cpp`, `mskpath3.cpp`, `stcycl.cpp`, `stmod.cpp`, nor `unpack.cpp` tests `MPG`. Behavior beyond `ps2tek` (`0x4A`) is verified only by our own unit tests (including micro memory address wrapping and odd-length uploads).
+- **`0x46` in `local/ps2autotests/tests/dma/vif/emit_vifcode.cpp` (`line 26`, `CMD_MPG = 0x46 << 24`)**: **`UNRESOLVED` — not guessed or aliased to `0x4A`**. `emit_vifcode.cpp` defines `CMD_MPG = 0x46 << 24` whereas `ps2tek` documents `4Ah MPG`. No test in `local/ps2autotests` executes `Packet::MPG`, and no real-hardware capture in the repo clarifies `0x46` (no behavior guessed).
+
+### 10.3 `ps2autotests` Hardware Nuances (`FETCHED` vs Inferred)
+
+- **`VIF1_NUM` 9-bit `256` vs `VIF0_NUM` 8-bit `0` (`FETCHED`, `unpack.expected` lines 27, 54)**: On `No data UNPACK(NUM: 256)`, `VIF0` reports `NUM = 0` (`8`-bit counter) while `VIF1` reports `NUM = 256` (`9`-bit counter).
+- **`MARK (I)` & `VIS` Interrupt Stall (`FETCHED`, `intstall.expected` lines 4, 6, 8)**: Non-`MARK` commands with bit 31 (`I`) set (`ERR.MII == 0`) set `STAT.INT` and arm `VIS` so the next decoded non-`MARK` command sets `STAT.VIS` (`STAT = 0x0000_0c02`, `VPS = 2`) before executing its payload. `MARK (I)` sets `STAT.MRK` and `STAT.INT` (`STAT = 0x0000_0840`) **without** arming `VIS` on subsequent commands.
+- **`STAT.FQC == 0` after 3-QWC `intstall` DMA (`inferred; fits test vectors, may not generalize`)**: On real PS2 silicon (`intstall.expected`), a 3-QWC DMA transfer containing `NOP(I)` -> `STMASK` finishes DMA (`STR = 0`), stops decoding before QWC 1..2, yet reads `STAT.FQC == 0`. Modeled with an internal 4-QWC (`16`-word) pre-decode staging buffer fed by the DMAC-facing `8`/`16`-QWC FIFO (`FQC` counts QWC still held in that DMAC-facing FIFO).
+- **`STCYCL` VU Data Memory Wrap (`FETCHED`, `stcycl.expected` lines 106, 114..126, 369)**: `UNPACK` destination quadword address wraps modulo `256` QWC (`4 KB`, `& 0xFF`) on `VIF0` and modulo `1024` QWC (`16 KB`, `& 0x3FF`) on `VIF1`.
+- **`GIF` Path-2 Stub (`0x1000_3000..=0x1000_30A0`, `FETCHED` `#gifio`)**: Step 3 adds a minimal `GIF` stub storing received `VIF1 DIRECT`/`DIRECTHL` (`0x50`/`0x51`) packets and tracking `GIF_STAT.M3P` (bit 1, controlled by `VIF1 MSKPATH3`). Full `GIF` registers and `GS` stub wiring follow in Step 4.
+
 

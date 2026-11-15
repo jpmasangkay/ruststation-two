@@ -20,3 +20,9 @@
 - **Inferred Test-Vector Behaviors (`fits test vectors; may not generalize`)**:
   - `BC1F`/`BC1T` back-to-back delay-slot chaining (`ee/interpreter.rs`, `cpu/ee_fpu/branchdelay.elf`).
   - `ps2float` `MUL.S`/`MULA.S` low-Booth-group truncation, `MADD.S`/`MSUB.S` product-overflow immediate saturation, and `(q25 + 1) >> 1` rounding in `DIV.S`/`SQRT.S`/`RSQRT.S` (`ps2-common/src/ps2float.rs`).
+
+## Known timing debt (Phase 4)
+- **VU timing shortcuts (`bus/mod.rs`, `vu/pipeline.rs`)**:
+  - Synchronous VU completion on `MSCAL`/`COP2` stalls (`finish_vu0_micro` / VU run-to-completion when stalled instead of cycle-accurate interleaved EE/VU execution).
+  - Instantaneous VU stall draining inside `step_micro_liw` without advancing or stalling the EE clock proportionally.
+  - Interleaved EE/VU races, `VU1` cycle-accurate parallel timing, and cycle-accurate stall backpressure are deferred to Phase 4 timing tightening.
