@@ -42,7 +42,7 @@ pub fn exec_efu_op(vu: &mut VuState, instr: u32) -> bool {
 
         // Group C
         0x7FE => eexp(vu.read_vf_lane(fs, fsf)),
-        0x7FC => 0, // ESIN
+        0x7FC => esin(vu.read_vf_lane(fs, fsf)),
         0x7FD => 0, // EATAN
         0x77C => 0, // EATANxy
         0x77D => 0, // EATANxz
@@ -161,6 +161,60 @@ pub fn eexp(val: u32) -> u32 {
     let p3 = ps2float::mul(base, p2).bits;
     let p4 = ps2float::mul(base, p3).bits;
     ps2float::div(0x3F80_0000, p4).bits
+}
+
+/// `ESIN` odd-degree polynomial `(coeff_bits, power)` pairs for `sum c_i x^i`.
+///
+/// Attribution: numeric constants from `Play!` (BSD-2-Clause, see `THIRD_PARTY_NOTICES.md`,
+/// `Source/ee/MA_VU_Lower.cpp`, `FETCHED`).
+const ESIN_TERMS: [(u32, u8); 5] = [
+    (0x3F80_0000, 1),
+    (0xBE2A_AAA4, 3),
+    (0x3C08_873E, 5),
+    (0xB94F_B21F, 7),
+    (0x362E_9C14, 9),
+];
+
+/// VU/EFU truncated multiply (`a * b`) without R5900 EE COP1 Radix-4 Booth `-1` subtraction.
+#[inline]
+fn vu_mul_rtz(a: u32, b: u32) -> u32 {
+    let res_sign = (a ^ b) & 0x8000_0000;
+    let e1 = ((a >> 23) & 0xFF) as i32;
+    let e2 = ((b >> 23) & 0xFF) as i32;
+    if e1 == 0 || e2 == 0 {
+        return res_sign;
+    }
+    let sig1 = 0x80_0000u64 | u64::from(a & 0x7F_FFFF);
+    let sig2 = 0x80_0000u64 | u64::from(b & 0x7F_FFFF);
+    let prod = sig1 * sig2;
+    let carry = ((prod >> 47) & 1) as i32;
+    let res_exp = e1 + e2 - 127 + carry;
+    if res_exp > 255 {
+        return res_sign | 0x7FFF_FFFF;
+    }
+    if res_exp <= 0 {
+        return res_sign;
+    }
+    let res_mant = ((prod >> (23 + carry)) & 0x7F_FFFF) as u32;
+    res_sign | ((res_exp as u32) << 23) | res_mant
+}
+
+/// `ESIN P, fs[fsf]`: `sin(x)` odd polynomial approximation (`sum c_i * x^i`).
+///
+/// Uses `Play!` coefficients (`ESIN_TERMS`) with odd-power `x^2` stepping (`vu_mul_rtz`,
+/// without EE COP1 Booth `-1`) and `ps2float::add`. Matches `12/16` vectors (`PARTIAL`;
+/// misses `CVF_ONE`/`CVF_NEGONE`/`CVF_DECREASING` by 1 ULP and `CVF_MAX_MANTISSA` by 2 ULP).
+#[inline]
+pub fn esin(val: u32) -> u32 {
+    let x2 = vu_mul_rtz(val, val);
+    let mut power = val;
+    let mut sum = vu_mul_rtz(ESIN_TERMS[0].0, power);
+    for &(coeff, _) in &ESIN_TERMS[1..] {
+        power = vu_mul_rtz(power, x2);
+        let term = vu_mul_rtz(coeff, power);
+        sum = ps2float::add(sum, term).bits;
+    }
+    sum
 }
 
 #[cfg(test)]
@@ -283,5 +337,17 @@ mod tests {
         let exp_pos1 = f32::from_bits(eexp((-1.0f32).to_bits()));
         assert!((exp_neg1 - (-1.0f32).exp()).abs() < 1e-5);
         assert!((exp_pos1 - 1.0f32.exp()).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_esin() {
+        // sin(+0.0) = +0.0, sin(-0.0) = +0.0
+        assert_eq!(esin(0), 0);
+        assert_eq!(esin(0x8000_0000), 0);
+        // Formula sanity near small angle 0.5 rad and odd symmetry sin(-0.5) = -sin(0.5)
+        let pos = esin(0.5f32.to_bits());
+        let neg = esin((-0.5f32).to_bits());
+        assert_eq!(neg, pos ^ 0x8000_0000);
+        assert!((f32::from_bits(pos) - 0.5f32.sin()).abs() < 1e-5);
     }
 }
