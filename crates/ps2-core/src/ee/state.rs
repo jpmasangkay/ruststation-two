@@ -88,8 +88,11 @@ impl EeCpuState {
     /// - `COP0.PRId` (`$15`) is initialized to `0x0000_2E20`.
     pub const fn new() -> Self {
         let mut cop0_regs = [0u32; 32];
-        cop0_regs[cop0_reg::STATUS] =
-            status_bits::BEV | status_bits::ERL | status_bits::CU0 | status_bits::CU1;
+        cop0_regs[cop0_reg::STATUS] = status_bits::BEV
+            | status_bits::ERL
+            | status_bits::CU0
+            | status_bits::CU1
+            | status_bits::CU2;
         cop0_regs[cop0_reg::PRID] = EE_COP0_PRID_DEFAULT;
 
         Self {

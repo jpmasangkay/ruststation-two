@@ -213,16 +213,6 @@ impl EeCpuState {
             return HleStepResult::Continue;
         }
 
-        // Detect out-of-scope COP2 / VU0 Macro instructions (`0x12`, `LWC2 = 0x32`, `SWC2 = 0x3A`)
-        // explicitly before `step` raises a generic ReservedInstruction exception.
-        if matches!(opcode, 0x12 | 0x32 | 0x3A) {
-            return HleStepResult::UnimplementedInstruction {
-                pc: instr_pc,
-                instr,
-                category: "COP2 / VU0 Macro (Out of Phase 1 Scope)",
-            };
-        }
-
         self.step(bus);
         if let Some(info) = bus.dmac.unimplemented_transfer.take() {
             return HleStepResult::UnimplementedDmaTransfer(info);
@@ -373,6 +363,9 @@ impl EeCpuState {
 
             // COP1 (0x11)
             0x11 => self.execute_cop1(instr, instr_pc, simm16),
+
+            // COP2 (0x12)
+            0x12 => self.execute_cop2(instr, instr_pc, simm16, bus),
 
             // BEQL (0x14)
             0x14 => {
@@ -681,6 +674,9 @@ impl EeCpuState {
             // LWC1 (0x31)
             0x31 => self.execute_lwc1(rs, rt, simm16, bus),
 
+            // LQC2 (0x36)
+            0x36 => self.execute_lqc2(rs, rt, simm16, bus),
+
             // LD (0x37)
             0x37 => {
                 let vaddr = self.gpr_u32(rs).wrapping_add(simm16 as u32);
@@ -695,6 +691,9 @@ impl EeCpuState {
 
             // SWC1 (0x39)
             0x39 => self.execute_swc1(rs, rt, simm16, bus),
+
+            // SQC2 (0x3E)
+            0x3E => self.execute_sqc2(rs, rt, simm16, bus),
 
             // SD (0x3F)
             0x3F => {

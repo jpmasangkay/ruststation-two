@@ -25,6 +25,8 @@ use ps2_common::Reg128;
 
 use crate::mmu::{Tlb, TlbEntry, TranslatedAddr, Vtlb, VtlbTarget};
 use crate::scheduler::{HardwareEventKind, Scheduler};
+use crate::vu::micro::{exec_shared_lower_op, step_micro_liw};
+use crate::vu::{VuState, VU0_TPC_MASK, VU1_TPC_MASK, VU_REVISION_ID};
 
 pub use dmac::{DmaChannel, EeDmac, UnimplementedDmaTransfer};
 pub use gs_stub::GsPrivilegedStub;
@@ -321,6 +323,10 @@ pub struct Bus {
     pub iop_scratchpad: Box<[u8]>,
     /// 64 KB VU0/VU1 Micro & Data memory window (`0x1100_0000..=0x1100_FFFF`).
     pub vu_mem: Box<[u8]>,
+    /// Vector Unit 0 (`VU0`) architectural state (`COP2` macro + micro mode).
+    pub vu0: VuState,
+    /// Vector Unit 1 (`VU1`) architectural state (micro mode).
+    pub vu1: VuState,
     /// Architectural 48-entry COP0 TLB.
     pub tlb: Tlb,
     /// Software 4 KB virtual-to-physical page table (`1,048,576` entries).
@@ -385,6 +391,8 @@ impl Bus {
             iop_ram: vec![0u8; IOP_RAM_SIZE].into_boxed_slice(),
             iop_scratchpad: vec![0u8; IOP_SCRATCHPAD_SIZE].into_boxed_slice(),
             vu_mem: vec![0u8; VU_MEM_WINDOW_SIZE].into_boxed_slice(),
+            vu0: VuState::new(),
+            vu1: VuState::new(),
             tlb: Tlb::new(),
             vtlb: Vtlb::new(),
             timers: EeTimers::new(),
@@ -719,16 +727,141 @@ impl Bus {
         }
     }
 
-    /// Advance active EE hardware timers (`TIM0..TIM3`) and the central hardware [`Scheduler`]
-    /// by `ee_cycles`, updating `self.intc` and completing due DMAC channel events.
+    /// Advance active EE hardware timers (`TIM0..TIM3`), running `VU0`/`VU1` microprograms,
+    /// and the central hardware [`Scheduler`] by `ee_cycles`, updating `self.intc` and
+    /// completing due DMAC channel events.
     #[inline]
     pub fn step_timers(&mut self, ee_cycles: u32) {
         self.timers.step_ee_cycles(ee_cycles, &mut self.intc);
+        if self.vu0.running || self.vu1.running {
+            let vu_steps = 1.max(ee_cycles / 2);
+            for _ in 0..vu_steps {
+                if self.vu0.running {
+                    let (vu0_code, rest) = self.vu_mem.split_at_mut(0x4000);
+                    step_micro_liw(
+                        &mut self.vu0,
+                        &vu0_code[..0x1000],
+                        &mut rest[..0x1000],
+                        VU0_TPC_MASK,
+                    );
+                }
+                if self.vu1.running {
+                    let (_, vu1_half) = self.vu_mem.split_at_mut(0x8000);
+                    let (vu1_code, vu1_data) = vu1_half.split_at_mut(0x4000);
+                    step_micro_liw(&mut self.vu1, vu1_code, vu1_data, VU1_TPC_MASK);
+                }
+                if !self.vu0.running && !self.vu1.running {
+                    break;
+                }
+            }
+        }
         self.scheduler.advance(u64::from(ee_cycles));
         while let Some(event) = self.scheduler.pop_due_event() {
             if let HardwareEventKind::DmacChannelComplete(ch) = event.kind {
                 self.dmac.complete_channel(usize::from(ch));
             }
+        }
+    }
+
+    /// Execute a single `COP2` macro-mode instruction on `self.vu0`.
+    #[inline]
+    pub fn exec_vu0_macro(&mut self, instr: u32) {
+        exec_shared_lower_op(&mut self.vu0, &mut self.vu_mem[0x4000..0x5000], instr);
+    }
+
+    /// Start `VU0` microprogram execution at `start_tpc` (8-byte LIW instruction index).
+    #[inline]
+    pub fn start_vu0_micro(&mut self, start_tpc: u16) {
+        self.vu0.start_micro(start_tpc, VU0_TPC_MASK);
+    }
+
+    /// Start `VU1` microprogram execution at `start_tpc` (8-byte LIW instruction index).
+    #[inline]
+    pub fn start_vu1_micro(&mut self, start_tpc: u16) {
+        self.vu1.start_micro(start_tpc, VU1_TPC_MASK);
+    }
+
+    /// Interlock helper (`CFC2.I`, `CTC2.I`, `QMFC2.I`, `QMTC2.I`): step `VU0` until idle.
+    #[inline]
+    pub fn finish_vu0_micro(&mut self) {
+        let mut guard = 0u32;
+        while self.vu0.running && guard < 65_536 {
+            let (vu0_code, rest) = self.vu_mem.split_at_mut(0x4000);
+            step_micro_liw(
+                &mut self.vu0,
+                &vu0_code[..0x1000],
+                &mut rest[..0x1000],
+                VU0_TPC_MASK,
+            );
+            guard += 1;
+        }
+    }
+
+    /// Read a 32-bit `COP2` control register (`vi00..vi31`) via `CFC2`.
+    #[inline]
+    pub const fn read_cfc2(&self, reg: usize) -> u32 {
+        match reg & 0x1F {
+            0 => 0,
+            r @ 1..=15 => self.vu0.vi[r] as u32,
+            16 => self.vu0.status_flag as u32,
+            17 => self.vu0.mac_flag as u32,
+            18 => self.vu0.clip_flag & 0x00FF_FFFF,
+            19 => VU_REVISION_ID,
+            20 => self.vu0.r & 0x007F_FFFF,
+            21 => self.vu0.i,
+            22 => self.vu0.q,
+            23 => 0,
+            24 => self.vu0.fbrst_ctrl as u32,
+            25 => 0,
+            26 => self.vu0.tpc as u32,
+            27 => self.vu0.cmsar0 as u32,
+            28 => 0,
+            29 => (self.vu0.running as u32) | ((self.vu1.running as u32) << 8),
+            30 => 0,
+            31 => self.vu1.cmsar1 as u32,
+            _ => 0,
+        }
+    }
+
+    /// Write a 32-bit `COP2` control register (`vi00..vi31`) via `CTC2`.
+    #[inline]
+    pub fn write_ctc2(&mut self, reg: usize, val: u32) {
+        match reg & 0x1F {
+            0 => {}
+            r @ 1..=15 => self.vu0.vi[r] = val as u16,
+            16 => self.vu0.status_flag = (val as u16) & 0x0FC0,
+            17 => {}
+            18 => self.vu0.clip_flag = val & 0x00FF_FFFF,
+            19 => {}
+            20 => self.vu0.r = val & 0x007F_FFFF,
+            21 => self.vu0.i = val,
+            22 => self.vu0.q = val,
+            23 => {}
+            24 => self.vu0.fbrst_ctrl = (val as u16) & 0x0C0C,
+            25 | 26 => {}
+            27 => self.vu0.cmsar0 = val as u16,
+            28 => {
+                if (val & 0x0001) != 0 {
+                    self.vu0.running = false;
+                }
+                if (val & 0x0002) != 0 {
+                    self.vu0.reset_unit();
+                }
+                if (val & 0x0100) != 0 {
+                    self.vu1.running = false;
+                }
+                if (val & 0x0200) != 0 {
+                    self.vu1.reset_unit();
+                }
+            }
+            29 | 30 => {}
+            31 => {
+                self.vu1.cmsar1 = val as u16;
+                if !self.vu1.running {
+                    self.start_vu1_micro(val as u16);
+                }
+            }
+            _ => {}
         }
     }
 

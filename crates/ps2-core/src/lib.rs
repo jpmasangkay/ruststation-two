@@ -10,6 +10,7 @@ pub mod elf;
 pub mod iop;
 pub mod mmu;
 pub mod scheduler;
+pub mod vu;
 
 pub use ee::EeCpuState;
 pub use elf::{load_elf32, ElfError, LoadedElf};

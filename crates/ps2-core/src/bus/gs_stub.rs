@@ -8,18 +8,28 @@
 //!     `0x1200_0080` `DISPLAY1`, `0x1200_0090` `DISPFB2`, `0x1200_00A0` `DISPLAY2`, `0x1200_00B0` `EXTBUF`,
 //!     `0x1200_00C0` `EXTDATA`, `0x1200_00D0` `EXTWRITE`, `0x1200_00E0` `BGCOLOR`, `0x1200_1000` `GS_CSR`,
 //!     `0x1200_1010` `GS_IMR`, `0x1200_1040` `BUSDIR`, `0x1200_1080` `SIGLBLID`.
-//! - `ps2autotests` (`tests/gs/gsregs.h` & `tests/gs/signal.cpp`):
+//! - `ps2autotests` (`tests/gs/gsregs.h` & `tests/gs/signal.cpp`, `FETCHED`):
 //!   * `GS_CSR` (`0x1200_1000`) bit 0 is `SIGNAL` (acknowledged/cleared by writing `1` to bit 0).
-//!
-//! Unverified claims marked with `TODO(verify)`:
-//! - Exact bit positions in `GS_CSR` (`0x1200_1000`) for `FINISH` (bit 1), `HSINT` (bit 2),
-//!   `VSINT` (bit 3), `EDWINT` (bit 4), `FIELD` (bit 13), `FIFO` (bits 14..15),
-//!   `REV` (`0x1B`, bits 16..23), and `ID` (`0x55`, bits 24..31) are not tabulated in `ps2tek`
-//!   or `ps2autotests`.
+//!   * Single `SIGNAL` rule: writing `1` to bit 0 of `GS_CSR` (`0x1200_1000`) clears `GS_CSR.SIGNAL`
+//!     (`0`), while writing `0` leaves it unchanged; writing to internal GS register `SIGNAL` (`0x60`)
+//!     with `(ID = data[31:0], IDMSK = data[63:32])` updates
+//!     `SIGLBLID[31:0] = (SIGLBLID[31:0] & !IDMSK) | (ID & IDMSK)` and sets `GS_CSR.SIGNAL = 1`.
+//! - `ps2sdk` (`ee/libgs/include/libgs.h` lines 504–565, `struct GS_CSR` and `struct GS_IMR`, `FETCHED`):
+//!   * `GS_CSR` (`0x1200_1000`) bit layout:
+//!     - bit 0: `signal_evnt` (`SIGNAL`)
+//!     - bit 1: `finish_evnt` (`FINISH`)
+//!     - bit 2: `hsint_intrupt` (`HSINT`)
+//!     - bit 3: `vsint_intrupt` (`VSINT`)
+//!     - bit 4: `write_terminate` (`EDWINT`)
+//!     - bit 5..6: `exhsint`, `exvsint`
+//!     - bit 8: `flush`, bit 9: `reset`, bit 10: `exverr`, bit 11: `exfield`, bit 12: `nfield`
+//!     - bit 13: `current_field` (`FIELD`)
+//!     - bits 14..15: `fifo_status` (`FIFO`, `0b01` = empty)
+//!     - bits 16..23: `gs_rev_number` (`REV`, `0x1B`)
+//!     - bits 24..31: `gs_id` (`ID`, `0x55`)
 
-// TODO(verify): Exact GS_CSR bit positions for FIFO (bits 14..15 = 0b01), REV (0x1B at bits 16..23),
-// and ID (0x55 at bits 24..31) are from memory and not tabulated in ps2tek or ps2autotests.
-/// Default read-only `REV` (`0x1B`) and `ID` (`0x55`) plus `FIFO = Empty` (`1 << 14`) in `GS_CSR`.
+/// Default read-only `REV` (`0x1B`) and `ID` (`0x55`) plus `FIFO = Empty` (`1 << 14`) in `GS_CSR`
+/// (`ps2sdk` `ee/libgs/include/libgs.h`, `FETCHED`).
 const GS_CSR_FIXED_BITS: u64 = (0x55u64 << 24) | (0x1Bu64 << 16) | (1u64 << 14);
 
 /// Stub state for the GS Privileged Registers in Phase 1 (before full `ps2-gs` arrives in Phase 2).
@@ -77,16 +87,15 @@ impl GsPrivilegedStub {
         }
     }
 
-    // TODO(verify): GS_CSR.FIELD (bit 13) and GS_CSR.VSINT (bit 3) bit positions are not tabulated in ps2tek.
-    /// Toggle `GS_CSR.FIELD` (bit 13) and set `GS_CSR.VSINT` (bit 3) on VBlank start.
+    /// Toggle `GS_CSR.FIELD` (bit 13) and set `GS_CSR.VSINT` (bit 3) on VBlank start
+    /// (`ps2sdk` `ee/libgs/include/libgs.h`, `FETCHED`).
     #[inline(always)]
     pub fn on_vblank_start(&mut self) {
         self.csr ^= 1 << 13;
         self.csr |= 1 << 3;
     }
 
-    // TODO(verify): GS_CSR.HSINT (bit 2) bit position is not tabulated in ps2tek.
-    /// Set `GS_CSR.HSINT` (bit 2) on HBlank.
+    /// Set `GS_CSR.HSINT` (bit 2) on HBlank (`ps2sdk` `ee/libgs/include/libgs.h`, `FETCHED`).
     #[inline(always)]
     pub fn on_hblank(&mut self) {
         self.csr |= 1 << 2;
@@ -137,8 +146,8 @@ impl GsPrivilegedStub {
             0x00D0 => self.extwrite = val,
             0x00E0 => self.bgcolor = val,
             0x1000 => {
-                // Bit 0 (SIGNAL) write-1-to-clear is verified in ps2autotests (tests/gs/signal.cpp).
-                // TODO(verify): Bits 1..=4 (FINISH, HSINT, VSINT, EDWINT) write-1-to-clear are from memory.
+                // Bits 0..=4 (SIGNAL, FINISH, HSINT, VSINT, EDWINT) write-1-to-clear
+                // (`ps2autotests` `tests/gs/signal.cpp` & `ps2sdk` `ee/libgs/include/libgs.h`, `FETCHED`).
                 let clear_mask = val & 0x1F;
                 self.csr = (self.csr & !clear_mask) | GS_CSR_FIXED_BITS;
             }

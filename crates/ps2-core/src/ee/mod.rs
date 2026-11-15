@@ -2,6 +2,7 @@
 
 pub mod cop0;
 pub mod cop1;
+pub mod cop2;
 pub mod interpreter;
 pub mod mmi;
 pub mod state;
