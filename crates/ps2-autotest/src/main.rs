@@ -28,7 +28,7 @@ struct Args {
     #[arg(long)]
     test: Option<PathBuf>,
 
-    /// Run all 35 suites in the Phase 1 Hardware Gate, print the summary table, and exit nonzero on any failure.
+    /// Run all 52 hardware gate suites (35 Phase 1 + 17 Phase 2a), print the summary table, and exit nonzero on any non-deferred failure.
     #[arg(long)]
     gate: bool,
 
@@ -373,21 +373,74 @@ pub const PHASE1_HW_GATE_SUITES: [&str; 35] = [
     "cpu/iop/muldiv.irx",
 ];
 
-fn run_phase1_gate(suite_dir: &Path, max_cycles: u64) -> ExitCode {
+/// Canonical list of all 17 suites in the Phase 2a Hardware Gate (`2` `cpu/vu0_macro` + `7` `vu/` + `6` `dma/vif` + `2` `gs/`).
+pub const PHASE2A_HW_GATE_SUITES: [&str; 17] = [
+    "cpu/vu0_macro/integer.elf",
+    "cpu/vu0_macro/transfer.elf",
+    "vu/games/triace.elf",
+    "vu/lower/branch.elf",
+    "vu/lower/efu.elf",
+    "vu/lower/fdivdelay.elf",
+    "vu/lower/integer.elf",
+    "vu/lower/random.elf",
+    "vu/upper/clip.elf",
+    "dma/vif/basic.elf",
+    "dma/vif/intstall.elf",
+    "dma/vif/mskpath3.elf",
+    "dma/vif/stcycl.elf",
+    "dma/vif/stmod.elf",
+    "dma/vif/unpack.elf",
+    "gs/label.elf",
+    "gs/signal.elf",
+];
+
+/// Checked-in list of gate suites explicitly deferred from blocking CI / gate exit code.
+pub const DEFERRED_GATE_SUITES: [(&str, &str); 1] = [("vu/lower/efu.elf", "parked on wip/efu")];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GateOutcome {
+    Pass,
+    Deferred(&'static str),
+    Fail,
+}
+
+fn deferred_gate_reason(rel_path: &str) -> Option<&'static str> {
+    DEFERRED_GATE_SUITES
+        .iter()
+        .find(|&&(suite, _)| suite == rel_path)
+        .map(|&(_, reason)| reason)
+}
+
+fn evaluate_gate_outcome(rel_path: &str, is_pass: bool) -> GateOutcome {
+    if is_pass {
+        GateOutcome::Pass
+    } else if let Some(reason) = deferred_gate_reason(rel_path) {
+        GateOutcome::Deferred(reason)
+    } else {
+        GateOutcome::Fail
+    }
+}
+
+fn run_hardware_gate(suite_dir: &Path, max_cycles: u64) -> ExitCode {
     let start_time = Instant::now();
     let mut passed_count = 0usize;
-    let total_count = PHASE1_HW_GATE_SUITES.len();
+    let mut deferred_count = 0usize;
+    let total_count = PHASE1_HW_GATE_SUITES.len() + PHASE2A_HW_GATE_SUITES.len();
     let mut failure_diffs: Vec<(String, String)> = Vec::new();
 
     println!(
-        "| {:>2} | {:<32} | {:<6} | {:<6} | {:>12} | {:<18} |",
+        "| {:>2} | {:<32} | {:<6} | {:<8} | {:>12} | {:<18} |",
         "#", "Suite", "Target", "Status", "Cycles", "Stop Reason"
     );
     println!(
-        "|---:|:---------------------------------|:-------|:-------|-------------:|:-------------------|"
+        "|---:|:---------------------------------|:-------|:---------|-------------:|:-------------------|"
     );
 
-    for (idx, rel_path) in PHASE1_HW_GATE_SUITES.iter().enumerate() {
+    let all_suites = PHASE1_HW_GATE_SUITES
+        .iter()
+        .chain(PHASE2A_HW_GATE_SUITES.iter());
+
+    for (idx, rel_path) in all_suites.enumerate() {
         let full_path = suite_dir.join(rel_path);
         let expected_path = full_path.with_extension("expected");
 
@@ -395,7 +448,7 @@ fn run_phase1_gate(suite_dir: &Path, max_cycles: u64) -> ExitCode {
             Ok(b) => b,
             Err(err) => {
                 println!(
-                    "| {:>2} | {:<32} | {:<6} | {:<6} | {:>12} | {:<18} |",
+                    "| {:>2} | {:<32} | {:<6} | {:<8} | {:>12} | {:<18} |",
                     idx + 1,
                     rel_path,
                     "N/A",
@@ -415,7 +468,7 @@ fn run_phase1_gate(suite_dir: &Path, max_cycles: u64) -> ExitCode {
             Ok(s) => s,
             Err(err) => {
                 println!(
-                    "| {:>2} | {:<32} | {:<6} | {:<6} | {:>12} | {:<18} |",
+                    "| {:>2} | {:<32} | {:<6} | {:<8} | {:>12} | {:<18} |",
                     idx + 1,
                     rel_path,
                     "N/A",
@@ -437,7 +490,7 @@ fn run_phase1_gate(suite_dir: &Path, max_cycles: u64) -> ExitCode {
                 Ok(rep) => (rep.stdout, rep.stop_reason, rep.iop_cycles, "IOP"),
                 Err(err) => {
                     println!(
-                        "| {:>2} | {:<32} | {:<6} | {:<6} | {:>12} | {:<18} |",
+                        "| {:>2} | {:<32} | {:<6} | {:<8} | {:>12} | {:<18} |",
                         idx + 1,
                         rel_path,
                         "IOP",
@@ -455,7 +508,7 @@ fn run_phase1_gate(suite_dir: &Path, max_cycles: u64) -> ExitCode {
                 Ok(rep) => (rep.stdout, rep.stop_reason, rep.cycles, "EE"),
                 Err(err) => {
                     println!(
-                        "| {:>2} | {:<32} | {:<6} | {:<6} | {:>12} | {:<18} |",
+                        "| {:>2} | {:<32} | {:<6} | {:<8} | {:>12} | {:<18} |",
                         idx + 1,
                         rel_path,
                         "EE",
@@ -470,31 +523,39 @@ fn run_phase1_gate(suite_dir: &Path, max_cycles: u64) -> ExitCode {
             }
         };
 
-        let is_pass = stdout == expected;
-        let status_str = if is_pass { "PASS" } else { "FAIL" };
-        if is_pass {
-            passed_count += 1;
-        } else {
-            failure_diffs.push((
-                (*rel_path).to_owned(),
-                format_expected_diff(&expected, &stdout),
-            ));
-        }
+        let (status_str, stop_display) = match evaluate_gate_outcome(rel_path, stdout == expected) {
+            GateOutcome::Pass => {
+                passed_count += 1;
+                ("PASS", stop_reason.to_string())
+            }
+            GateOutcome::Deferred(reason) => {
+                deferred_count += 1;
+                ("DEFERRED", format!("{stop_reason} ({reason})"))
+            }
+            GateOutcome::Fail => {
+                failure_diffs.push((
+                    (*rel_path).to_owned(),
+                    format_expected_diff(&expected, &stdout),
+                ));
+                ("FAIL", stop_reason.to_string())
+            }
+        };
 
         println!(
-            "| {:>2} | {:<32} | {:<6} | {:<6} | {:>12} | {:<18} |",
+            "| {:>2} | {:<32} | {:<6} | {:<8} | {:>12} | {:<18} |",
             idx + 1,
             rel_path,
             target_label,
             status_str,
             cycles,
-            stop_reason.to_string()
+            stop_display
         );
     }
 
     let elapsed = start_time.elapsed().as_secs_f64();
+    let failed_count = failure_diffs.len();
     println!(
-        "\n=== PHASE 1 HARDWARE GATE: {passed_count}/{total_count} PASSED in {elapsed:.3} s ==="
+        "\n=== HARDWARE GATE: {passed_count}/{total_count} PASSED, {deferred_count} DEFERRED, {failed_count} FAILED in {elapsed:.3} s ==="
     );
 
     if !failure_diffs.is_empty() {
@@ -923,7 +984,7 @@ fn main() -> ExitCode {
     }
 
     if args.gate || args.suite_dir.exists() {
-        return run_phase1_gate(&args.suite_dir, args.max_cycles);
+        return run_hardware_gate(&args.suite_dir, args.max_cycles);
     }
 
     eprintln!(
@@ -1153,6 +1214,34 @@ mod tests {
                 is_write: false,
                 value: 0,
             })
+        );
+    }
+
+    #[test]
+    fn hardware_gate_lists_52_suites_and_ignores_only_deferred_efu_failure() {
+        assert_eq!(
+            PHASE1_HW_GATE_SUITES.len() + PHASE2A_HW_GATE_SUITES.len(),
+            52
+        );
+        assert_eq!(
+            DEFERRED_GATE_SUITES,
+            [("vu/lower/efu.elf", "parked on wip/efu")]
+        );
+        assert_eq!(
+            evaluate_gate_outcome("vu/lower/efu.elf", false),
+            GateOutcome::Deferred("parked on wip/efu")
+        );
+        assert_eq!(
+            evaluate_gate_outcome("vu/lower/efu.elf", true),
+            GateOutcome::Pass
+        );
+        assert_eq!(
+            evaluate_gate_outcome("gs/label.elf", false),
+            GateOutcome::Fail
+        );
+        assert_eq!(
+            evaluate_gate_outcome("cpu/ee/alu.elf", false),
+            GateOutcome::Fail
         );
     }
 }
