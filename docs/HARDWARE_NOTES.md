@@ -278,3 +278,73 @@ Every citation is labeled with its verification status from this session:
 | **R2.1** | `0x1F80_1070..=0x1F80_1078` (IOP) | `IopIntc` (`I_STAT`, `I_MASK`, `I_CTRL`) | Reset `0`; `I_STAT` write-0-to-clear; `I_MASK` R/W; `I_CTRL` bit 0 R/W where **read clears bit 0**. Asserts `COP0.Cause.IP2` (bit 10). | `I_STAT`, `I_MASK`, and old `I_CTRL.0` (before clearing `I_CTRL.0` to `0`). | **Yes (Steering)**: `intrman` `CpuSuspendIntr` branches on old `I_CTRL.0`, and IRQ dispatcher branches on `I_STAT & I_MASK`. | **Primary source (`FETCHED`)**: `ps2tek` `#iopint` (`local/ps2tek/index.html` lines 3916–3961, `FETCHED`) and `ps2sdk` `iop/system/intrman/src/intrman.c` lines 201–258, 816–875 (`FETCHED`). |
 | **R2.2** | `0x1F80_1080..=0x1F80_10EC`, `0x1F80_1500..=0x1F80_1568`, `0x1F80_15F0` (IOP) | `IopDmacControl` (`channels[0..12]`, `ch_aux_4_9_a`, `dpcr3`) | Reset `0`; `MADR`/`TADR` masked to 24 bits (`0x00FF_FFFF`); `BCR`/`CHCR`/`ch_aux_4_9_a`/`dpcr3` 32-bit R/W. Writing `CHCR.24 = 1` raises `UnimplementedIopRegister`. | Last written architectural value (`CHCR.24 == 0` when stopped). | **Yes**: `dmacman_deinit` checks `(chcr & 0x0100_0000) != 0`; `sceEnableDMAChannel` RMWs `dpcr3`. | **Primary source (`FETCHED`)**: `ps2tek` `#iopdma` (`local/ps2tek/index.html` lines 3965–4050, `FETCHED`) and `ps2sdk` `iop/system/dmacman/src/dmacman.c` lines 20–73, 108–739 (`FETCHED`). |
 
+---
+
+## 9. VU Micro Pipeline Timing Model (Step 2b, commit `adf109c`)
+
+Implemented in `crates/ps2-core/src/vu/pipeline.rs` (`VuPipeline`) and integrated into LIW execution in `crates/ps2-core/src/vu/micro.rs` (`step_micro_liw`). Below is the exact classification of every Step 2b rule into **Sourced (`FETCHED`)**, **`inferred; fits test vectors, may not generalize`**, or **Deferred**.
+
+### 9.1 FMAC Writeback & Per-Lane `VF` RAW Hazard Stalls
+
+- **Implemented behavior**:
+  - `VuPipeline::fmac_pipe` tracks a 3-cycle sliding window (`[(u8, u8); 3]` storing `(vf_reg, lane_mask)`) of Upper FMAC `VF` destinations from `upper_fmac_vf_write`:
+    - 6-bit `funct6` `0x00..=0x2D` and `0x2F`, plus `OPMSUB` (`0x2E`, effective mask `dest & 0b1110`), plus Upper `Type2`/`Type3` ops writing `ft` (`ITOF*` `0x13C..=0x13F`, `FTOI*` `0x17C..=0x17F`, `ABS` `0x1FD`); excludes `VF00` and `dest == 0`.
+    - Slot `[0]` (1 cycle ago) incurs a `3`-cycle stall; slot `[1]` (2 cycles ago) incurs `2` cycles; slot `[2]` (3 cycles ago) incurs `1` cycle.
+  - `compute_stall_cycles` gathers all `(reg, lane_mask)` reads from `upper_vf_reads` and (when `!has_i_bit`) `lower_vf_reads` (`MOVE`, `MR32`, `LQI`, `SQI`, `LQD`, `SQD`, `DIV`, `SQRT`, `RSQRT`, `MTIR`, `RINIT`, `RXOR`, `EFU`, and `SQ`), taking the maximum stall where `r_reg == w_reg && (r_mask & w_mask) != 0`.
+  - `ACC`, `VF00`, `I`, `Q`, `P`, and `R` do not cause FMAC RAW stalls.
+  - `VF` results are committed to `vu.vf` at LIW completion rather than delayed in a 4-stage writeback queue.
+- **Classification**:
+  - **Sourced (`FETCHED`)**: 4-cycle FMAC latency (`1..=3` stall cycles on dependent `VF` field reads) and exemption of `ACC`, `VF00`, `I`, `Q`, `P`, and `R` — `ps2tek` `#vupipelining` (`local/ps2tek/index.html` lines 2852–2874, `FETCHED`) and verified against `local/ps2autotests/tests/vu/lower/fdivdelay.cpp` (`PerformStalled` / `PerformStalledBranch`, `FETCHED`).
+  - **`inferred; fits test vectors, may not generalize`**:
+    1. Eager `VF` writeback at LIW issue instead of holding pending `VF` writes in a 4-cycle writeback buffer (matches after-stall RAW reads, but omits WAW-without-RAW ordering and mid-pipeline external `QMFC2` timing).
+    2. Tracking only Upper FMAC `VF` writes in `fmac_pipe` (Lower `MOVE`/`MR32`/`LQ`/`LQI`/`LQD` writes are not pushed into an integer/load delay hazard window).
+
+### 9.2 Flag Pipelines (`CLIP`, `MAC`, `Status`)
+
+- **Implemented behavior**:
+  - **`CLIP` 4-cycle pipeline**: `clip_latest` holds the most recently computed 24-bit `CLIP` shift register; `prepare_upper_clip` loads `clip_latest` into `vu.clip_flag` immediately before Upper `CLIP` computes `((val << 6) | bits) & 0x00FF_FFFF`, and `after_liw` restores `pre.pre_clip` to `vu.clip_flag` while saving the new shifted value into `clip_latest`.
+  - Each VU cycle (`advance_cycle_with_fmac`, including stall cycles) shifts `clip_latest -> clip_queue[0] -> clip_queue[1] -> clip_queue[2] -> vu.clip_flag`, giving a 4-cycle delay before `FCGET`/`FCEQ`/`FCAND`/`FCOR` observe the new `CLIP` bits.
+  - `FCSET` (`set_clip_flag`) writes `clip_latest`, all `3` entries of `clip_queue`, and `vu.clip_flag` immediately (if Upper `CLIP` and Lower `FCSET` execute in the same LIW, `clip_latest` keeps `CLIP`'s shifted result while `clip_queue` and `vu.clip_flag` receive the `FCSET` value).
+  - **`MAC` & `Status` flag pipelines**: Step 2b does not yet compute or delay-pipeline Upper FMAC `MAC`/`Status` flag updates; only `CTC2` and `FS*`/`FM*` instructions access them directly.
+- **Classification**:
+  - **Sourced (`FETCHED`)**: `CLIP` 24-bit `(val << 6) | bits` shift layout and 4-cycle visibility delay — `ps2tek` `#vuregisters` (`local/ps2tek/index.html` lines 2792–2802, `FETCHED`) and `local/ps2autotests/tests/vu/upper/clip.cpp` + `clip.expected` (lines 16–31, `FETCHED`).
+  - **`inferred; fits test vectors, may not generalize`**: `FCSET` flushing all `3` `clip_queue` slots and the same-cycle `CLIP` + `FCSET` resolution rule (neither case is directly exercised by `clip.cpp`).
+  - **Deferred**: `MAC` and `Status` 4-cycle flag pipelines (not required by current passing Phase 2a suites).
+
+### 9.3 `Q` (`FDIV`) and `P` (`EFU`) Latency
+
+- **Implemented behavior**:
+  - **`FDIV` (`Q`)**: `DIV` (`0x3BC`) and `SQRT` (`0x3BD`) take `7` VU cycles (`FDIV_LATENCY_DIV_SQRT = 7`); `RSQRT` (`0x3BE`) takes `13` VU cycles (`FDIV_LATENCY_RSQRT = 13`).
+  - Upon issue, the computed result is staged into `fdiv_pending_q` and `vu.q` is restored to `pre.pre_q`. Subsequent Upper/Lower reads of `Q` during an active `FDIV` do **not** stall and read the previous `vu.q` value. Each VU cycle decrements `fdiv_cycles` and commits `fdiv_pending_q -> vu.q` on `0`.
+  - Issuing `DIV`/`SQRT`/`RSQRT` (`0x3BC..=0x3BE`) or `WAITQ` (`0x3BF`) while `fdiv_cycles > 0` stalls `fdiv_cycles` cycles in `before_liw` before issuing. `CTC2 $22` (`vi22` / `Q`) clears `fdiv_cycles = 0`.
+  - **`EFU` (`P`)**: `efu_pending_p` / `efu_cycles` model the EFU busy timer using `efu_latency` (`ESADD=11`, `ERSADD=18`, `ELENG=18`, `ERLENG=24`, `EATANxy/EATANxz=54`, `ESUM=12`, `ESQRT=12`, `ERSQRT=18`, `ERCPR=12`, `ESIN=29`, `EATAN=54`, `EEXP=44`), stalling on `WAITP` (`0x7BF`) or another EFU op.
+- **Classification**:
+  - **Sourced (`FETCHED`)**: `Q` latencies (`7` for `DIV`/`SQRT`, `13` for `RSQRT`), non-stalling reads returning old `Q`, and `FDIV`/`WAITQ` busy stalls — `ps2tek` `#vupipelining` (`local/ps2tek/index.html` lines 2887–2904, `FETCHED`) and `local/ps2autotests/tests/vu/lower/fdivdelay.cpp` + `fdivdelay.expected` (`FETCHED`). `EFU` latency numbers (`11..54`) — `ps2tek` `#vupipelining` (`local/ps2tek/index.html` lines 2915–2927, `FETCHED`).
+  - **`inferred; fits test vectors, may not generalize`**: Exact `CTC2 $22` cancellation behavior, exact `efu_cycles` vs `efu_cycles - 1` stall boundary (noting `ps2tek` line 2912 states EFU lacks the writeback hazard stage), and EFU numeric evaluation (EFU work is parked on local branch `wip/efu` pending Step 4 completion).
+
+### 9.4 Stall / Branch Interaction
+
+- **Implemented behavior**:
+  - In `step_micro_liw`, any pending `branch_delay_active` target is latched into `vu.tpc` at the start of the delay-slot LIW's successor; before executing `(upper, lower)`, `before_liw(vu, upper, lower, has_i_bit)` computes `stall = compute_stall_cycles(...)` and runs `advance_cycle_with_fmac` / `advance_stall_cycle` for all `stall` cycles, draining `fmac_pipe`, `clip_queue`, `fdiv_cycles`, and `efu_cycles` in order.
+  - Consequently, a branch delay-slot LIW that triggers an FMAC RAW stall (for example `IBLTZ` + `MADD` followed by delay slot `CLIP` in `fdivdelay.cpp` `PerformStalledBranch`) drains those `3` stall cycles out of `fdiv_cycles` and `clip_queue` while executing the delay slot and still branching cleanly to `branch_delay_target`.
+  - Externally, `Bus::step_timers(ee_cycles)` calls VU micro stepping `1.max(ee_cycles / 2)` times per scheduler slice: an EE step with `ee_cycles == 1` executes one VU LIW (including any internal VU stall cycles drained instantaneously inside `step_micro_liw`), unless EE executes `CFC2.I`/`CTC2.I`/`QMFC2.I`/`QMTC2.I`, which drains VU0 via `finish_vu0_micro`.
+- **Classification**:
+  - **Sourced (`FETCHED`)**: Delay-slot FMAC RAW stalls draining in-flight `FDIV`/`CLIP` pipelines cleanly across taken branches — `local/ps2autotests/tests/vu/lower/fdivdelay.cpp` (`PerformStalledBranch`) + `fdivdelay.expected` (`FETCHED`).
+  - **`inferred; fits test vectors, may not generalize`**: Draining all VU stall cycles instantaneously inside one `step_micro_liw` invocation rather than co-scheduling EE vs stalled VU cycle-by-cycle in `Bus::step_timers` (consistent with `1.max(ee_cycles / 2)` and synchronous `finish_vu0_micro`, unverified against cycle-exact EE/VU race tests).
+
+### 9.5 Step 2b Rule Summary Table
+
+| Rule Area | Implemented Mechanism | Classification | Evidence |
+| :--- | :--- | :--- | :--- |
+| FMAC latency (`4` cycles) & lane-masked RAW stalls (`1..3` cycles) | `fmac_pipe` 3-slot window checked against `upper_vf_reads`/`lower_vf_reads`; `ACC`/`VF00`/`I`/`Q`/`P`/`R` exempt | **Sourced (`FETCHED`)** | `ps2tek` `#vupipelining`; `fdivdelay.cpp` |
+| Eager `VF` writeback & Upper-only `fmac_pipe` tracking | `VF` written at LIW issue; Lower `MOVE`/`MR32`/`LQ*` not tracked in `fmac_pipe` | **`inferred; fits test vectors, may not generalize`** | Matches RAW stall tests; untested on WAW / external `QMFC2` |
+| `CLIP` 4-cycle delay & 6-bit shift register | `clip_latest -> clip_queue[0..2] -> vu.clip_flag` | **Sourced (`FETCHED`)** | `ps2tek` `#vuregisters`; `clip.cpp` & `.expected` |
+| `FCSET` queue flush & `CLIP`+`FCSET` same-cycle rule | `FCSET` overwrites `clip_queue[0..2]` & `vu.clip_flag` | **`inferred; fits test vectors, may not generalize`** | Not directly tested in `clip.cpp` |
+| `MAC` & `Status` 4-cycle flag pipelines | Direct access via `CTC2`/`FS*`/`FM*`; FMAC flag updates omitted | **Deferred** | Not exercised by current passing Phase 2a suites |
+| `Q` (`DIV`/`SQRT`=`7`, `RSQRT`=`13`), stale-`Q` reads, `WAITQ`/FDIV stalls | `fdiv_pending_q` committed on `fdiv_cycles == 0` | **Sourced (`FETCHED`)** | `ps2tek` `#vupipelining`; `fdivdelay.cpp` |
+| `EFU` `P` latency table (`11..54` cycles) | `efu_latency` table in `vu/pipeline.rs` | **Sourced (`FETCHED`)** (ops parked on `wip/efu`) | `ps2tek` `#vupipelining` |
+| `EFU` stall boundary (`efu_cycles` vs `efu_cycles - 1`) & `CTC2 $22` cancel | Stalls full `efu_cycles`; `CTC2 $22` zeroes `fdiv_cycles` | **`inferred; fits test vectors, may not generalize`** | Unverified pending Step 2c EFU resume |
+| Delay-slot RAW stalls draining `FDIV`/`CLIP` across branches | `before_liw` drains stall cycles cleanly with `branch_delay_active` | **Sourced (`FETCHED`)** | `fdivdelay.cpp` (`PerformStalledBranch`) |
+| Instantaneous stall drain per `step_micro_liw` in `Bus::step_timers` | `1.max(ee_cycles / 2)` LIW steps without slowing EE clock | **`inferred; fits test vectors, may not generalize`** | Untested against cycle-accurate EE/VU race tests |
+
+
