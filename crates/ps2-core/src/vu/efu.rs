@@ -40,8 +40,8 @@ pub fn exec_efu_op(vu: &mut VuState, instr: u32) -> bool {
         0x73F => erleng(vu.read_vf(fs).u32_lanes()),
         0x73D => ersadd(vu.read_vf(fs).u32_lanes()),
 
-        // Group C (pending)
-        0x7FE => 0, // EEXP
+        // Group C
+        0x7FE => eexp(vu.read_vf_lane(fs, fsf)),
         0x7FC => 0, // ESIN
         0x7FD => 0, // EATAN
         0x77C => 0, // EATANxy
@@ -114,6 +114,53 @@ pub fn erleng(lanes: &[u32; 4]) -> u32 {
 #[inline]
 pub fn ersadd(lanes: &[u32; 4]) -> u32 {
     ercpr(esadd(lanes))
+}
+
+/// `EEXP` polynomial `(coeff_bits, power)` pairs for `(1 + sum c_i x^i)^(-4)`.
+///
+/// Attribution: numeric constants from `Play!` (BSD-2-Clause, see `THIRD_PARTY_NOTICES.md`,
+/// `Source/ee/MA_VU_Lower.cpp`, `FETCHED`).
+const EEXP_TERMS: [(u32, u8); 6] = [
+    (0x3E7F_FFA8, 1),
+    (0x3D00_07F4, 2),
+    (0x3B29_D3FF, 3),
+    (0x3933_E553, 4),
+    (0x36B6_3510, 5),
+    (0x3539_61AC, 6),
+];
+
+/// Evaluate a polynomial sum `sum_i (coeff_i * x^exp_i)` using `ps2float` mul/add
+/// in ascending term order (`x^e = x * ... * x`, accumulated sequentially).
+fn eval_sum_series_ps2(x: u32, terms: &[(u32, u8)]) -> u32 {
+    let mut sum = 0u32;
+    for (idx, &(coeff, exp)) in terms.iter().enumerate() {
+        let mut power = x;
+        for _ in 1..exp {
+            power = ps2float::mul(power, x).bits;
+        }
+        let term = ps2float::mul(coeff, power).bits;
+        sum = if idx == 0 {
+            term
+        } else {
+            ps2float::add(sum, term).bits
+        };
+    }
+    sum
+}
+
+/// `EEXP P, fs[fsf]`: `e^(-x)` via `(1 + sum c_i * x^i)^(-4)` (`Play!` `MA_VU_Lower.cpp`, `ps2float`).
+///
+/// Matches `10/16` vectors (`ZERO`, `NEGZERO`, `MAX`, `MIN`, `MAX_EXP`, `MIN_EXP`,
+/// `GARBAGE1`, `GARBAGE2`, `PI_OVER2`, `3PI_OVER2`); remaining 6 normal-range vectors
+/// differ by `1..5` ULPs from EFU hardware approximation (`PARTIAL`).
+#[inline]
+pub fn eexp(val: u32) -> u32 {
+    let sum = eval_sum_series_ps2(val, &EEXP_TERMS);
+    let base = ps2float::add(0x3F80_0000, sum).bits;
+    let p2 = ps2float::mul(base, base).bits;
+    let p3 = ps2float::mul(base, p2).bits;
+    let p4 = ps2float::mul(base, p3).bits;
+    ps2float::div(0x3F80_0000, p4).bits
 }
 
 #[cfg(test)]
@@ -224,5 +271,17 @@ mod tests {
         );
         // Zero vector -> +PS2_MAX
         assert_eq!(ersadd(&[0, 0, 0, 1.0f32.to_bits()]), 0x7FFF_FFFF);
+    }
+
+    #[test]
+    fn test_eexp() {
+        // e^0 = 1.0 (+0.0 and -0.0)
+        assert_eq!(eexp(0), 1.0f32.to_bits());
+        assert_eq!(eexp(0x8000_0000), 1.0f32.to_bits());
+        // Formula sanity against mathematical e^(-1) and e^(+1)
+        let exp_neg1 = f32::from_bits(eexp(1.0f32.to_bits()));
+        let exp_pos1 = f32::from_bits(eexp((-1.0f32).to_bits()));
+        assert!((exp_neg1 - (-1.0f32).exp()).abs() < 1e-5);
+        assert!((exp_pos1 - 1.0f32.exp()).abs() < 1e-3);
     }
 }
