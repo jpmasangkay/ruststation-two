@@ -19,12 +19,16 @@
 //!       * `SA == 0x40`: returns `MCH_RICM & 0x1F`.
 //!       * Otherwise returns `0`.
 
-/// Emotion Engine RDRAM controller (`MCH_RICM` / `MCH_DRD`) state machine (`ps2tek` `#eerdram`).
+/// Emotion Engine RDRAM controller (`MCH`, `0x1000_F400..=0x1000_F4F0`) state machine (`ps2tek` `#eerdram`).
+// TODO(verify): `ps2tek` `#eerdram` only documents `0x1000_F430` (`MCH_RICM`) and `0x1000_F440` (`MCH_DRD`).
+// Remaining 16-byte-aligned slots in `0x1000_F400..=0x1000_F4F0` (such as `0x1000_F410`, accessed by the EE BIOS
+// memory initialization routine at `PC = 0x9FC4_11B4`) are backed by 32-bit R/W latches in `regs`.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct RdramMch {
     pub ricm: u32,
     pub drd: u32,
     pub rdram_sdevid: u32,
+    pub regs: [u32; 16],
 }
 
 impl RdramMch {
@@ -33,6 +37,33 @@ impl RdramMch {
             ricm: 0,
             drd: 0,
             rdram_sdevid: 0,
+            regs: [0; 16],
+        }
+    }
+
+    /// Read a 32-bit register in `0x1000_F400..=0x1000_F4F0`.
+    #[inline]
+    pub fn read32(&mut self, paddr: u32) -> u32 {
+        match paddr {
+            0x1000_F430 => self.read_f430(),
+            0x1000_F440 => self.read_f440(),
+            _ => {
+                let idx = ((paddr - 0x1000_F400) >> 4) as usize & 0xF;
+                self.regs[idx]
+            }
+        }
+    }
+
+    /// Write a 32-bit register in `0x1000_F400..=0x1000_F4F0`.
+    #[inline]
+    pub fn write32(&mut self, paddr: u32, data: u32) {
+        match paddr {
+            0x1000_F430 => self.write_f430(data),
+            0x1000_F440 => self.write_f440(data),
+            _ => {
+                let idx = ((paddr - 0x1000_F400) >> 4) as usize & 0xF;
+                self.regs[idx] = data;
+            }
         }
     }
 

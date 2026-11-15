@@ -163,3 +163,57 @@ This document records non-obvious PlayStation 2 hardware behaviors encountered d
   - Import stub tables in `.text` start with a 20-byte header (`0x41E0_0000`, `0`, `version`, 8-byte module name) followed by 8-byte function stubs (`0x03E0_0008` `jr $ra`; `0x2400_xxxx` `addiu $zero, $zero, import_index`).
 - **Evidence**: `local/ps2autotests/tests/cpu/iop/*.irx` ELF headers, `SHT_REL` sections, and `.iop.import` tables.
 - **Source Classification**: **Primary source** (`ps2autotests` `cpu/iop/*.irx` binaries).
+
+---
+
+## 7. LLE BIOS Boot Register Stubs & IOP Cache Isolation (`Task 6b`)
+
+### 7.1 EE DMAC `0x1000_F500` Undocumented Control Latch (`EeDmac::d_f500`)
+- **Behavior**:
+  - Backed by a 32-bit R/W latch (`EeDmac::d_f500`) at physical address `0x1000_F500` in the `0x1000_F5xx` DMAC disable/enable register block (`D_ENABLEW` `0x1000_F520`, `D_ENABLER` `0x1000_F590`).
+- **Evidence**: Hit on Iteration 1 of coupled LLE BIOS boot (`EE PC = 0xBFC0_0838`, `sw $v0, 0($v1)` with `$v1 = 0xB000_F500`, `val = 0x0000_0001`).
+- **Source Classification**: `TODO(verify)` (`ps2tek` `#dmacio` documents `0x1000_F520` and `0x1000_F590` in the `0x1000_F5xx` block, but omits `0x1000_F500`).
+
+### 7.2 EE Serial I/O (`EeSio`, `0x1000_F100..=0x1000_F1C0`)
+- **Behavior**:
+  - Implements the Emotion Engine UART control/status registers (`0x1000_F100` `SIO_LCR`, `0x1000_F110` `SIO_LSR`, `0x1000_F120` `SIO_IER`, `0x1000_F130` `SIO_ISR` with write-1-to-clear on bits `0..=2`, `0x1000_F140` `SIO_FCR`, `0x1000_F150` `SIO_BGR`, `0x1000_F180` `SIO_TXFIFO` / `KPUTCHAR` stdout capture, and `0x1000_F1C0` `SIO_RXFIFO`).
+- **Evidence**: Hit on Iteration 2 of LLE BIOS boot (`EE PC = 0x9FC4_2F9C`, `paddr = 0x1000_F100`, `val = 0x0000_0020`), immediately preceding EE serial console initialization and output.
+- **Source Classification**: **Primary source** (`ps2tek` `#iomaps` line 212 for `0x1000_F180` `KPUTCHAR`; `ps2sdk` `ee/kernel/include/sio.h` for `0x1000_F100..=0x1000_F1C0`).
+
+### 7.3 IOP Mode & Bootstrap Register (`0x1F80_1450`, `GM_IF`)
+- **Behavior**:
+  - Backed by `Bus::iop_gm_if: u32` (initialized to `0` on reset = PS2 R3000A mode). Early IOP BIOS reset code (`IOP PC = 0xBFC0_2040`) reads `0xBF80_1450` and tests bit 3 (`andi $t0, $t0, 0x0008`) to branch between native PS2 IOP initialization and PS1 backwards-compatibility mode.
+- **Evidence**: Hit on Iteration 3 of LLE BIOS boot (`IOP PC = 0xBFC0_2040`, `lw $t0, 5200($t0)` at `paddr = 0x1F80_1450`).
+- **Source Classification**: `TODO(verify)` (`ps2sdk` `common/include/iop_regs.h` names `0x1F80_1450` `GM_IF`; `ps2tek` omits `0x1F80_1450`).
+
+### 7.4 IOP Sub-System Bus Controller (`IopSsbusc`, `0x1F80_1000..=0x1F80_1023`, `0x1F80_1060`, `0x1F80_1400..=0x1F80_1423`)
+- **Behavior**:
+  - Backed by `IopSsbusc` (`memctrl1: [u32; 9]` at `0x1F80_1000..=0x1F80_1023`, `ram_size: u32` at `0x1F80_1060`, and `ssbus_ext: [u32; 9]` at `0x1F80_1400..=0x1F80_1423`).
+- **Evidence**: Hit on Iteration 4 of LLE BIOS boot (`IOP PC = 0xBFC0_20C4`, `paddr = 0x1F80_1010`) where the IOP BIOS iterates through an initialization table configuring SSBUSC memory/device bus delays and base addresses.
+- **Source Classification**: `TODO(verify)` (`ps2sdk` `iop/system/ssbusc` and `psx-spx` Memory Control 1/2 document these ranges; `ps2tek` omits the register bitfields).
+
+### 7.5 IOP Expansion Region 2 `POST2` Diagnostic Latch (`0x1F80_2070`)
+- **Behavior**:
+  - Backed by `Bus::iop_post2: u32` at `0x1F80_2070` (`HW_POST2` power-on self-test diagnostic status latch).
+- **Evidence**: Hit on Iteration 5 of LLE BIOS boot (`IOP PC = 0xBFC0_20E8`, `paddr = 0x1F80_2070`, `val = 0x0000_00FC`).
+- **Source Classification**: `TODO(verify)` (`ps2tek` omits `0x1F80_2070`).
+
+### 7.6 IOP DMA Priority & Interrupt Control (`IopDmacControl`, `0x1F80_10F0..=0x1F80_10F4`, `0x1F80_1570..=0x1F80_157C`)
+- **Behavior**:
+  - Implements `DPCR` (`0x1F80_10F0`, reset `0x0777_7777`), `DICR` (`0x1F80_10F4`, bits `24..=30` write-1-to-clear, bit `31` computed as `DICR.15 | (DMACINTEN.0 && DICR.23 && (DICR.24..30 != 0 || DICR2.24..29 != 0))`), `DPCR2` (`0x1F80_1570`), `DICR2` (`0x1F80_1574`, bits `24..=29` write-1-to-clear), `DMACEN` (`0x1F80_1578`, bit `0`), and `DMACINTEN` (`0x1F80_157C`, bits `0..=1`).
+- **Evidence**: Hit on Iteration 6 of LLE BIOS boot (`IOP PC = 0xBFC0_20E8`, `paddr = 0x1F80_10F0`, `val = 0x0777_7777`).
+- **Source Classification**: **Primary source** (`ps2tek` `https://psi-rockin.github.io/ps2tek/#iopdma`, `local/ps2tek/index.html` lines 4051–4118).
+
+### 7.7 EE RDRAM Memory Controller Hub (`RdramMch`, `0x1000_F400..=0x1000_F4F0`)
+- **Behavior**:
+  - Extends `RdramMch` beyond `0x1000_F430` (`MCH_RICM`) and `0x1000_F440` (`MCH_DRD`) with a 16-word `regs: [u32; 16]` array covering the remaining 16-byte-aligned MCH control/timing slots in `0x1000_F400..=0x1000_F4F0` (such as `0x1000_F410`).
+- **Evidence**: Hit on Iteration 7 of LLE BIOS boot (`EE PC = 0x9FC4_11B4` inside the EE memory initialization routine, `sw $zero, 0($v1)` at `paddr = 0x1000_F410`).
+- **Source Classification**: **Primary source** for `0x1000_F430` and `0x1000_F440` (`ps2tek` `#eerdram` lines 700–754); `TODO(verify)` for the remaining 16-byte-aligned slots in `0x1000_F400..=0x1000_F4F0`.
+
+### 7.8 IOP `COP0.SR.IsC` Cache Isolation & `KSEG2` Cache Control (`0xFFFE_0130..=0xFFFE_014F`)
+- **Behavior**:
+  - When `COP0.SR` bit 16 (`IsC = 0x0001_0000`, Isolate Cache) is set on the R3000A IOP, data loads and stores (`LB`, `LBU`, `LH`, `LHU`, `LW`, `LWL`, `LWR`, `SB`, `SH`, `SW`, `SWL`, `SWR`) target the isolated cache lines/tags and do not read or overwrite `Bus::iop_ram`. Without `IsC` isolation, the IOP BIOS `FlushIcache()` / `FlushDcache()` routines overwrite the first 4 KB of IOP RAM (`0x0000_0000..=0x0000_0FFF`) with zeros during boot.
+  - `Bus::iop_translate_addr` preserves `KSEG2` addresses (`vaddr >= 0xC000_0000`) instead of masking with `0x1FFF_FFFF` (which would otherwise alias `0xFFFE_0130` into BIOS ROM at `0x1FFE_0130`), and maps `0xFFFE_0130..=0xFFFE_014F` to `Bus::iop_cache_ctrl: [u32; 8]`.
+- **Evidence**: Hit on Iteration 8 of LLE BIOS boot (`IOP PC = 0x0000_0078` prior to `IsC` isolation, and `IOP PC = 0xBFC0_20E8` writing `0xFFFE_0130` / `0xFFFE_0140` / `0xFFFE_0144`). With both in place, the IOP BIOS boots past `145,058` IOP cycles (`1,160,464` EE cycles) into loaded IOP kernel initialization (`PC = 0x0000_3D88`).
+- **Source Classification**: **Primary source** for R3000A `COP0.SR.IsC` cache isolation and `FFFE0000h (KSEG2) Cache control` (`ps2tek` `#memorymap` line 106 & `#iop` line 5326); `TODO(verify)` for individual bitfields of `0xFFFE_0130..=0xFFFE_014F`.
+

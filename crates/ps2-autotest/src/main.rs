@@ -3,9 +3,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Instant;
 
 use clap::Parser;
-use ps2_core::bus::{Bus, UnimplementedDmaTransfer, UnimplementedIopRegister};
+use ps2_core::bus::{
+    Bus, UnimplementedDmaTransfer, UnimplementedEeRegister, UnimplementedIopRegister,
+};
 use ps2_core::ee::{EeCpuState, EeHleState, HleStepResult};
 use ps2_core::iop::{
     is_irx_binary, load_irx, IopCpuState, IopStepResult, IrxError, LoadedIrx,
@@ -21,16 +24,24 @@ struct Args {
     #[arg(value_name = "ELF")]
     elf: Option<PathBuf>,
 
-    /// Path to a single `.elf` test binary (alias for positional `ELF`).
+    /// Path to a single `.elf` or `.irx` test binary (alias for positional `ELF`).
     #[arg(long)]
     test: Option<PathBuf>,
+
+    /// Run all 35 suites in the Phase 1 Hardware Gate, print the summary table, and exit nonzero on any failure.
+    #[arg(long)]
+    gate: bool,
+
+    /// Boot the PS2 BIOS image from reset (`0xBFC0_0000`) in coupled `(EE + IOP)` LLE mode until the first blocker.
+    #[arg(long)]
+    boot_bios: bool,
 
     /// Path to the `ps2autotests` `tests/` directory.
     #[arg(long, default_value = "local/ps2autotests/tests")]
     suite_dir: PathBuf,
 
     /// Optional path to a 4 MB PS2 BIOS dump directory or file.
-    #[arg(long, default_value = "local/bios")]
+    #[arg(long, default_value = "local/bios/scph10000.bin")]
     bios: PathBuf,
 
     /// Maximum EE cycles to execute per test before timing out.
@@ -57,7 +68,9 @@ pub enum RunStopReason {
     UnimplementedDmaTransfer(UnimplementedDmaTransfer),
     /// Hit an unimplemented IOP `.irx` module import stub.
     UnimplementedIopImport(UnimplementedIopImport),
-    /// Accessed an unimplemented IOP hardware register (`0x1F80_1000..=0x1F9F_FFFF`).
+    /// Accessed an unimplemented EE hardware register.
+    UnimplementedEeRegister(UnimplementedEeRegister),
+    /// Accessed an unimplemented IOP hardware register.
     UnimplementedIopRegister(UnimplementedIopRegister),
 }
 
@@ -85,6 +98,11 @@ impl std::fmt::Display for RunStopReason {
                 info.channel, info.channel_name, info.chcr, info.madr, info.qwc, info.tadr
             ),
             Self::UnimplementedIopImport(imp) => write!(f, "{imp}"),
+            Self::UnimplementedEeRegister(reg) => write!(
+                f,
+                "UnimplementedEeRegister(paddr=0x{:08X}, width={}, is_write={}, value=0x{:08X})",
+                reg.paddr, reg.width, reg.is_write, reg.value
+            ),
             Self::UnimplementedIopRegister(reg) => write!(
                 f,
                 "UnimplementedIopRegister(paddr=0x{:08X}, width={}, is_write={}, value=0x{:08X})",
@@ -313,23 +331,567 @@ fn run_single_elf_file(elf_path: &Path, max_cycles: u64) -> ExitCode {
     }
 }
 
+/// Canonical list of all 35 suites in the Phase 1 Hardware Gate (`23` EE + `5` DMAC/SPR + `7` `cpu/iop`).
+pub const PHASE1_HW_GATE_SUITES: [&str; 35] = [
+    // 23 EE CPU, COP0, COP1 FPU, MMI SIMD, and Memory suites
+    "cpu/ee/alu.elf",
+    "cpu/ee/branch.elf",
+    "cpu/ee/branchdelay.elf",
+    "cpu/ee/lsu.elf",
+    "cpu/ee/lsudelay.elf",
+    "cpu/ee/muldiv.elf",
+    "cpu/ee_cop0/performance.elf",
+    "cpu/ee_fpu/arithmetic.elf",
+    "cpu/ee_fpu/branch.elf",
+    "cpu/ee_fpu/branchdelay.elf",
+    "cpu/ee_fpu/compare.elf",
+    "cpu/ee_fpu/convert.elf",
+    "cpu/ee_fpu/fcr.elf",
+    "cpu/ee_fpu/muldiv.elf",
+    "cpu/ee_fpu/sqrt.elf",
+    "cpu/ee_fpu/transfer.elf",
+    "cpu/ee_simd/arithmetic.elf",
+    "cpu/ee_simd/compare.elf",
+    "cpu/ee_simd/funnel.elf",
+    "cpu/ee_simd/logic.elf",
+    "cpu/ee_simd/muldiv.elf",
+    "cpu/ee_simd/shuffle.elf",
+    "memory/ee/default.elf",
+    // 5 EE DMAC & Scratchpad DMA suites
+    "dma/dmac/cpcond.elf",
+    "dma/dmac/tagintr.elf",
+    "dma/spr/chain.elf",
+    "dma/spr/interleave.elf",
+    "dma/spr/normal.elf",
+    // 7 R3000A IOP CPU suites
+    "cpu/iop/alu.irx",
+    "cpu/iop/branch.irx",
+    "cpu/iop/branchdelay.irx",
+    "cpu/iop/hilodelay.irx",
+    "cpu/iop/lsu.irx",
+    "cpu/iop/lsudelay.irx",
+    "cpu/iop/muldiv.irx",
+];
+
+fn run_phase1_gate(suite_dir: &Path, max_cycles: u64) -> ExitCode {
+    let start_time = Instant::now();
+    let mut passed_count = 0usize;
+    let total_count = PHASE1_HW_GATE_SUITES.len();
+    let mut failure_diffs: Vec<(String, String)> = Vec::new();
+
+    println!(
+        "| {:>2} | {:<32} | {:<6} | {:<6} | {:>12} | {:<18} |",
+        "#", "Suite", "Target", "Status", "Cycles", "Stop Reason"
+    );
+    println!(
+        "|---:|:---------------------------------|:-------|:-------|-------------:|:-------------------|"
+    );
+
+    for (idx, rel_path) in PHASE1_HW_GATE_SUITES.iter().enumerate() {
+        let full_path = suite_dir.join(rel_path);
+        let expected_path = full_path.with_extension("expected");
+
+        let bin_bytes = match fs::read(&full_path) {
+            Ok(b) => b,
+            Err(err) => {
+                println!(
+                    "| {:>2} | {:<32} | {:<6} | {:<6} | {:>12} | {:<18} |",
+                    idx + 1,
+                    rel_path,
+                    "N/A",
+                    "FAIL",
+                    0,
+                    format!("ReadError({err})")
+                );
+                failure_diffs.push((
+                    (*rel_path).to_owned(),
+                    format!("Failed to read {}: {err}\n", full_path.display()),
+                ));
+                continue;
+            }
+        };
+
+        let expected_raw = match fs::read_to_string(&expected_path) {
+            Ok(s) => s,
+            Err(err) => {
+                println!(
+                    "| {:>2} | {:<32} | {:<6} | {:<6} | {:>12} | {:<18} |",
+                    idx + 1,
+                    rel_path,
+                    "N/A",
+                    "FAIL",
+                    0,
+                    format!("ExpectedError({err})")
+                );
+                failure_diffs.push((
+                    (*rel_path).to_owned(),
+                    format!("Failed to read {}: {err}\n", expected_path.display()),
+                ));
+                continue;
+            }
+        };
+        let expected = normalize_newlines(&expected_raw);
+
+        let (stdout, stop_reason, cycles, target_label) = if is_irx_binary(&bin_bytes) {
+            match run_irx_bytes(&bin_bytes, max_cycles) {
+                Ok(rep) => (rep.stdout, rep.stop_reason, rep.iop_cycles, "IOP"),
+                Err(err) => {
+                    println!(
+                        "| {:>2} | {:<32} | {:<6} | {:<6} | {:>12} | {:<18} |",
+                        idx + 1,
+                        rel_path,
+                        "IOP",
+                        "FAIL",
+                        0,
+                        format!("LoadError({err})")
+                    );
+                    failure_diffs
+                        .push(((*rel_path).to_owned(), format!("IRX load error: {err}\n")));
+                    continue;
+                }
+            }
+        } else {
+            match run_elf_bytes(&bin_bytes, max_cycles) {
+                Ok(rep) => (rep.stdout, rep.stop_reason, rep.cycles, "EE"),
+                Err(err) => {
+                    println!(
+                        "| {:>2} | {:<32} | {:<6} | {:<6} | {:>12} | {:<18} |",
+                        idx + 1,
+                        rel_path,
+                        "EE",
+                        "FAIL",
+                        0,
+                        format!("LoadError({err})")
+                    );
+                    failure_diffs
+                        .push(((*rel_path).to_owned(), format!("ELF load error: {err}\n")));
+                    continue;
+                }
+            }
+        };
+
+        let is_pass = stdout == expected;
+        let status_str = if is_pass { "PASS" } else { "FAIL" };
+        if is_pass {
+            passed_count += 1;
+        } else {
+            failure_diffs.push((
+                (*rel_path).to_owned(),
+                format_expected_diff(&expected, &stdout),
+            ));
+        }
+
+        println!(
+            "| {:>2} | {:<32} | {:<6} | {:<6} | {:>12} | {:<18} |",
+            idx + 1,
+            rel_path,
+            target_label,
+            status_str,
+            cycles,
+            stop_reason.to_string()
+        );
+    }
+
+    let elapsed = start_time.elapsed().as_secs_f64();
+    println!(
+        "\n=== PHASE 1 HARDWARE GATE: {passed_count}/{total_count} PASSED in {elapsed:.3} s ==="
+    );
+
+    if !failure_diffs.is_empty() {
+        for (suite, diff) in &failure_diffs {
+            eprintln!("\n--- FAILURE DIFF: {suite} ---\n{diff}");
+        }
+        return ExitCode::FAILURE;
+    }
+
+    ExitCode::SUCCESS
+}
+
+const MIPS_GPR_NAMES: [&str; 32] = [
+    "$zero", "$at", "$v0", "$v1", "$a0", "$a1", "$a2", "$a3", "$t0", "$t1", "$t2", "$t3", "$t4",
+    "$t5", "$t6", "$t7", "$s0", "$s1", "$s2", "$s3", "$s4", "$s5", "$s6", "$s7", "$t8", "$t9",
+    "$k0", "$k1", "$gp", "$sp", "$fp", "$ra",
+];
+
+fn peek_ee_word(bus: &Bus, vaddr: u32) -> u32 {
+    let paddr = vaddr & 0x1FFF_FFFF;
+    match paddr {
+        0x0000_0000..=0x01FF_FFFF => {
+            let off = (paddr as usize) & (bus.ram.len() - 4);
+            u32::from_le_bytes([
+                bus.ram[off],
+                bus.ram[off + 1],
+                bus.ram[off + 2],
+                bus.ram[off + 3],
+            ])
+        }
+        0x1FC0_0000..=0x1FFF_FFFF => {
+            let off = (paddr as usize) & (bus.bios.len() - 4);
+            u32::from_le_bytes([
+                bus.bios[off],
+                bus.bios[off + 1],
+                bus.bios[off + 2],
+                bus.bios[off + 3],
+            ])
+        }
+        _ => 0,
+    }
+}
+
+fn peek_iop_word(bus: &Bus, vaddr: u32) -> u32 {
+    let paddr = vaddr & 0x1FFF_FFFF;
+    match paddr {
+        0x0000_0000..=0x007F_FFFF => {
+            let off = (paddr as usize) & (bus.iop_ram.len() - 4);
+            u32::from_le_bytes([
+                bus.iop_ram[off],
+                bus.iop_ram[off + 1],
+                bus.iop_ram[off + 2],
+                bus.iop_ram[off + 3],
+            ])
+        }
+        0x1FC0_0000..=0x1FFF_FFFF => {
+            let off = (paddr as usize) & (bus.bios.len() - 4);
+            u32::from_le_bytes([
+                bus.bios[off],
+                bus.bios[off + 1],
+                bus.bios[off + 2],
+                bus.bios[off + 3],
+            ])
+        }
+        _ => 0,
+    }
+}
+
+fn disasm_mips_instr(pc: u32, instr: u32) -> String {
+    if instr == 0 {
+        return "nop".to_owned();
+    }
+    let op = instr >> 26;
+    let rs = ((instr >> 21) & 0x1F) as usize;
+    let rt = ((instr >> 16) & 0x1F) as usize;
+    let rd = ((instr >> 11) & 0x1F) as usize;
+    let sa = (instr >> 6) & 0x1F;
+    let funct = instr & 0x3F;
+    let imm = (instr & 0xFFFF) as u16;
+    let simm = imm as i16;
+    let btarget = pc
+        .wrapping_add(4)
+        .wrapping_add(((simm as i32) as u32).wrapping_shl(2));
+    let jtarget = (pc.wrapping_add(4) & 0xF000_0000) | ((instr & 0x03FF_FFFF) << 2);
+
+    match op {
+        0x00 => match funct {
+            0x00 => format!("sll {}, {}, {sa}", MIPS_GPR_NAMES[rd], MIPS_GPR_NAMES[rt]),
+            0x02 => format!("srl {}, {}, {sa}", MIPS_GPR_NAMES[rd], MIPS_GPR_NAMES[rt]),
+            0x03 => format!("sra {}, {}, {sa}", MIPS_GPR_NAMES[rd], MIPS_GPR_NAMES[rt]),
+            0x08 => format!("jr {}", MIPS_GPR_NAMES[rs]),
+            0x09 => format!("jalr {}, {}", MIPS_GPR_NAMES[rd], MIPS_GPR_NAMES[rs]),
+            0x0C => "syscall".to_owned(),
+            0x0F => "sync".to_owned(),
+            0x10 => format!("mfhi {}", MIPS_GPR_NAMES[rd]),
+            0x12 => format!("mflo {}", MIPS_GPR_NAMES[rd]),
+            0x18 => format!(
+                "mult {}, {}, {}",
+                MIPS_GPR_NAMES[rd], MIPS_GPR_NAMES[rs], MIPS_GPR_NAMES[rt]
+            ),
+            0x19 => format!(
+                "multu {}, {}, {}",
+                MIPS_GPR_NAMES[rd], MIPS_GPR_NAMES[rs], MIPS_GPR_NAMES[rt]
+            ),
+            0x1A => format!("div {}, {}", MIPS_GPR_NAMES[rs], MIPS_GPR_NAMES[rt]),
+            0x1B => format!("divu {}, {}", MIPS_GPR_NAMES[rs], MIPS_GPR_NAMES[rt]),
+            0x21 => format!(
+                "addu {}, {}, {}",
+                MIPS_GPR_NAMES[rd], MIPS_GPR_NAMES[rs], MIPS_GPR_NAMES[rt]
+            ),
+            0x23 => format!(
+                "subu {}, {}, {}",
+                MIPS_GPR_NAMES[rd], MIPS_GPR_NAMES[rs], MIPS_GPR_NAMES[rt]
+            ),
+            0x24 => format!(
+                "and {}, {}, {}",
+                MIPS_GPR_NAMES[rd], MIPS_GPR_NAMES[rs], MIPS_GPR_NAMES[rt]
+            ),
+            0x25 => format!(
+                "or {}, {}, {}",
+                MIPS_GPR_NAMES[rd], MIPS_GPR_NAMES[rs], MIPS_GPR_NAMES[rt]
+            ),
+            0x26 => format!(
+                "xor {}, {}, {}",
+                MIPS_GPR_NAMES[rd], MIPS_GPR_NAMES[rs], MIPS_GPR_NAMES[rt]
+            ),
+            0x27 => format!(
+                "nor {}, {}, {}",
+                MIPS_GPR_NAMES[rd], MIPS_GPR_NAMES[rs], MIPS_GPR_NAMES[rt]
+            ),
+            0x2A => format!(
+                "slt {}, {}, {}",
+                MIPS_GPR_NAMES[rd], MIPS_GPR_NAMES[rs], MIPS_GPR_NAMES[rt]
+            ),
+            0x2B => format!(
+                "sltu {}, {}, {}",
+                MIPS_GPR_NAMES[rd], MIPS_GPR_NAMES[rs], MIPS_GPR_NAMES[rt]
+            ),
+            0x2D => format!(
+                "daddu {}, {}, {}",
+                MIPS_GPR_NAMES[rd], MIPS_GPR_NAMES[rs], MIPS_GPR_NAMES[rt]
+            ),
+            _ => format!("special(funct=0x{funct:02X})"),
+        },
+        0x01 => match rt {
+            0x00 => format!("bltz {}, 0x{btarget:08X}", MIPS_GPR_NAMES[rs]),
+            0x01 => format!("bgez {}, 0x{btarget:08X}", MIPS_GPR_NAMES[rs]),
+            0x10 => format!("bltzal {}, 0x{btarget:08X}", MIPS_GPR_NAMES[rs]),
+            0x11 => format!("bgezal {}, 0x{btarget:08X}", MIPS_GPR_NAMES[rs]),
+            _ => format!("regimm(rt=0x{rt:02X})"),
+        },
+        0x02 => format!("j 0x{jtarget:08X}"),
+        0x03 => format!("jal 0x{jtarget:08X}"),
+        0x04 => format!(
+            "beq {}, {}, 0x{btarget:08X}",
+            MIPS_GPR_NAMES[rs], MIPS_GPR_NAMES[rt]
+        ),
+        0x05 => format!(
+            "bne {}, {}, 0x{btarget:08X}",
+            MIPS_GPR_NAMES[rs], MIPS_GPR_NAMES[rt]
+        ),
+        0x06 => format!("blez {}, 0x{btarget:08X}", MIPS_GPR_NAMES[rs]),
+        0x07 => format!("bgtz {}, 0x{btarget:08X}", MIPS_GPR_NAMES[rs]),
+        0x08 => format!(
+            "addi {}, {}, {simm}",
+            MIPS_GPR_NAMES[rt], MIPS_GPR_NAMES[rs]
+        ),
+        0x09 => format!(
+            "addiu {}, {}, 0x{imm:04X} ({simm})",
+            MIPS_GPR_NAMES[rt], MIPS_GPR_NAMES[rs]
+        ),
+        0x0A => format!(
+            "slti {}, {}, {simm}",
+            MIPS_GPR_NAMES[rt], MIPS_GPR_NAMES[rs]
+        ),
+        0x0B => format!(
+            "sltiu {}, {}, {simm}",
+            MIPS_GPR_NAMES[rt], MIPS_GPR_NAMES[rs]
+        ),
+        0x0C => format!(
+            "andi {}, {}, 0x{imm:04X}",
+            MIPS_GPR_NAMES[rt], MIPS_GPR_NAMES[rs]
+        ),
+        0x0D => format!(
+            "ori {}, {}, 0x{imm:04X}",
+            MIPS_GPR_NAMES[rt], MIPS_GPR_NAMES[rs]
+        ),
+        0x0E => format!(
+            "xori {}, {}, 0x{imm:04X}",
+            MIPS_GPR_NAMES[rt], MIPS_GPR_NAMES[rs]
+        ),
+        0x0F => format!("lui {}, 0x{imm:04X}", MIPS_GPR_NAMES[rt]),
+        0x10 => match rs {
+            0x00 => format!("mfc0 {}, ${rd}", MIPS_GPR_NAMES[rt]),
+            0x04 => format!("mtc0 {}, ${rd}", MIPS_GPR_NAMES[rt]),
+            0x10 => format!("cop0_co(funct=0x{funct:02X})"),
+            _ => format!("cop0(rs=0x{rs:02X})"),
+        },
+        0x14 => format!(
+            "beql {}, {}, 0x{btarget:08X}",
+            MIPS_GPR_NAMES[rs], MIPS_GPR_NAMES[rt]
+        ),
+        0x15 => format!(
+            "bnel {}, {}, 0x{btarget:08X}",
+            MIPS_GPR_NAMES[rs], MIPS_GPR_NAMES[rt]
+        ),
+        0x19 => format!(
+            "daddiu {}, {}, {simm}",
+            MIPS_GPR_NAMES[rt], MIPS_GPR_NAMES[rs]
+        ),
+        0x1E => format!("lq {}, {simm}({})", MIPS_GPR_NAMES[rt], MIPS_GPR_NAMES[rs]),
+        0x1F => format!("sq {}, {simm}({})", MIPS_GPR_NAMES[rt], MIPS_GPR_NAMES[rs]),
+        0x20 => format!("lb {}, {simm}({})", MIPS_GPR_NAMES[rt], MIPS_GPR_NAMES[rs]),
+        0x21 => format!("lh {}, {simm}({})", MIPS_GPR_NAMES[rt], MIPS_GPR_NAMES[rs]),
+        0x23 => format!("lw {}, {simm}({})", MIPS_GPR_NAMES[rt], MIPS_GPR_NAMES[rs]),
+        0x24 => format!("lbu {}, {simm}({})", MIPS_GPR_NAMES[rt], MIPS_GPR_NAMES[rs]),
+        0x25 => format!("lhu {}, {simm}({})", MIPS_GPR_NAMES[rt], MIPS_GPR_NAMES[rs]),
+        0x27 => format!("lwu {}, {simm}({})", MIPS_GPR_NAMES[rt], MIPS_GPR_NAMES[rs]),
+        0x28 => format!("sb {}, {simm}({})", MIPS_GPR_NAMES[rt], MIPS_GPR_NAMES[rs]),
+        0x29 => format!("sh {}, {simm}({})", MIPS_GPR_NAMES[rt], MIPS_GPR_NAMES[rs]),
+        0x2B => format!("sw {}, {simm}({})", MIPS_GPR_NAMES[rt], MIPS_GPR_NAMES[rs]),
+        0x2F => format!("cache 0x{rt:02X}, {simm}({})", MIPS_GPR_NAMES[rs]),
+        0x37 => format!("ld {}, {simm}({})", MIPS_GPR_NAMES[rt], MIPS_GPR_NAMES[rs]),
+        0x3F => format!("sd {}, {simm}({})", MIPS_GPR_NAMES[rt], MIPS_GPR_NAMES[rs]),
+        _ => format!("op=0x{op:02X} (0x{instr:08X})"),
+    }
+}
+
+fn print_disasm_window(bus: &Bus, is_iop: bool, center_pc: u32) {
+    for delta in -2i32..=2i32 {
+        let addr = center_pc.wrapping_add((delta * 4) as u32);
+        let word = if is_iop {
+            peek_iop_word(bus, addr)
+        } else {
+            peek_ee_word(bus, addr)
+        };
+        let marker = if delta == 0 { "=>" } else { "  " };
+        println!(
+            "  {marker} 0x{addr:08X}: 0x{word:08X}  {}",
+            disasm_mips_instr(addr, word)
+        );
+    }
+}
+
+fn run_bios_boot(bios_path: &Path, max_ee_cycles: u64) -> ExitCode {
+    let resolved_path = if bios_path.is_dir() {
+        bios_path.join("scph10000.bin")
+    } else {
+        bios_path.to_path_buf()
+    };
+
+    let bios_bytes = match fs::read(&resolved_path) {
+        Ok(b) => b,
+        Err(err) => {
+            eprintln!(
+                "ERROR: failed to read BIOS image at {}: {err}",
+                resolved_path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut ee = EeCpuState::new();
+    let mut iop = IopCpuState::new();
+    let mut bus = Bus::new();
+    if let Err(err) = bus.load_bios(&bios_bytes) {
+        eprintln!("ERROR: {err}");
+        return ExitCode::FAILURE;
+    }
+
+    let mut ee_cycles = 0u64;
+    let mut iop_cycles = 0u64;
+
+    let (stop_cpu, stop_pc, stop_reason) = 'outer: loop {
+        if ee_cycles >= max_ee_cycles {
+            break ("EE/IOP", ee.pc, RunStopReason::MaxCyclesReached(ee_cycles));
+        }
+
+        for _ in 0..8 {
+            let ee_pc_before = ee.pc;
+            let ee_instr = peek_ee_word(&bus, ee_pc_before);
+            let opcode = ee_instr >> 26;
+            if matches!(opcode, 0x12 | 0x32 | 0x3A) {
+                break 'outer (
+                    "EE",
+                    ee_pc_before,
+                    RunStopReason::UnimplementedInstruction {
+                        pc: ee_pc_before,
+                        instr: ee_instr,
+                        category: "COP2 / VU0 Macro (Phase 2)",
+                    },
+                );
+            }
+
+            ee.step(&mut bus);
+            ee_cycles += 1;
+
+            if let Some(reg_err) = bus.pending_ee_mmio_error.take() {
+                break 'outer (
+                    "EE",
+                    ee_pc_before,
+                    RunStopReason::UnimplementedEeRegister(reg_err),
+                );
+            }
+            if let Some(dma_err) = bus.dmac.unimplemented_transfer.take() {
+                break 'outer (
+                    "EE",
+                    ee_pc_before,
+                    RunStopReason::UnimplementedDmaTransfer(dma_err),
+                );
+            }
+        }
+
+        let iop_pc_before = iop.pc;
+        let iop_res = iop.step_coupled(&mut bus);
+        iop_cycles += 1;
+        match iop_res {
+            IopStepResult::Continue | IopStepResult::Exited(_) => {}
+            IopStepResult::UnimplementedImport(imp) => {
+                break 'outer (
+                    "IOP",
+                    iop_pc_before,
+                    RunStopReason::UnimplementedIopImport(imp),
+                );
+            }
+            IopStepResult::UnimplementedRegister(reg_err) => {
+                break 'outer (
+                    "IOP",
+                    iop_pc_before,
+                    RunStopReason::UnimplementedIopRegister(reg_err),
+                );
+            }
+            IopStepResult::UnimplementedInstruction { pc, instr } => {
+                break 'outer (
+                    "IOP",
+                    pc,
+                    RunStopReason::UnimplementedInstruction {
+                        pc,
+                        instr,
+                        category: "IOP_R3000A",
+                    },
+                );
+            }
+        }
+    };
+
+    println!("=== LLE BIOS BOOT REPORT ===");
+    println!("Stopped on: {stop_cpu} at PC = 0x{stop_pc:08X}");
+    println!("Stop reason: {stop_reason}");
+    println!(
+        "Progress: ee_cycles = {ee_cycles}, iop_cycles = {iop_cycles} (current EE PC = 0x{:08X}, IOP PC = 0x{:08X})",
+        ee.pc, iop.pc
+    );
+    if stop_cpu == "EE" || stop_cpu == "EE/IOP" {
+        println!("EE Disassembly around 0x{:08X}:", stop_pc);
+        print_disasm_window(&bus, false, stop_pc);
+    }
+    if stop_cpu == "IOP" || stop_cpu == "EE/IOP" {
+        let pc_to_show = if stop_cpu == "IOP" { stop_pc } else { iop.pc };
+        println!("IOP Disassembly around 0x{:08X}:", pc_to_show);
+        print_disasm_window(&bus, true, pc_to_show);
+    }
+    if !bus.stdout_buffer.is_empty() {
+        let out = String::from_utf8_lossy(&bus.stdout_buffer);
+        println!(
+            "Console output ({} bytes):\n{}",
+            bus.stdout_buffer.len(),
+            out
+        );
+    }
+
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     let args = Args::parse();
+    if args.boot_bios {
+        return run_bios_boot(&args.bios, args.max_cycles);
+    }
+
     if let Some(elf_path) = args.elf.as_ref().or(args.test.as_ref()) {
         return run_single_elf_file(elf_path, args.max_cycles);
     }
 
-    tracing::info!(
-        suite_dir = %args.suite_dir.display(),
-        bios = %args.bios.display(),
-        max_cycles = args.max_cycles,
-        "No ELF path provided; pass <path/to/test.elf> or --test <path/to/test.elf>"
+    if args.gate || args.suite_dir.exists() {
+        return run_phase1_gate(&args.suite_dir, args.max_cycles);
+    }
+
+    eprintln!(
+        "ERROR: suite directory {} does not exist; pass --suite-dir <path> or a single test binary",
+        args.suite_dir.display()
     );
-    ExitCode::SUCCESS
+    ExitCode::FAILURE
 }
 
 #[cfg(test)]

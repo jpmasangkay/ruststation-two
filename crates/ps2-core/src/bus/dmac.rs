@@ -209,6 +209,10 @@ pub struct EeDmac {
     pub d_rbor: u32,
     /// `0x1000_E060` (`D_STADR`): Stall Address Register (`16`-byte aligned).
     pub d_stadr: u32,
+    /// `0x1000_F500`: Undocumented EE DMAC/bus management configuration latch written with `0x1` during early BIOS reset.
+    // TODO(verify): `ps2tek` (`#dmacio`) documents `0x1000_F520` (`D_ENABLER`) and `0x1000_F590` (`D_ENABLEW`)
+    // in the `0x1000_F5xx` block, but omits `0x1000_F500`; verify exact bit semantics on silicon.
+    pub d_f500: u32,
     /// `0x1000_F520` (`D_ENABLER`) / `0x1000_F590` (`D_ENABLEW`): Master DMA hold/suspend register
     /// (initialized to `0x1201` per `ps2tek` `https://psi-rockin.github.io/ps2tek/#dmacio`).
     pub d_enable: u32,
@@ -242,6 +246,7 @@ impl EeDmac {
             d_rbsr: 0,
             d_rbor: 0,
             d_stadr: 0,
+            d_f500: 0,
             d_enable: 0x1201,
             unimplemented_transfer: None,
         }
@@ -336,12 +341,13 @@ impl EeDmac {
             0x1000_E040 => self.d_rbsr,
             0x1000_E050 => self.d_rbor,
             0x1000_E060 => self.d_stadr,
+            0x1000_F500 => self.d_f500,
             0x1000_F520 | 0x1000_F590 => self.d_enable,
             _ => 0,
         }
     }
 
-    /// Write a 32-bit DMAC register at `paddr` (`0x1000_8000..=0x1000_E060` or `0x1000_F590`),
+    /// Write a 32-bit DMAC register at `paddr` (`0x1000_8000..=0x1000_E060` or `0x1000_F500` / `0x1000_F590`),
     /// starting and scheduling any triggered DMA transfer.
     pub fn write32(
         &mut self,
@@ -383,6 +389,9 @@ impl EeDmac {
             }
             0x1000_E060 => {
                 self.d_stadr = val & !0xF;
+            }
+            0x1000_F500 => {
+                self.d_f500 = val;
             }
             0x1000_F520 => {
                 // `D_ENABLER` is read-only (`ps2tek` `#dmacio`).

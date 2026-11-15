@@ -39,7 +39,18 @@ impl IopCpuState {
     /// Execute a single R3000A instruction in pure LLE mode and advance the central [`Bus`]
     /// scheduler by `EE_CYCLES_PER_IOP_CYCLE` (`8` EE cycles = `1` IOP cycle).
     pub fn step(&mut self, bus: &mut Bus) {
-        let _ = self.execute_cycle(bus, false);
+        let _ = self.execute_cycle(bus, false, true);
+    }
+
+    /// Execute a single R3000A instruction in coupled `(EE + IOP)` LLE mode (where the EE loop
+    /// already advances [`Bus::step_timers`] by `8` EE cycles per IOP cycle) and return any
+    /// unimplemented-register or unimplemented-instruction diagnostic.
+    pub fn step_coupled(&mut self, bus: &mut Bus) -> IopStepResult {
+        let res = self.execute_cycle(bus, false, false);
+        if let Some(reg_err) = bus.pending_iop_mmio_error.take() {
+            return IopStepResult::UnimplementedRegister(reg_err);
+        }
+        res
     }
 
     /// Execute a single R3000A instruction with `.irx` import stub HLE and exit detection,
@@ -48,14 +59,19 @@ impl IopCpuState {
         if self.pc == IOP_HLE_EXIT_RA {
             return IopStepResult::Exited(self.read_gpr(2) as i32);
         }
-        let res = self.execute_cycle(bus, true);
+        let res = self.execute_cycle(bus, true, true);
         if let Some(reg_err) = bus.pending_iop_mmio_error.take() {
             return IopStepResult::UnimplementedRegister(reg_err);
         }
         res
     }
 
-    fn execute_cycle(&mut self, bus: &mut Bus, enable_hle: bool) -> IopStepResult {
+    fn execute_cycle(
+        &mut self,
+        bus: &mut Bus,
+        enable_hle: bool,
+        advance_bus_timers: bool,
+    ) -> IopStepResult {
         // Check for pending hardware/software interrupts before fetching.
         if self.cop0.is_interrupt_pending() {
             let (vec_pc, vec_next) = self.cop0.raise_exception(
@@ -86,7 +102,7 @@ impl IopCpuState {
                 inst_in_delay_slot,
                 Some(inst_pc),
             );
-            self.finish_cycle(bus);
+            self.finish_cycle(bus, advance_bus_timers);
             return IopStepResult::Continue;
         }
 
@@ -481,7 +497,11 @@ impl IopCpuState {
             // LB (0x20)
             0x20 => {
                 let vaddr = self.read_gpr(rs).wrapping_add(simm);
-                let val = (bus.iop_read8(vaddr) as i8) as i32 as u32;
+                let val = if (self.cop0.status & (1 << 16)) != 0 {
+                    0
+                } else {
+                    (bus.iop_read8(vaddr) as i8) as i32 as u32
+                };
                 Self::queue_delayed_load(rt, val, &mut next_load, &mut written_reg);
             }
 
@@ -496,7 +516,11 @@ impl IopCpuState {
                         Some(vaddr),
                     );
                 } else {
-                    let val = (bus.iop_read16(vaddr) as i16) as i32 as u32;
+                    let val = if (self.cop0.status & (1 << 16)) != 0 {
+                        0
+                    } else {
+                        (bus.iop_read16(vaddr) as i16) as i32 as u32
+                    };
                     Self::queue_delayed_load(rt, val, &mut next_load, &mut written_reg);
                 }
             }
@@ -506,7 +530,11 @@ impl IopCpuState {
                 let vaddr = self.read_gpr(rs).wrapping_add(simm);
                 let aligned = vaddr & !3;
                 let byte = vaddr & 3;
-                let mem = bus.iop_read32(aligned);
+                let mem = if (self.cop0.status & (1 << 16)) != 0 {
+                    0
+                } else {
+                    bus.iop_read32(aligned)
+                };
                 // Merge against in-flight delayed load if back-to-back LWL/LWR targets `rt`.
                 let cur_rt = match prev_load {
                     Some(prev) if prev.reg == rt => prev.value,
@@ -532,7 +560,11 @@ impl IopCpuState {
                         Some(vaddr),
                     );
                 } else {
-                    let val = bus.iop_read32(vaddr);
+                    let val = if (self.cop0.status & (1 << 16)) != 0 {
+                        0
+                    } else {
+                        bus.iop_read32(vaddr)
+                    };
                     Self::queue_delayed_load(rt, val, &mut next_load, &mut written_reg);
                 }
             }
@@ -540,7 +572,11 @@ impl IopCpuState {
             // LBU (0x24)
             0x24 => {
                 let vaddr = self.read_gpr(rs).wrapping_add(simm);
-                let val = bus.iop_read8(vaddr) as u32;
+                let val = if (self.cop0.status & (1 << 16)) != 0 {
+                    0
+                } else {
+                    bus.iop_read8(vaddr) as u32
+                };
                 Self::queue_delayed_load(rt, val, &mut next_load, &mut written_reg);
             }
 
@@ -555,7 +591,11 @@ impl IopCpuState {
                         Some(vaddr),
                     );
                 } else {
-                    let val = bus.iop_read16(vaddr) as u32;
+                    let val = if (self.cop0.status & (1 << 16)) != 0 {
+                        0
+                    } else {
+                        bus.iop_read16(vaddr) as u32
+                    };
                     Self::queue_delayed_load(rt, val, &mut next_load, &mut written_reg);
                 }
             }
@@ -565,7 +605,11 @@ impl IopCpuState {
                 let vaddr = self.read_gpr(rs).wrapping_add(simm);
                 let aligned = vaddr & !3;
                 let byte = vaddr & 3;
-                let mem = bus.iop_read32(aligned);
+                let mem = if (self.cop0.status & (1 << 16)) != 0 {
+                    0
+                } else {
+                    bus.iop_read32(aligned)
+                };
                 let cur_rt = match prev_load {
                     Some(prev) if prev.reg == rt => prev.value,
                     _ => self.read_gpr(rt),
@@ -583,7 +627,11 @@ impl IopCpuState {
             0x28 => {
                 let vaddr = self.read_gpr(rs).wrapping_add(simm);
                 let val = (self.read_gpr(rt) & 0xFF) as u8;
-                bus.iop_write8(vaddr, val);
+                // When `COP0.SR.IsC` (bit 16, Isolate Cache) is set, stores target the isolated cache
+                // and must not modify main memory (`FlushIcache` / `FlushDcache`, `ps2tek` `#memorymap`).
+                if (self.cop0.status & (1 << 16)) == 0 {
+                    bus.iop_write8(vaddr, val);
+                }
             }
 
             // SH (0x29)
@@ -596,7 +644,7 @@ impl IopCpuState {
                         inst_in_delay_slot,
                         Some(vaddr),
                     );
-                } else {
+                } else if (self.cop0.status & (1 << 16)) == 0 {
                     let val = (self.read_gpr(rt) & 0xFFFF) as u16;
                     bus.iop_write16(vaddr, val);
                 }
@@ -605,17 +653,19 @@ impl IopCpuState {
             // SWL (0x2A) — Unaligned store word left (`lsu.c` & `lsu.expected` lines 92-113)
             0x2A => {
                 let vaddr = self.read_gpr(rs).wrapping_add(simm);
-                let aligned = vaddr & !3;
-                let byte = vaddr & 3;
-                let mem = bus.iop_read32(aligned);
-                let rt_val = self.read_gpr(rt);
-                let merged = match byte {
-                    0 => (mem & 0xFFFF_FF00) | (rt_val >> 24),
-                    1 => (mem & 0xFFFF_0000) | (rt_val >> 16),
-                    2 => (mem & 0xFF00_0000) | (rt_val >> 8),
-                    _ => rt_val,
-                };
-                bus.iop_write32(aligned, merged);
+                if (self.cop0.status & (1 << 16)) == 0 {
+                    let aligned = vaddr & !3;
+                    let byte = vaddr & 3;
+                    let mem = bus.iop_read32(aligned);
+                    let rt_val = self.read_gpr(rt);
+                    let merged = match byte {
+                        0 => (mem & 0xFFFF_FF00) | (rt_val >> 24),
+                        1 => (mem & 0xFFFF_0000) | (rt_val >> 16),
+                        2 => (mem & 0xFF00_0000) | (rt_val >> 8),
+                        _ => rt_val,
+                    };
+                    bus.iop_write32(aligned, merged);
+                }
             }
 
             // SW (0x2B)
@@ -628,7 +678,7 @@ impl IopCpuState {
                         inst_in_delay_slot,
                         Some(vaddr),
                     );
-                } else {
+                } else if (self.cop0.status & (1 << 16)) == 0 {
                     let val = self.read_gpr(rt);
                     bus.iop_write32(vaddr, val);
                 }
@@ -637,17 +687,19 @@ impl IopCpuState {
             // SWR (0x2E) — Unaligned store word right (`lsu.c` & `lsu.expected` lines 92-113)
             0x2E => {
                 let vaddr = self.read_gpr(rs).wrapping_add(simm);
-                let aligned = vaddr & !3;
-                let byte = vaddr & 3;
-                let mem = bus.iop_read32(aligned);
-                let rt_val = self.read_gpr(rt);
-                let merged = match byte {
-                    0 => rt_val,
-                    1 => (mem & 0x0000_00FF) | (rt_val << 8),
-                    2 => (mem & 0x0000_FFFF) | (rt_val << 16),
-                    _ => (mem & 0x00FF_FFFF) | (rt_val << 24),
-                };
-                bus.iop_write32(aligned, merged);
+                if (self.cop0.status & (1 << 16)) == 0 {
+                    let aligned = vaddr & !3;
+                    let byte = vaddr & 3;
+                    let mem = bus.iop_read32(aligned);
+                    let rt_val = self.read_gpr(rt);
+                    let merged = match byte {
+                        0 => rt_val,
+                        1 => (mem & 0x0000_00FF) | (rt_val << 8),
+                        2 => (mem & 0x0000_FFFF) | (rt_val << 16),
+                        _ => (mem & 0x00FF_FFFF) | (rt_val << 24),
+                    };
+                    bus.iop_write32(aligned, merged);
+                }
             }
 
             _ => {
@@ -665,7 +717,7 @@ impl IopCpuState {
         self.pending_load = next_load;
         self.gpr[0] = 0;
 
-        self.finish_cycle(bus);
+        self.finish_cycle(bus, advance_bus_timers);
         step_result
     }
 
@@ -717,12 +769,14 @@ impl IopCpuState {
         self.in_delay_slot = false;
     }
 
-    /// Advance the IOP cycle counter by `1` and the central [`Bus`] scheduler by `8` EE cycles
-    /// (`EE_CYCLES_PER_IOP_CYCLE = 8`, `36.864 MHz` IOP vs `294.912 MHz` EE).
+    /// Advance the IOP cycle counter by `1` and optionally advance the central [`Bus`] scheduler
+    /// by `8` EE cycles (`EE_CYCLES_PER_IOP_CYCLE = 8`, `36.864 MHz` IOP vs `294.912 MHz` EE).
     #[inline]
-    fn finish_cycle(&mut self, bus: &mut Bus) {
+    fn finish_cycle(&mut self, bus: &mut Bus, advance_bus_timers: bool) {
         self.cycle_count = self.cycle_count.wrapping_add(1);
-        bus.step_timers(EE_CYCLES_PER_IOP_CYCLE as u32);
+        if advance_bus_timers {
+            bus.step_timers(EE_CYCLES_PER_IOP_CYCLE as u32);
+        }
     }
 }
 

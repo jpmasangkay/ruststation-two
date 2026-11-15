@@ -33,7 +33,9 @@
 - Do not add dependencies with GPL/AGPL licenses to the workspace without asking.
 
 ## Verification
-- Phase 1: ps2autotests via `ps2-autotest` CLI, headless.
+- Phase 1: ps2autotests via `ps2-autotest` CLI, headless. Run all 35 Phase 1 hardware gate suites with:
+  `cargo run --release -p ps2-autotest -- --gate`
+  (prints the 35-suite table and exits nonzero on any failure).
 - Phase 2+: `.gs` dump replay via `ps2-gs-runner`, pixel-compare against golden PNGs.
 - Performance: measure frame-time percentiles (P99), not only average FPS. Use fixed save states or dumps for repeatable benchmarks.
 - Never claim a test passes without running it and showing the output.
