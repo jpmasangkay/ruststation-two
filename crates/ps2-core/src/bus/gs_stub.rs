@@ -15,7 +15,7 @@
 //!     with `(ID = data[31:0], IDMSK = data[63:32])` updates
 //!     `SIGLBLID[31:0] = (SIGLBLID[31:0] & !IDMSK) | (ID & IDMSK)` and sets `GS_CSR.SIGNAL = 1`.
 //! - `ps2sdk` (`ee/libgs/include/libgs.h` lines 504–565, `struct GS_CSR` and `struct GS_IMR`, `FETCHED`):
-//!   * `GS_CSR` (`0x1200_1000`) bit layout:
+//!   * `GS_CSR` (`0x1200_1000`) bit layout (`SEARCH-ONLY` beyond `SIGNAL`/`FINISH`):
 //!     - bit 0: `signal_evnt` (`SIGNAL`)
 //!     - bit 1: `finish_evnt` (`FINISH`)
 //!     - bit 2: `hsint_intrupt` (`HSINT`)
@@ -25,14 +25,37 @@
 //!     - bit 8: `flush`, bit 9: `reset`, bit 10: `exverr`, bit 11: `exfield`, bit 12: `nfield`
 //!     - bit 13: `current_field` (`FIELD`)
 //!     - bits 14..15: `fifo_status` (`FIFO`, `0b01` = empty)
-//!     - bits 16..23: `gs_rev_number` (`REV`, `0x1B`)
-//!     - bits 24..31: `gs_id` (`ID`, `0x55`)
+//!     - bits 16..23: `gs_rev_number` (`REV`, `0x1B`, `SEARCH-ONLY`/`GUESS`)
+//!     - bits 24..31: `gs_id` (`ID`, `0x55`, `SEARCH-ONLY`/`GUESS`)
+
+use crate::bus::intc::{EeIntc, IntcFlags};
 
 /// Default read-only `REV` (`0x1B`) and `ID` (`0x55`) plus `FIFO = Empty` (`1 << 14`) in `GS_CSR`
-/// (`ps2sdk` `ee/libgs/include/libgs.h`, `FETCHED`).
+/// (`ps2sdk` `ee/libgs/include/libgs.h`, `SEARCH-ONLY`/`GUESS`).
 const GS_CSR_FIXED_BITS: u64 = (0x55u64 << 24) | (0x1Bu64 << 16) | (1u64 << 14);
 
-/// Stub state for the GS Privileged Registers in Phase 1 (before full `ps2-gs` arrives in Phase 2).
+/// Internal GS register indices handled by [`GsPrivilegedStub::write_internal_reg`].
+pub mod gs_reg {
+    pub const PRIM: u8 = 0x00;
+    pub const RGBAQ: u8 = 0x01;
+    pub const ST: u8 = 0x02;
+    pub const UV: u8 = 0x03;
+    pub const XYZF2: u8 = 0x04;
+    pub const XYZ2: u8 = 0x05;
+    pub const TEX0_1: u8 = 0x06;
+    pub const TEX0_2: u8 = 0x07;
+    pub const CLAMP_1: u8 = 0x08;
+    pub const CLAMP_2: u8 = 0x09;
+    pub const FOG: u8 = 0x0A;
+    pub const XYZF3: u8 = 0x0C;
+    pub const XYZ3: u8 = 0x0D;
+    pub const HWREG: u8 = 0x54;
+    pub const SIGNAL: u8 = 0x60;
+    pub const FINISH: u8 = 0x61;
+    pub const LABEL: u8 = 0x62;
+}
+
+/// Stub state for the GS Privileged Registers in Phase 1/2a (before full `ps2-gs` arrives in Phase 2b).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct GsPrivilegedStub {
     pub pmode: u64,
@@ -54,6 +77,12 @@ pub struct GsPrivilegedStub {
     pub imr: u64,
     pub busdir: u64,
     pub siglblid: u64,
+    /// Latched internal GS registers (`0x00..=0x7F`) written via GIF packets (pre-Phase 2b inspection).
+    internal_regs: [u64; 128],
+    /// Total internal GS register writes accepted from GIF paths.
+    pub internal_write_count: u64,
+    /// Total `HWREG` (`0x54`) writes accepted (`IMAGE` mode).
+    pub hwreg_write_count: u64,
 }
 
 impl Default for GsPrivilegedStub {
@@ -84,7 +113,90 @@ impl GsPrivilegedStub {
             imr: 0x7F00,
             busdir: 0,
             siglblid: 0,
+            internal_regs: [0; 128],
+            internal_write_count: 0,
+            hwreg_write_count: 0,
         }
+    }
+
+    /// Return `true` when `GS_BUSDIR` bit 0 selects `Local->Host` (`GS->EE`, `SEARCH-ONLY`).
+    #[inline(always)]
+    pub const fn busdir_gs_to_ee(&self) -> bool {
+        (self.busdir & 1) != 0
+    }
+
+    /// Return `true` when `GS_CSR.SIGNAL` (bit 0) is set (`SIGNAL` stall active until cleared).
+    #[inline(always)]
+    pub const fn signal_stalled(&self) -> bool {
+        (self.csr & 1) != 0
+    }
+
+    /// Return `true` if internal GS register `reg` can currently be written without stalling.
+    ///
+    /// A second `SIGNAL` (`0x60`) stalls GS/GIF while `GS_CSR.SIGNAL == 1` (`SEARCH-ONLY`).
+    #[inline(always)]
+    pub const fn can_accept_internal_reg(&self, reg: u8) -> bool {
+        reg != gs_reg::SIGNAL || (self.csr & 1) == 0
+    }
+
+    /// Read the most recent 64-bit value written to internal GS register `reg` (`0x00..=0x7F`).
+    #[inline(always)]
+    pub const fn internal_reg(&self, reg: u8) -> u64 {
+        let idx = reg as usize;
+        if idx < self.internal_regs.len() {
+            self.internal_regs[idx]
+        } else {
+            0
+        }
+    }
+
+    /// Write a 64-bit internal GS register (`0x00..=0x7F`) delivered via GIF.
+    ///
+    /// Returns `false` if `reg == 0x60` (`SIGNAL`) while `GS_CSR.SIGNAL` (bit 0) is already `1`
+    /// (**stall**: `SIGLBLID` and counters are left untouched until EE clears `GS_CSR.SIGNAL`,
+    /// `SEARCH-ONLY`). Otherwise applies GS side effects (`SIGNAL`, `FINISH`, `LABEL`, `HWREG`)
+    /// and raises `IntcFlags::GS` if unmasked by `GS_IMR`.
+    pub fn write_internal_reg(&mut self, reg: u8, data: u64, intc: &mut EeIntc) -> bool {
+        if reg == gs_reg::SIGNAL && (self.csr & 1) != 0 {
+            return false;
+        }
+        self.internal_write_count += 1;
+        let idx = reg as usize;
+        if idx < self.internal_regs.len() {
+            self.internal_regs[idx] = data;
+        }
+        match reg {
+            gs_reg::HWREG => {
+                self.hwreg_write_count += 1;
+            }
+            gs_reg::SIGNAL => {
+                let id = data & 0xFFFF_FFFF;
+                let idmsk = data >> 32;
+                let old_sig = self.siglblid & 0xFFFF_FFFF;
+                let new_sig = (old_sig & !idmsk) | (id & idmsk);
+                self.siglblid = (self.siglblid & 0xFFFF_FFFF_0000_0000) | new_sig;
+                self.csr |= 1;
+                if (self.imr & (1 << 8)) == 0 {
+                    intc.raise_irq(IntcFlags::GS);
+                }
+            }
+            gs_reg::FINISH => {
+                // `SEARCH-ONLY`: setting GS_CSR.FINISH (bit 1) + GS IRQ gated by GS_IMR[9].
+                self.csr |= 1 << 1;
+                if (self.imr & (1 << 9)) == 0 {
+                    intc.raise_irq(IntcFlags::GS);
+                }
+            }
+            gs_reg::LABEL => {
+                let id = data & 0xFFFF_FFFF;
+                let idmsk = data >> 32;
+                let old_lbl = self.siglblid >> 32;
+                let new_lbl = (old_lbl & !idmsk) | (id & idmsk);
+                self.siglblid = (self.siglblid & 0xFFFF_FFFF) | (new_lbl << 32);
+            }
+            _ => {}
+        }
+        true
     }
 
     /// Toggle `GS_CSR.FIELD` (bit 13) and set `GS_CSR.VSINT` (bit 3) on VBlank start
@@ -186,5 +298,69 @@ impl GsPrivilegedStub {
             (current & 0xFFFF_FFFF_0000_0000) | u64::from(val)
         };
         self.write64(aligned, updated);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gs_signal_updates_sigid_sets_csr_and_stalls_second_signal_until_cleared() {
+        let mut gs = GsPrivilegedStub::new();
+        let mut intc = EeIntc::new();
+
+        // Unmask SIGNAL IRQ (clear bit 8 of IMR) and write initial SIGLBLID.
+        gs.write64(0x1200_1010, gs.imr & !(1 << 8));
+        gs.write64(0x1200_1080, 0x7654_3210_0000_0000);
+
+        // First SIGNAL succeeds.
+        assert!(gs.write_internal_reg(gs_reg::SIGNAL, (0xF0 << 32) | 0xF0, &mut intc));
+        assert_eq!(gs.csr & 1, 1);
+        assert_eq!(gs.siglblid, 0x7654_3210_0000_00F0);
+        assert_ne!(intc.stat & IntcFlags::GS.bits(), 0);
+
+        // Second SIGNAL stalls while GS_CSR.SIGNAL == 1; SIGLBLID must not change.
+        assert!(!gs.write_internal_reg(
+            gs_reg::SIGNAL,
+            (0xFFFF_FFFF << 32) | 0xDEAD_BEEF,
+            &mut intc
+        ));
+        assert_eq!(gs.siglblid, 0x7654_3210_0000_00F0);
+
+        // Clearing GS_CSR.SIGNAL (W1C bit 0) allows retry to succeed.
+        gs.write64(0x1200_1000, 1);
+        assert_eq!(gs.csr & 1, 0);
+        gs.write64(0x1200_1080, 0x3333_3333_3333_3333);
+        assert!(gs.write_internal_reg(gs_reg::SIGNAL, 0xF0 << 32, &mut intc));
+        assert_eq!(gs.csr & 1, 1);
+        assert_eq!(gs.siglblid, 0x3333_3333_3333_3303);
+    }
+
+    #[test]
+    fn gs_label_and_finish_respect_masks_and_imr() {
+        let mut gs = GsPrivilegedStub::new();
+        let mut intc = EeIntc::new();
+
+        gs.write64(0x1200_1080, 0x0000_0000_7654_3210);
+        assert!(gs.write_internal_reg(gs_reg::LABEL, (0xF0 << 32) | 0xF0, &mut intc));
+        assert_eq!(gs.siglblid, 0x0000_00F0_7654_3210);
+        assert_eq!(gs.csr & 1, 0);
+
+        gs.write64(0x1200_1080, 0x3333_3333_3333_3333);
+        assert!(gs.write_internal_reg(gs_reg::LABEL, 0xF0 << 32, &mut intc));
+        assert_eq!(gs.siglblid, 0x3333_3303_3333_3333);
+
+        // FINISH with IMR[9] == 1 sets CSR[1] without raising GS IRQ.
+        assert!(gs.write_internal_reg(gs_reg::FINISH, 0, &mut intc));
+        assert_eq!(gs.csr & (1 << 1), 1 << 1);
+        assert_eq!(intc.stat & IntcFlags::GS.bits(), 0);
+
+        // Clear FINISH and unmask IMR[9] -> FINISH raises GS IRQ.
+        gs.write64(0x1200_1000, 1 << 1);
+        gs.write64(0x1200_1010, gs.imr & !(1 << 9));
+        assert!(gs.write_internal_reg(gs_reg::FINISH, 0, &mut intc));
+        assert_eq!(gs.csr & (1 << 1), 1 << 1);
+        assert_ne!(intc.stat & IntcFlags::GS.bits(), 0);
     }
 }

@@ -8,15 +8,22 @@
 ## Speed Baseline (Release Profile: `lto = "fat"`, `codegen-units = 1`)
 - **Phase 1 Gate (`35` suites)**: `82,167,799` EE cycles + `30,724` IOP cycles = **`82,198,523` cycles in `1.408 s` (`58.38 Mcycles/s`)**.
 
-## Phase 2a Gate (`17` New Suites -> `52 / 52` Cumulative Hardware Gate)
+## Phase 2a Gate (`17` New Suites -> `51 / 52` Passing, `1` Deferred)
+- **Hardware Gate**: **`51 / 52 PASSED, 1 DEFERRED, 0 FAILED`** (`gs/label.elf` and `gs/signal.elf` passing; `vu/lower/efu.elf` `DEFERRED` on `wip/efu`).
+- **Workspace Unit Tests**: **`94 / 94 PASS`** (`11` `ps2-common`, `78` `ps2-core`, `5` `ps2-autotest`).
 - **`cpu/vu0_macro` (2)**: `integer.elf`, `transfer.elf`.
 - **`vu/` Micro & EFU (7)**: `games/triace.elf`, `lower/{branch,efu,fdivdelay,integer,random}.elf`, `upper/clip.elf`.
 - **`dma/vif` (6)**: `basic.elf`, `intstall.elf`, `mskpath3.elf`, `stcycl.elf`, `stmod.elf`, `unpack.elf`.
 - **`gs/` Privileged & GIF (2)**: `label.elf`, `signal.elf`.
 
+## Phase 2b Scope (Deferred from Phase 2a)
+- **`VU1 XGKICK -> GIF PATH1`**: Executing `XGKICK` in `VU1` micromode to transfer GS packets directly into `GIF PATH1` (`GIF_CNT[20..=29]` VU address, double-buffered `TOP`/`XTOP` interaction) and Phase 2b GS rendering.
+
 ## Active `GUESS` Stubs & Inferred Behaviors (`docs/HARDWARE_NOTES.md`)
 - **`0x1000_F500` (`EeDmac::d_f500`)**: `GUESS` (`TODO(verify)`) — 32-bit R/W latch (reset `0`); write-only during BIOS boot (`EE PC = 0xBFC0_0838`), omitted in `ps2tek` `#dmacio`.
 - **`0x1000_F400..=0x1000_F4F0` (`RdramMch::regs`, non-`F430`/`F440` slots)**: `GUESS` (`TODO(verify)`) — 32-bit R/W slots (reset `0`) for undocumented MCH timing registers (`0x1000_F410`, `0x1000_F420`, etc.); `0x1000_F430` (`MCH_RICM`) and `0x1000_F440` (`MCH_DRD`) are verified from `ps2tek` `#eerdram`.
+- **`GS` Privileged Stub & `GIF` Edge Semantics (`bus/gs_stub.rs`, `gif/mod.rs`)**:
+  - `GS_CSR` bits beyond `SIGNAL`/`FINISH`, `GS_IMR`, `GS_BUSDIR`, `REV`/`ID` (`0x1B`/`0x55`), and second-`SIGNAL` stall are `SEARCH-ONLY` / `GUESS` (`TODO(verify)` `FLUSH`/`RESET`, `IMR` power-on mask, `GS->EE` `BUSDIR=1` readback, `M3R`/`IMT` exact boundary, `0x3`/`0xA`/`0xB`/`0xC`/`0xD` PACKED details).
 - **Inferred Test-Vector Behaviors (`fits test vectors; may not generalize`)**:
   - `BC1F`/`BC1T` back-to-back delay-slot chaining (`ee/interpreter.rs`, `cpu/ee_fpu/branchdelay.elf`).
   - `ps2float` `MUL.S`/`MULA.S` low-Booth-group truncation, `MADD.S`/`MSUB.S` product-overflow immediate saturation, and `(q25 + 1) >> 1` rounding in `DIV.S`/`SQRT.S`/`RSQRT.S` (`ps2-common/src/ps2float.rs`).

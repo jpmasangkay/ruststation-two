@@ -7,6 +7,7 @@
 pub mod bus;
 pub mod ee;
 pub mod elf;
+pub mod gif;
 pub mod iop;
 pub mod mmu;
 pub mod scheduler;

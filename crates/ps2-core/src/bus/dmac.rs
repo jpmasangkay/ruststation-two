@@ -22,6 +22,7 @@
 //!     and interleaved slice transfers (`TQWC` quadwords transferred followed by `SQWC * 16` byte skip
 //!     on `MADR` after every slice, including the final slice).
 
+use crate::gif::GifUnit;
 use crate::scheduler::{HardwareEventKind, Scheduler};
 use crate::vif::VifUnit;
 
@@ -190,24 +191,85 @@ impl DmaChannel {
     }
 }
 
-/// Per-channel state for scheduler-driven incremental `VIF0`/`VIF1` DMA transfers.
+/// Per-channel state for scheduler-driven incremental FIFO DMA transfers (`VIF0`, `VIF1`, `GIF`).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-enum VifDmaPhase {
+enum FifoDmaPhase {
     #[default]
     Idle,
     /// Source Chain (`MOD == 1`): ready to fetch next DMAtag from `TADR`.
     ReadTag,
-    /// Source Chain (`MOD == 1`, `CHCR.TTE == 1`): waiting to send tag bits `64..=127` to VIF.
+    /// Source Chain (`MOD == 1`, `CHCR.TTE == 1`): waiting to send tag bits `64..=127` to FIFO.
     SendTte { lo: u32, hi: u32 },
     /// Streaming `ch.qwc` 128-bit quadwords from `ch.madr` (RDRAM or Scratchpad via bit 31).
     TransferData,
 }
 
-/// Resumable DMAC transfer cursor for `D0` (`VIF0`) and `D1` (`VIF1`).
+/// Resumable DMAC transfer cursor for `D0` (`VIF0`), `D1` (`VIF1`), and `D2` (`GIF`).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-struct VifDmaState {
-    phase: VifDmaPhase,
+struct FifoDmaState {
+    phase: FifoDmaPhase,
     chain_end: bool,
+}
+
+/// Static-dispatch adapter for scheduler-driven 128-bit peripheral FIFO targets (`VIF0`, `VIF1`, `GIF`).
+trait DmaFifoSink {
+    fn supports_tte(&self) -> bool;
+    fn can_accept_qwc(&self) -> bool;
+    fn push_dma_qwc(&mut self, qwc: ps2_common::Reg128);
+    fn can_accept_tte(&self) -> bool;
+    fn push_dma_tte(&mut self, lo: u32, hi: u32);
+}
+
+impl DmaFifoSink for VifUnit {
+    #[inline(always)]
+    fn supports_tte(&self) -> bool {
+        true
+    }
+
+    #[inline(always)]
+    fn can_accept_qwc(&self) -> bool {
+        VifUnit::can_accept_qwc(self)
+    }
+
+    #[inline(always)]
+    fn push_dma_qwc(&mut self, qwc: ps2_common::Reg128) {
+        VifUnit::push_dma_qwc(self, qwc);
+    }
+
+    #[inline(always)]
+    fn can_accept_tte(&self) -> bool {
+        VifUnit::can_accept_tte(self)
+    }
+
+    #[inline(always)]
+    fn push_dma_tte(&mut self, lo: u32, hi: u32) {
+        VifUnit::push_dma_tte(self, lo, hi);
+    }
+}
+
+impl DmaFifoSink for GifUnit {
+    #[inline(always)]
+    fn supports_tte(&self) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    fn can_accept_qwc(&self) -> bool {
+        GifUnit::can_accept_path3_qwc(self)
+    }
+
+    #[inline(always)]
+    fn push_dma_qwc(&mut self, qwc: ps2_common::Reg128) {
+        let _ = GifUnit::push_path3_qwc(self, qwc);
+    }
+
+    #[inline(always)]
+    fn can_accept_tte(&self) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    fn push_dma_tte(&mut self, _lo: u32, _hi: u32) {}
 }
 
 /// Outcome of advancing one Source Chain tag via [`EeDmac::step_source_chain_tag`].
@@ -253,8 +315,8 @@ pub struct EeDmac {
     pub d_enable: u32,
     /// Pending unimplemented peripheral DMA transfer error (channels `0..=7`), if triggered by guest code.
     pub unimplemented_transfer: Option<UnimplementedDmaTransfer>,
-    /// Incremental BUSCLK state for `D0` (`VIF0`) and `D1` (`VIF1`).
-    vif_dma: [VifDmaState; 2],
+    /// Incremental BUSCLK state for `D0` (`VIF0`), `D1` (`VIF1`), and `D2` (`GIF`).
+    fifo_dma: [FifoDmaState; 3],
 }
 
 impl Default for EeDmac {
@@ -286,10 +348,10 @@ impl EeDmac {
             d_f500: 0,
             d_enable: 0x1201,
             unimplemented_transfer: None,
-            vif_dma: [VifDmaState {
-                phase: VifDmaPhase::Idle,
+            fifo_dma: [FifoDmaState {
+                phase: FifoDmaPhase::Idle,
                 chain_end: false,
-            }; 2],
+            }; 3],
         }
     }
 
@@ -498,11 +560,31 @@ impl EeDmac {
         (self.d_ctrl & d_ctrl_bits::DMAE) != 0 && (self.d_enable & (1 << 16)) == 0
     }
 
-    /// Return `true` when `VIF0` (`D0`) or `VIF1` (`D1`) currently has `CHCR.STR == 1`.
+    /// Return `true` when channel `ch_idx` currently has `CHCR.STR == 1`.
     #[inline(always)]
-    pub const fn has_active_vif_transfer(&self) -> bool {
-        ((self.channels[dmac_ch::VIF0].chcr | self.channels[dmac_ch::VIF1].chcr) & chcr_bits::STR)
+    pub const fn is_channel_active(&self, ch_idx: usize) -> bool {
+        ch_idx < DMAC_CHANNEL_COUNT && (self.channels[ch_idx].chcr & chcr_bits::STR) != 0
+    }
+
+    /// Return `true` when any FIFO channel (`VIF0`, `VIF1`, or `GIF`) currently has `CHCR.STR == 1`.
+    #[inline(always)]
+    pub const fn has_active_fifo_transfer(&self) -> bool {
+        ((self.channels[dmac_ch::VIF0].chcr
+            | self.channels[dmac_ch::VIF1].chcr
+            | self.channels[dmac_ch::GIF].chcr)
+            & chcr_bits::STR)
             != 0
+    }
+
+    #[inline]
+    fn fifo_channel_can_step_inner<S: DmaFifoSink>(&self, ch_idx: usize, sink: &S) -> bool {
+        let ch = &self.channels[ch_idx];
+        match self.fifo_dma[ch_idx].phase {
+            FifoDmaPhase::Idle => false,
+            FifoDmaPhase::ReadTag => true,
+            FifoDmaPhase::SendTte { .. } => sink.supports_tte() && sink.can_accept_tte(),
+            FifoDmaPhase::TransferData => ch.qwc == 0 || sink.can_accept_qwc(),
+        }
     }
 
     /// Return `true` if `ch_idx` (`VIF0` or `VIF1`) is active and not currently blocked on VIF FIFO / `REFS`.
@@ -517,12 +599,22 @@ impl EeDmac {
         if ch_idx == dmac_ch::VIF1 && vif.fdr && (ch.chcr & chcr_bits::DIR) == 0 {
             return false;
         }
-        match self.vif_dma[ch_idx].phase {
-            VifDmaPhase::Idle => false,
-            VifDmaPhase::ReadTag => true,
-            VifDmaPhase::SendTte { .. } => vif.can_accept_tte(),
-            VifDmaPhase::TransferData => ch.qwc == 0 || vif.can_accept_qwc(),
+        self.fifo_channel_can_step_inner(ch_idx, vif)
+    }
+
+    /// Return `true` if `D2` (`GIF` `PATH3`) is active and can transfer a beat to the `PATH3` FIFO.
+    pub fn gif_channel_can_step(&self, gif: &GifUnit) -> bool {
+        if !self.dma_enabled() {
+            return false;
         }
+        let ch = &self.channels[dmac_ch::GIF];
+        if (ch.chcr & chcr_bits::STR) == 0 {
+            return false;
+        }
+        if (ch.chcr & chcr_bits::DIR) == 0 || ch.mode() > 1 || ch.tte() {
+            return false;
+        }
+        self.fifo_channel_can_step_inner(dmac_ch::GIF, gif)
     }
 
     /// Advance `ch_idx` (`dmac_ch::VIF0` or `dmac_ch::VIF1`) by at most one BUSCLK beat (`1` tag or `1` QWC).
@@ -540,30 +632,60 @@ impl EeDmac {
             return false;
         }
         if (self.channels[ch_idx].chcr & chcr_bits::STR) == 0 {
-            self.vif_dma[ch_idx] = VifDmaState::default();
+            self.fifo_dma[ch_idx] = FifoDmaState::default();
             return false;
         }
         if ch_idx == dmac_ch::VIF1 && vif.fdr && (self.channels[ch_idx].chcr & chcr_bits::DIR) == 0
         {
             return false;
         }
+        self.step_fifo_channel_inner(ch_idx, vif, ram, scratchpad)
+    }
 
+    /// Advance `D2` (`GIF` `PATH3`) by at most one BUSCLK beat (`1` source-chain tag or `1` QWC).
+    pub fn step_gif_channel(&mut self, gif: &mut GifUnit, ram: &[u8], scratchpad: &[u8]) -> bool {
+        if !self.dma_enabled() {
+            return false;
+        }
+        let ch = &self.channels[dmac_ch::GIF];
+        if (ch.chcr & chcr_bits::STR) == 0 {
+            self.fifo_dma[dmac_ch::GIF] = FifoDmaState::default();
+            return false;
+        }
+        if (ch.chcr & chcr_bits::DIR) == 0 || ch.mode() > 1 || ch.tte() {
+            return false;
+        }
+        gif.on_path3_dma_start();
+        let progressed = self.step_fifo_channel_inner(dmac_ch::GIF, gif, ram, scratchpad);
+        if (self.channels[dmac_ch::GIF].chcr & chcr_bits::STR) == 0 {
+            gif.on_path3_dma_end();
+        }
+        progressed
+    }
+
+    fn step_fifo_channel_inner<S: DmaFifoSink>(
+        &mut self,
+        ch_idx: usize,
+        sink: &mut S,
+        ram: &[u8],
+        scratchpad: &[u8],
+    ) -> bool {
         // Recover phase if channel was already busy (`STR == 1`) before `start_channel_transfer` ran.
-        if self.vif_dma[ch_idx].phase == VifDmaPhase::Idle {
+        if self.fifo_dma[ch_idx].phase == FifoDmaPhase::Idle {
             let is_chain = self.channels[ch_idx].mode() == 1;
-            self.vif_dma[ch_idx] = VifDmaState {
+            self.fifo_dma[ch_idx] = FifoDmaState {
                 phase: if is_chain {
-                    VifDmaPhase::ReadTag
+                    FifoDmaPhase::ReadTag
                 } else {
-                    VifDmaPhase::TransferData
+                    FifoDmaPhase::TransferData
                 },
                 chain_end: !is_chain,
             };
         }
 
-        match self.vif_dma[ch_idx].phase {
-            VifDmaPhase::Idle => false,
-            VifDmaPhase::ReadTag => {
+        match self.fifo_dma[ch_idx].phase {
+            FifoDmaPhase::Idle => false,
+            FifoDmaPhase::ReadTag => {
                 match self.step_source_chain_tag(ch_idx, true, ram, scratchpad) {
                     SourceChainTagStep::Stalled => false,
                     SourceChainTagStep::Advanced {
@@ -572,13 +694,13 @@ impl EeDmac {
                         qwc,
                         end_chain,
                     } => {
-                        self.vif_dma[ch_idx].chain_end = end_chain;
-                        if self.channels[ch_idx].tte() {
-                            if vif.can_accept_tte() {
-                                vif.push_dma_tte(tte_lo, tte_hi);
+                        self.fifo_dma[ch_idx].chain_end = end_chain;
+                        if sink.supports_tte() && self.channels[ch_idx].tte() {
+                            if sink.can_accept_tte() {
+                                sink.push_dma_tte(tte_lo, tte_hi);
                                 self.finish_or_advance_after_tag(ch_idx, qwc, end_chain);
                             } else {
-                                self.vif_dma[ch_idx].phase = VifDmaPhase::SendTte {
+                                self.fifo_dma[ch_idx].phase = FifoDmaPhase::SendTte {
                                     lo: tte_lo,
                                     hi: tte_hi,
                                 };
@@ -590,34 +712,34 @@ impl EeDmac {
                     }
                 }
             }
-            VifDmaPhase::SendTte { lo, hi } => {
-                if !vif.can_accept_tte() {
+            FifoDmaPhase::SendTte { lo, hi } => {
+                if !sink.supports_tte() || !sink.can_accept_tte() {
                     return false;
                 }
-                vif.push_dma_tte(lo, hi);
+                sink.push_dma_tte(lo, hi);
                 let qwc = self.channels[ch_idx].qwc;
-                let end_chain = self.vif_dma[ch_idx].chain_end;
+                let end_chain = self.fifo_dma[ch_idx].chain_end;
                 self.finish_or_advance_after_tag(ch_idx, qwc, end_chain);
                 true
             }
-            VifDmaPhase::TransferData => {
+            FifoDmaPhase::TransferData => {
                 let qwc_left = self.channels[ch_idx].qwc;
                 if qwc_left == 0 {
-                    if self.vif_dma[ch_idx].chain_end {
+                    if self.fifo_dma[ch_idx].chain_end {
                         self.complete_channel(ch_idx);
-                        self.vif_dma[ch_idx] = VifDmaState::default();
+                        self.fifo_dma[ch_idx] = FifoDmaState::default();
                     } else {
-                        self.vif_dma[ch_idx].phase = VifDmaPhase::ReadTag;
+                        self.fifo_dma[ch_idx].phase = FifoDmaPhase::ReadTag;
                     }
                     return true;
                 }
-                if !vif.can_accept_qwc() {
+                if !sink.can_accept_qwc() {
                     return false;
                 }
                 let src_addr = self.channels[ch_idx].madr;
                 let qwc_bytes = read_source_qwc(ram, scratchpad, src_addr, true);
                 let qwc = ps2_common::Reg128::from_u128(u128::from_le_bytes(qwc_bytes));
-                vif.push_dma_qwc(qwc);
+                sink.push_dma_qwc(qwc);
 
                 let ch = &mut self.channels[ch_idx];
                 // Preserve bit 31 Scratchpad selector across sequential QWC increments.
@@ -625,11 +747,11 @@ impl EeDmac {
                 ch.madr = spr_bit | (src_addr.wrapping_add(16) & 0x7FFF_FFF0);
                 ch.qwc = qwc_left - 1;
                 if ch.qwc == 0 {
-                    if self.vif_dma[ch_idx].chain_end {
+                    if self.fifo_dma[ch_idx].chain_end {
                         self.complete_channel(ch_idx);
-                        self.vif_dma[ch_idx] = VifDmaState::default();
+                        self.fifo_dma[ch_idx] = FifoDmaState::default();
                     } else {
-                        self.vif_dma[ch_idx].phase = VifDmaPhase::ReadTag;
+                        self.fifo_dma[ch_idx].phase = FifoDmaPhase::ReadTag;
                     }
                 }
                 true
@@ -640,12 +762,12 @@ impl EeDmac {
     #[inline]
     fn finish_or_advance_after_tag(&mut self, ch_idx: usize, qwc: u32, end_chain: bool) {
         if qwc > 0 {
-            self.vif_dma[ch_idx].phase = VifDmaPhase::TransferData;
+            self.fifo_dma[ch_idx].phase = FifoDmaPhase::TransferData;
         } else if end_chain {
             self.complete_channel(ch_idx);
-            self.vif_dma[ch_idx] = VifDmaState::default();
+            self.fifo_dma[ch_idx] = FifoDmaState::default();
         } else {
-            self.vif_dma[ch_idx].phase = VifDmaPhase::ReadTag;
+            self.fifo_dma[ch_idx].phase = FifoDmaPhase::ReadTag;
         }
     }
 
@@ -656,13 +778,13 @@ impl EeDmac {
         scratchpad: &mut [u8],
         scheduler: &mut Scheduler,
     ) {
-        if ch_idx <= dmac_ch::VIF1 {
+        if ch_idx <= dmac_ch::GIF {
             let is_chain = self.channels[ch_idx].mode() == 1;
-            self.vif_dma[ch_idx] = VifDmaState {
+            self.fifo_dma[ch_idx] = FifoDmaState {
                 phase: if is_chain {
-                    VifDmaPhase::ReadTag
+                    FifoDmaPhase::ReadTag
                 } else {
-                    VifDmaPhase::TransferData
+                    FifoDmaPhase::TransferData
                 },
                 chain_end: !is_chain,
             };
@@ -680,6 +802,25 @@ impl EeDmac {
             dmac_ch::VIF0 | dmac_ch::VIF1 => {
                 // Scheduler-driven 1 QWC per BUSCLK (2 EE cycles): transfer runs incrementally
                 // in `step_vif_channel` and honors VIF FIFO backpressure mid-packet.
+                scheduler.cancel_by_kind(HardwareEventKind::DmacTick);
+                scheduler.schedule(2, HardwareEventKind::DmacTick);
+            }
+            dmac_ch::GIF => {
+                let ch = &self.channels[ch_idx];
+                // TODO(verify): `ps2tek` is silent on GIF->EE VRAM DMA readback (`DIR == 0`),
+                // `Interleave` mode on `D2`, and `CHCR.TTE` 64-to-128 expansion on `GIF`.
+                if (ch.chcr & chcr_bits::DIR) == 0 || ch.mode() > 1 || ch.tte() {
+                    self.fifo_dma[ch_idx] = FifoDmaState::default();
+                    self.unimplemented_transfer = Some(UnimplementedDmaTransfer {
+                        channel: ch_idx as u8,
+                        channel_name: DmaChannel::name(ch_idx),
+                        chcr: ch.chcr,
+                        madr: ch.madr,
+                        qwc: ch.qwc,
+                        tadr: ch.tadr,
+                    });
+                    return;
+                }
                 scheduler.cancel_by_kind(HardwareEventKind::DmacTick);
                 scheduler.schedule(2, HardwareEventKind::DmacTick);
             }
@@ -705,8 +846,8 @@ impl EeDmac {
                 }
             }
             _ => {
-                // Channels 2..=7 (`GIF`, `fromIPU`, `toIPU`, `SIF0`, `SIF1`, `SIF2`)
-                // are not yet wired in Step 3; record an explicit unimplemented-transfer error.
+                // Channels 3..=7 (`fromIPU`, `toIPU`, `SIF0`, `SIF1`, `SIF2`)
+                // are not yet wired in Step 4; record an explicit unimplemented-transfer error.
                 let ch = &self.channels[ch_idx];
                 self.unimplemented_transfer = Some(UnimplementedDmaTransfer {
                     channel: ch_idx as u8,
@@ -1168,22 +1309,74 @@ mod tests {
         let mut spr = vec![0u8; SCRATCHPAD_SIZE];
         let mut sched = Scheduler::new();
 
-        // Attempt to start a GIF (channel 2, 0x1000_A000) transfer.
-        dmac.write32(0x1000_A010, 0x0010_0000, &mut ram, &mut spr, &mut sched);
-        dmac.write32(0x1000_A020, 4, &mut ram, &mut spr, &mut sched);
-        dmac.write32(0x1000_A000, chcr_bits::STR, &mut ram, &mut spr, &mut sched);
+        // Attempt to start a fromIPU (channel 3, 0x1000_B000) transfer.
+        dmac.write32(0x1000_B010, 0x0010_0000, &mut ram, &mut spr, &mut sched);
+        dmac.write32(0x1000_B020, 4, &mut ram, &mut spr, &mut sched);
+        dmac.write32(0x1000_B000, chcr_bits::STR, &mut ram, &mut spr, &mut sched);
 
         assert_eq!(
             dmac.unimplemented_transfer,
             Some(UnimplementedDmaTransfer {
-                channel: 2,
-                channel_name: "GIF",
+                channel: 3,
+                channel_name: "fromIPU",
                 chcr: chcr_bits::STR,
                 madr: 0x0010_0000,
                 qwc: 4,
                 tadr: 0,
             })
         );
+    }
+
+    #[test]
+    fn dmac_gif_d2_backpressure_source_chain_and_unimplemented_dir0() {
+        let mut dmac = EeDmac::new();
+        let mut ram = vec![0u8; EE_RAM_SIZE];
+        let mut spr = vec![0u8; SCRATCHPAD_SIZE];
+        let mut sched = Scheduler::new();
+        let mut gif = GifUnit::new();
+
+        // Fill `D2` chain with 18 QWCs via two tags (`CNT` 10 + `END` 8) to exercise 16-QWC backpressure.
+        let tadr = 0x1000usize;
+        let payload2 = tadr + 16 + 10 * 16;
+        // Tag 0: CNT QWC=10
+        let tag0_lo = 10u32 | (1u32 << 28);
+        ram[tadr..tadr + 4].copy_from_slice(&tag0_lo.to_le_bytes());
+        ram[tadr + 4..tadr + 8].copy_from_slice(&0u32.to_le_bytes());
+        for i in 0..10u32 {
+            let off = tadr + 16 + (i as usize) * 16;
+            ram[off..off + 4].copy_from_slice(&(0x100 + i).to_le_bytes());
+        }
+        // Tag 1 at `payload2`: END QWC=8
+        let tag1_lo = 8u32 | (7u32 << 28);
+        ram[payload2..payload2 + 4].copy_from_slice(&tag1_lo.to_le_bytes());
+        ram[payload2 + 4..payload2 + 8].copy_from_slice(&0u32.to_le_bytes());
+        for i in 0..8u32 {
+            let off = payload2 + 16 + (i as usize) * 16;
+            ram[off..off + 4].copy_from_slice(&(0x200 + i).to_le_bytes());
+        }
+
+        dmac.write32(0x1000_A030, tadr as u32, &mut ram, &mut spr, &mut sched);
+        dmac.write32(
+            0x1000_A000,
+            chcr_bits::DIR | (1 << 2) | chcr_bits::STR,
+            &mut ram,
+            &mut spr,
+            &mut sched,
+        );
+
+        // Read Tag 0 + push 10 QWCs + read Tag 1 + push 6 QWCs = 18 steps fill PATH3 16-QWC FIFO,
+        // then step 19 stalls cleanly on backpressure!
+        for _ in 0..18 {
+            assert!(dmac.step_gif_channel(&mut gif, &ram, &spr));
+        }
+        assert_eq!(gif.path3_fifo_len(), 16);
+        assert!(!dmac.gif_channel_can_step(&gif));
+        assert!(!dmac.step_gif_channel(&mut gif, &ram, &spr));
+        assert_ne!(dmac.channels[dmac_ch::GIF].chcr & chcr_bits::STR, 0);
+
+        // Starting D2 with `DIR=0` (GS->EE) must record explicit unimplemented error.
+        dmac.write32(0x1000_A000, chcr_bits::STR, &mut ram, &mut spr, &mut sched);
+        assert_eq!(dmac.unimplemented_transfer.map(|u| u.channel), Some(2));
     }
 
     #[test]
@@ -1262,7 +1455,7 @@ mod tests {
 
     #[test]
     fn dmac_vif1_chain_tte_and_scratchpad_bit31_source() {
-        use crate::bus::gif_stub::GifStub;
+        use crate::gif::GifUnit;
         use crate::vif::{VifKind, VifUnit};
         use crate::vu::VuState;
 
@@ -1274,7 +1467,7 @@ mod tests {
         let mut vu1 = VuState::new();
         let mut vu1_micro = vec![0u8; 0x4000];
         let mut vu1_data = vec![0u8; 0x4000];
-        let mut gif = GifStub::new();
+        let mut gif = GifUnit::new();
 
         // Place DMAtag in Scratchpad at offset `0x0100` (`TADR = 0x8000_0100`):
         // `END` (id=7, qwc=1), TTE words = `[STCYCL(0x0101), UNPACK V4-32 NUM=1 addr=4]`,

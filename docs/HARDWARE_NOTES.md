@@ -390,6 +390,86 @@ Primary sources verified directly (`FETCHED`):
 - **`MARK (I)` & `VIS` Interrupt Stall (`FETCHED`, `intstall.expected` lines 4, 6, 8)**: Non-`MARK` commands with bit 31 (`I`) set (`ERR.MII == 0`) set `STAT.INT` and arm `VIS` so the next decoded non-`MARK` command sets `STAT.VIS` (`STAT = 0x0000_0c02`, `VPS = 2`) before executing its payload. `MARK (I)` sets `STAT.MRK` and `STAT.INT` (`STAT = 0x0000_0840`) **without** arming `VIS` on subsequent commands.
 - **`STAT.FQC == 0` after 3-QWC `intstall` DMA (`inferred; fits test vectors, may not generalize`)**: On real PS2 silicon (`intstall.expected`), a 3-QWC DMA transfer containing `NOP(I)` -> `STMASK` finishes DMA (`STR = 0`), stops decoding before QWC 1..2, yet reads `STAT.FQC == 0`. Modeled with an internal 4-QWC (`16`-word) pre-decode staging buffer fed by the DMAC-facing `8`/`16`-QWC FIFO (`FQC` counts QWC still held in that DMAC-facing FIFO).
 - **`STCYCL` VU Data Memory Wrap (`FETCHED`, `stcycl.expected` lines 106, 114..126, 369)**: `UNPACK` destination quadword address wraps modulo `256` QWC (`4 KB`, `& 0xFF`) on `VIF0` and modulo `1024` QWC (`16 KB`, `& 0x3FF`) on `VIF1`.
-- **`GIF` Path-2 Stub (`0x1000_3000..=0x1000_30A0`, `FETCHED` `#gifio`)**: Step 3 adds a minimal `GIF` stub storing received `VIF1 DIRECT`/`DIRECTHL` (`0x50`/`0x51`) packets and tracking `GIF_STAT.M3P` (bit 1, controlled by `VIF1 MSKPATH3`). Full `GIF` registers and `GS` stub wiring follow in Step 4.
+- **`GIF` Path-2 Stub (`0x1000_3000..=0x1000_30A0`, `FETCHED` `#gifio`)**: Step 3 adds a minimal `GIF` stub storing received `VIF1 DIRECT`/`DIRECTHL` (`0x50`/`0x51`) packets and tracking `GIF_STAT.M3P` (bit 1, controlled by `VIF1 MSKPATH3`). Replaced by full `GifUnit` in Step 4 (§11).
+
+## 11. Phase 2a Step 4: GIF, DMAC D2 (`PATH3`), and GS Privileged / `SIGNAL` / `LABEL`
+
+### 11.1 `SIGNAL` (`0x60`) & `LABEL` (`0x62`) Rule and Step-by-Step Trace
+
+- **Rule (`FETCHED` `ps2tek` `#gsregisterlist` + `ps2autotests` `tests/gs/{signal,label}.cpp` + `SEARCH-ONLY`)**:
+  - Internal GS register `0x60` (`SIGNAL`) and `0x62` (`LABEL`) carry `ID` in bits `0..=31` and `IDMSK` in bits `32..=63` (`GS::SIGNAL(id, idmsk)` / `GS::LABEL(id, idmsk)`).
+  - **`SIGNAL` (`0x60`) stall rule [`SEARCH-ONLY` — Sony GS manual via search snippets; supported by `local/ps2autotests/tests/gs/signal.cpp` lines 8 and 28 comment `"//Signal must be cleared to unstall GIF"`]**:
+    - If `GS_CSR.SIGNAL` (bit 0) is currently `1`, GS/GIF **stalls** before executing the incoming `SIGNAL` write until the EE clears `GS_CSR.SIGNAL` by writing `1` to `GS_CSR[0]` (`0x1200_1000`, W1C). No registers update while stalled.
+    - When `GS_CSR.SIGNAL == 0`:
+      - `SIGLBLID[31:0]` (`SIGID`) `= (SIGLBLID[31:0] & !IDMSK) | (ID & IDMSK)`
+      - `SIGLBLID[63:32]` (`LBLID`) is preserved unchanged.
+      - `GS_CSR.SIGNAL` (bit 0) becomes `1` (raising `IntcFlags::GS` if `GS_IMR[8]` is `0`).
+  - **`LABEL` (`0x62`) rule (`FETCHED` `ps2autotests` `tests/gs/label.cpp`)**:
+    - Does not inspect or set `GS_CSR.SIGNAL`.
+    - `SIGLBLID[63:32]` (`LBLID`) `= (SIGLBLID[63:32] & !IDMSK) | (ID & IDMSK)`
+    - `SIGLBLID[31:0]` (`SIGID`) is preserved unchanged.
+
+- **Trace of `local/ps2autotests/tests/gs/signal.cpp` against `signal.expected`**:
+  1. `signal.expected` line 1 (`signal.cpp:48`): `-- TEST BEGIN`
+     - Predicted state before tests: initial boot `CSR[SIGNAL] = 0`, `SIGLBLID = 0`.
+  2. `testSetBits()` (`signal.cpp:7-25`):
+     - Line 9 writes `*GS::CSR = 1` -> `CSR.SIGNAL = 0` (unstalled).
+     - Line 10 writes `*GS::SIGLBLID = 0x76543210_00000000` -> `LBLID = 0x76543210`, `SIGID = 0x00000000`.
+     - Lines 12-21 `DMA::SendSimple(DMA::D2, ...)` sends `GIFtag(NLOOP=1, EOP=1, FLG=0 [PACKED], NREG=1, REGS=0xE [A+D])` + `A+D(reg=0x60 [SIGNAL], data=0x000000F0_000000F0)` (`ID=0x000000F0`, `IDMSK=0x000000F0`).
+     - Since `CSR.SIGNAL == 0`, rule yields `SIGID = (0x00000000 & !0xF0) | (0xF0 & 0xF0) = 0x000000F0`, `LBLID = 0x76543210`, `CSR.SIGNAL = 1`.
+     - Predicted print (`signal.cpp:23-24`): `CSR & CSR_SIGNAL = 0000000000000001`, `SIGLBLID = 76543210000000f0`.
+     - Matches `signal.expected` line 2 verbatim: `Set signal bits -> CSR[SIGNAL] = 0000000000000001, SIGLBLID: 76543210000000f0`.
+  3. `testClearBits()` (`signal.cpp:27-45`):
+     - Line 29 writes `*GS::CSR = 1` -> clears `CSR.SIGNAL` (`1 -> 0`) so GIF does not stall on this second `SIGNAL`.
+     - Line 30 writes `*GS::SIGLBLID = 0x33333333_33333333` -> `LBLID = 0x33333333`, `SIGID = 0x33333333`.
+     - Lines 32-41 `DMA::SendSimple(DMA::D2, ...)` sends `A+D(reg=0x60 [SIGNAL], data=0x000000F0_00000000)` (`ID=0x00000000`, `IDMSK=0x000000F0`).
+     - Since `CSR.SIGNAL == 0`, rule yields `SIGID = (0x33333333 & !0xF0) | (0x00 & 0xF0) = 0x33333303`, `LBLID = 0x33333333`, `CSR.SIGNAL = 1`.
+     - Predicted print (`signal.cpp:43-44`): `CSR & CSR_SIGNAL = 0000000000000001`, `SIGLBLID = 3333333333333303`.
+     - Matches `signal.expected` line 3 verbatim: `Clear signal bits -> CSR[SIGNAL] = 0000000000000001, SIGLBLID: 3333333333333303`.
+  4. `signal.expected` line 4 (`signal.cpp:53`): `-- TEST END`
+     - Final state: `CSR[SIGNAL] = 1`, `SIGLBLID = 0x3333333333333303`. Every line follows cleanly from the rule.
+
+- **Trace of `local/ps2autotests/tests/gs/label.cpp` against `label.expected`**:
+  1. `label.expected` line 1 (`label.cpp:42`): `-- TEST BEGIN`
+  2. `testSetBits()` (`label.cpp:7-22`): writes `SIGLBLID = 0x00000000_76543210`, DMA `D2` sends `A+D(reg=0x62 [LABEL], data=0x000000F0_000000F0)`. Rule yields `LBLID = (0 & !0xF0) | 0xF0 = 0x000000F0`, `SIGID = 0x76543210`. Matches `label.expected` line 2: `Set label bits -> SIGLBLID: 000000f076543210`.
+  3. `testClearBits()` (`label.cpp:24-39`): writes `SIGLBLID = 0x33333333_33333333`, DMA `D2` sends `A+D(reg=0x62 [LABEL], data=0x000000F0_00000000)`. Rule yields `LBLID = (0x33333333 & !0xF0) | 0 = 0x33333303`, `SIGID = 0x33333333`. Matches `label.expected` line 3: `Clear label bits -> SIGLBLID: 3333330333333333`.
+  4. `label.expected` line 4 (`label.cpp:47`): `-- TEST END`.
+
+### 11.2 GS Privileged Registers (`0x1200_0000..=0x1200_1FFF`) — `SEARCH-ONLY` / `GUESS` Inventory
+
+- **`GS_CSR` (`0x1200_1000`) beyond `SIGNAL`/`FINISH`**:
+  - `SIGNAL` (bit 0, W1C) & `SIGLBLID` (`0x1200_1080`): covered above (`FETCHED` `ps2autotests` + `SEARCH-ONLY` stall).
+  - `FINISH` (`0x61` internal reg -> `GS_CSR[1]`, W1C): register address `0x61` is `FETCHED` (`ps2tek` `#gsregisterlist`); setting `GS_CSR.FINISH` (bit 1) + IRQ raising is **`SEARCH-ONLY`**.
+  - `HSINT` (bit 2, W1C), `VSINT` (bit 3, W1C), `EDWINT` (bit 4, W1C): **`SEARCH-ONLY`** (`ps2sdk` `libgs.h` / Sony GS docs).
+  - `FLUSH` (bit 8) & `RESET` (bit 9): **`SEARCH-ONLY` / `GUESS`** (`TODO(verify)` exact effect of `GS_CSR.FLUSH` vs `RESET` on internal GS/GIF state beyond resetting GS privileged interrupts).
+  - `NFIELD` (bit 12), `FIELD` (bit 13, toggled on VBlank), `FIFO` status bits `14..=15` (`01` = empty): **`SEARCH-ONLY`** (`ps2sdk` `libgs.h`).
+  - `REV` (`bits 16..=23 = 0x1B`) and `ID` (`bits 24..=31 = 0x55`): **`SEARCH-ONLY` / `GUESS`** (console revision dependent; hardcoded `0x551B << 16`).
+- **`GS_IMR` (`0x1200_1010`)**: **`SEARCH-ONLY`** — bits `8..=12` (`SIGMSK`, `FINISHMSK`, `HSMSK`, `VSMSK`, `EDWMSK`), active-high (`1` = masked, `0` = enabled) gating `IntcFlags::GS` (`INTC` bit 0). Resets to `0x7F00` (`bits 8..=14` masked); `TODO(verify)` reset bits `13..=14` vs `ps2sdk`/hardware.
+- **`GS_BUSDIR` (`0x1200_1040`)**: **`SEARCH-ONLY`** — bit 0 selects direction (`0 = Host->Local` / `EE->GS`, `1 = Local->Host` / `GS->EE`), reflected into `GIF_STAT.DIR` (bit 12). When `GS_BUSDIR == 1`, `ps2tek` is silent on VRAM readback FIFO contents and DMA handshake -> explicit unimplemented error (`TODO(verify)`).
+- **Other GS privileged display registers (`PMODE`, `SMODE1`, `SMODE2`, `SRFSH`, `SYNCH1`, `SYNCH2`, `SYNCV`, `DISPFB1`, `DISPLAY1`, `DISPFB2`, `DISPLAY2`, `EXTBUF`, `EXTDATA`, `EXTWRITE`, `BGCOLOR`)**: latch-only storage in `GsPrivilegedStub` (**`GUESS`** / minimal latches for BIOS/SDK writes).
+
+### 11.3 GIF & DMAC `D2` (`PATH3`) Behaviors Beyond `gs/label` & `gs/signal` (`untested by hardware suites`)
+
+All behaviors below are implemented strictly from `local/ps2tek/index.html` (`#gif`, `#gifio`, `#giftags`, `#gifdataformats`, `#gifpath3masking`, `#dmac`, `#dmacio`) and marked **`untested by hardware suites`**:
+
+- **`GIF_CTRL` (`0x1000_3000`, W-only)**: bit 0 `RST` resets GIF paths, queues, tags, and internal state (clears `PSE` and `IP3` as well — `TODO(verify)` whether `RST` clears `M3P` or leaves `VIF1 MSKPATH3` bit untouched; left `M3P` preserved across `GIF_CTRL.RST` unless `VIF1` writes `MSKPATH3` or resets). Bit 3 `PSE` pauses GIF transfers when `1` (`GIF_STAT.PSE`).
+- **`GIF_MODE` (`0x1000_3010`, W-only)**:
+  - Bit 0 `M3R`: masks `PATH3` when `1`. Per `ps2tek` `#gifpath3masking`, when `PATH3` DMA/transfer is already active, masking takes effect after the ongoing `PATH3` transfer ends (`pending_m3r` latched until `PATH3` packet/DMA finishes — `TODO(verify)` exact boundary between packet `EOP` vs `D2` DMA completion).
+  - Bit 2 `IMT`: intermittent mode (`PATH3` may yield to `PATH1`/`PATH2`). Note `ps2tek` itself writes `"(by intermittent mode?)"`; **`TODO(verify)`** exact preemption point (preempted at QWC boundaries between `PATH3` GIFtag `NLOOP` steps, saving `GIF_P3CNT` & `GIF_P3TAG` and setting `GIF_STAT.IP3 = 1`).
+- **`GIF_STAT` (`0x1000_3020`, R-only)**: `0=M3R`, `1=M3P`, `2=IMT`, `3=PSE`, `5=IP3`, `6=P3Q`, `7=P2Q`, `8=P1Q`, `9=OPH`, `10..=11=APATH` (`0=Idle,1=PATH1,2=PATH2,3=PATH3`), `12=DIR` (`GS_BUSDIR & 1`), `24..=28=FQC` (`0..=16` QWCs in PATH3 16-QWC FIFO).
+- **`PSE`-gated debug registers (`0x1000_3040..=0x1000_30A0`, R-only)**: `GIF_TAG0..3`, `GIF_CNT`, `GIF_P3CNT`, `GIF_P3TAG`. Per `ps2tek` `#gifio`, readable **only while `GIF_CTRL.PSE == 1`**, returning `0` otherwise. **`TODO(verify)`**: `GIF_CNT[20..=29]` (`VU` address for `PATH1` `XGKICK`) stays `0` until Phase 2b `XGKICK`.
+- **Priority & Arbitration (`PATH1 > PATH2 > PATH3`)**: `PATH1` (`P1Q` / priority queue slot; `XGKICK` feeder deferred to Phase 2b), `PATH2` (`VIF1 DIRECT`/`DIRECTHL`), `PATH3` (`DMAC D2` / `0x1000_6000`). **`TODO(verify)`**: whether `PATH1` has any mask bit outside `PSE` (`ps2tek` `#gifio` lists none).
+- **GIFtag parsing & formats**:
+  - `NLOOP` (`bits 0..=14`), `EOP` (`bit 15`), `PRE` (`bit 46`), `PRIM` (`bits 47..=57`), `FLG` (`bits 58..=59`: `0=PACKED, 1=REGLIST, 2|3=IMAGE`), `NREG` (`bits 60..=63`, `0 => 16`), `REGS` (`bits 64..=127`, 4 bits per reg).
+  - `NLOOP == 0`: ignores all fields other than `EOP` (does not initialize GS `Q = 1.0f` or send `PRE`/`PRIM`).
+  - `NLOOP > 0`: initializes GS internal `Q = 1.0f` (`0x3F80_0000`) and, if `PRE == 1`, sends `PRIM` to internal GS `0x00` before payload (`FLG != IMAGE` or all non-`NLOOP==0` tags per `ps2tek` `#giftags`).
+  - `PACKED` (`FLG=0`): implements all 16 register descriptors (`0x0=PRIM`, `0x1=RGBAQ`, `0x2=ST`, `0x3=UV`, `0x4=XYZF2`, `0x5=XYZ2`, `0x6=TEX0_1`, `0x7=TEX0_2`, `0x8=CLAMP_1`, `0x9=CLAMP_2`, `0xA=FOG`, `0xC=XYZF3`, `0xD=XYZ3`, `0xE=A+D`, `0xF=NOP`) per `ps2tek` `#gifdataformats` (including `0x2 ST` storing float `Q` from bits `64..95` into internal `Q`, `0x1 RGBAQ` injecting internal `Q` into `RGBAQ[32..63]`, `0x4`/`0x5` ADC from bit 111 / bit 15 of word 3).
+  - `REGLIST` (`FLG=1`): 2 x 64-bit writes per QWC; when total writes `NREG * NLOOP` is odd, the upper 64 bits of the last QWC are discarded (`ps2tek` `#gifdataformats`).
+  - `IMAGE` (`FLG=2|3`): 2 x 64-bit `HWREG` (`0x54`) writes per QWC.
+- **`DMAC D2` (`GIF`, `0x1000_A000..=0x1000_A030`) & `GIF_FIFO` (`0x1000_6000..=0x1000_6FFF`)**:
+  - `D2` transfers 1 QWC per `BUSCLK` (`2` EE cycles) on scheduler ticks (`DmacTick`) in `Normal` and `Chain` (`DIR=1`, EE->GIF) modes, pausing automatically when the 16-QWC PATH3 FIFO is full (preserving backpressure even when PATH3 is masked via `M3R`/`M3P`).
+  - `DMAC D2` with `CHCR.DIR == 0` (to memory) or `CHCR.MOD == 2` (`Interleave`), or writes/reads to `GIF_FIFO` while `GS_BUSDIR == 1`, return an explicit unimplemented error (`TODO(verify)`).
+- **Scheduler-driven bounded GIF execution**: `step_gif` advances at most 1 QWC / unit per `GifTick` (`2` EE cycles per BUSCLK beat); register writes never synchronously drain a multi-QWC packet or DMA, and register reads never mutate or advance GIF state.
+
 
 

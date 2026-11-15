@@ -15,7 +15,6 @@
 //!   * `0x7000_0000..=0x7000_3FFF`: 16 KB Scratchpad SRAM (`8`/`16`/`32`/`64`/`128`-bit).
 
 pub mod dmac;
-pub mod gif_stub;
 pub mod gs_stub;
 pub mod intc;
 pub mod rdram_mch;
@@ -24,6 +23,7 @@ pub mod timers;
 
 use ps2_common::Reg128;
 
+use crate::gif::GifUnit;
 use crate::mmu::{Tlb, TlbEntry, TranslatedAddr, Vtlb, VtlbTarget};
 use crate::scheduler::{HardwareEventKind, Scheduler};
 use crate::vif::{VifKind, VifUnit};
@@ -31,7 +31,6 @@ use crate::vu::micro::{exec_macro_op, step_micro_liw};
 use crate::vu::{VuState, VU0_TPC_MASK, VU1_TPC_MASK, VU_REVISION_ID};
 
 pub use dmac::{DmaChannel, EeDmac, UnimplementedDmaTransfer};
-pub use gif_stub::GifStub;
 pub use gs_stub::GsPrivilegedStub;
 pub use intc::{EeIntc, IntcFlags, IopIntc, IopIrqFlags};
 pub use rdram_mch::RdramMch;
@@ -368,8 +367,8 @@ pub struct Bus {
     // TODO(verify): `ps2tek` `#memorymap` line 106 (`FETCHED`) lists `FFFE0000h (KSEG2) Cache control` without
     // per-offset bitfields (`0xFFFE_0130` `BIU_CONFIG` and `0xFFFE_0140..=0xFFFE_014F`).
     pub iop_cache_ctrl: [u32; 8],
-    /// Graphics Synthesizer Interface (`GIF`) Path-2 stub (`0x1000_3000..=0x1000_30AF`, `0x1000_6000..=0x1000_6FFF`).
-    pub gif: GifStub,
+    /// Graphics Synthesizer Interface (`GIF`, `0x1000_3000..=0x1000_30AF`, `0x1000_6000..=0x1000_6FFF`).
+    pub gif: GifUnit,
     /// Vector Unit Interface 0 (`VIF0`, `0x1000_3800..=0x1000_3970`, `0x1000_4000..=0x1000_4FFF`).
     pub vif0: VifUnit,
     /// Vector Unit Interface 1 (`VIF1`, `0x1000_3C00..=0x1000_3D70`, `0x1000_5000..=0x1000_5FFF`).
@@ -378,6 +377,8 @@ pub struct Bus {
     pub scheduler: Scheduler,
     /// Tracks whether a `HardwareEventKind::DmacTick` is currently queued in `scheduler`.
     dmac_tick_scheduled: bool,
+    /// Tracks whether a `HardwareEventKind::GifTick` is currently queued in `scheduler`.
+    gif_tick_scheduled: bool,
     /// Captured EE/IOP serial & console stdout bytes (`KPUTCHAR` `0x1000_F180` + HLE stdout, `ps2tek` `#iomaps`, `FETCHED`).
     pub stdout_buffer: Vec<u8>,
     /// Diagnostic error set if the EE reads or writes an unimplemented EE MMIO register.
@@ -419,11 +420,12 @@ impl Bus {
             iop_gm_if: 0,
             iop_post2: 0,
             iop_cache_ctrl: [0; 8],
-            gif: GifStub::new(),
+            gif: GifUnit::new(),
             vif0: VifUnit::new(VifKind::Vif0),
             vif1: VifUnit::new(VifKind::Vif1),
             scheduler: Scheduler::new(),
             dmac_tick_scheduled: false,
+            gif_tick_scheduled: false,
             stdout_buffer: Vec::new(),
             pending_ee_mmio_error: None,
             pending_iop_mmio_error: None,
@@ -554,7 +556,14 @@ impl Bus {
             VtlbTarget::Mmio => {
                 let addr = offset & !0xF;
                 match addr {
-                    0x1000_4000..=0x1000_6FFF => Reg128::ZERO,
+                    0x1000_4000..=0x1000_5FFF => Reg128::ZERO,
+                    0x1000_6000..=0x1000_6FFF => {
+                        if self.gs.busdir_gs_to_ee() {
+                            // TODO(verify): `ps2tek` is silent on GS->EE VRAM readback FIFO contents.
+                            self.record_unimplemented_ee_reg(addr, 16, false, 0);
+                        }
+                        Reg128::ZERO
+                    }
                     _ => {
                         let lo = self.read_mmio64(addr);
                         let hi = self.read_mmio64(addr.wrapping_add(8));
@@ -750,9 +759,16 @@ impl Bus {
                         let _ = self.vif1.push_cpu_fifo_qwc(val);
                         self.step_vifs();
                         self.schedule_dmac_tick_if_needed();
+                        self.schedule_gif_tick_if_needed();
                     }
                     0x1000_6000..=0x1000_6FFF => {
-                        self.gif.push_fifo_qwc(val);
+                        if self.gs.busdir_gs_to_ee() {
+                            // TODO(verify): `GS_BUSDIR == 1` reverses FIFO to GS->EE; CPU writes unsupported.
+                            self.record_unimplemented_ee_reg(addr, 16, true, val.lo_u64() as u32);
+                        } else {
+                            let _ = self.gif.push_path3_qwc(val);
+                            self.schedule_gif_tick_if_needed();
+                        }
                     }
                     _ => {
                         self.write_mmio64(addr, val.lo_u64());
@@ -806,16 +822,32 @@ impl Bus {
                 HardwareEventKind::DmacChannelComplete(ch) => {
                     self.dmac.complete_channel(usize::from(ch));
                     if usize::from(ch) == dmac::dmac_ch::FROM_SPR {
-                        self.schedule_dmac_tick_if_needed();
+                        self.schedule_dmac_tick_at_if_needed(event.trigger_cycle + 2);
                     }
                 }
                 HardwareEventKind::DmacTick => {
                     self.dmac_tick_scheduled = false;
                     let progressed = self.tick_dmac_once();
-                    if progressed && self.can_any_vif_dma_progress() {
+                    let next_cycle = event.trigger_cycle + 2;
+                    if progressed && self.can_any_fifo_dma_progress() {
                         self.dmac_tick_scheduled = true;
                         self.scheduler
-                            .schedule_at(event.trigger_cycle + 2, HardwareEventKind::DmacTick);
+                            .schedule_at(next_cycle, HardwareEventKind::DmacTick);
+                    }
+                    self.schedule_gif_tick_at_if_needed(next_cycle);
+                }
+                HardwareEventKind::GifTick => {
+                    self.gif_tick_scheduled = false;
+                    let progressed = self.gif.step(&mut self.gs, &mut self.intc);
+                    if progressed {
+                        let next_cycle = event.trigger_cycle + 2;
+                        self.step_vifs();
+                        self.schedule_dmac_tick_at_if_needed(next_cycle);
+                        if self.gif.can_step(&self.gs) {
+                            self.gif_tick_scheduled = true;
+                            self.scheduler
+                                .schedule_at(next_cycle, HardwareEventKind::GifTick);
+                        }
                     }
                 }
                 _ => {}
@@ -846,7 +878,7 @@ impl Bus {
         }
     }
 
-    /// Advance scheduler-driven peripheral DMAC channels (`VIF0`, `VIF1`) by 1 BUSCLK beat.
+    /// Advance scheduler-driven peripheral DMAC channels (`VIF0`, `VIF1`, `GIF`) by 1 BUSCLK beat.
     #[inline]
     fn tick_dmac_once(&mut self) -> bool {
         let mut progressed = false;
@@ -862,25 +894,50 @@ impl Bus {
             &self.ram,
             &self.scratchpad,
         );
+        progressed |= self
+            .dmac
+            .step_gif_channel(&mut self.gif, &self.ram, &self.scratchpad);
         self.step_vifs();
         progressed
     }
 
     #[inline]
-    fn can_any_vif_dma_progress(&self) -> bool {
+    fn can_any_fifo_dma_progress(&self) -> bool {
         self.dmac
             .vif_channel_can_step(dmac::dmac_ch::VIF0, &self.vif0)
             || self
                 .dmac
                 .vif_channel_can_step(dmac::dmac_ch::VIF1, &self.vif1)
+            || self.dmac.gif_channel_can_step(&self.gif)
     }
 
-    /// Schedule the next BUSCLK `DmacTick` if an active `VIF` DMA can currently make progress.
+    /// Schedule the next BUSCLK `DmacTick` if an active `VIF`/`GIF` DMA can currently make progress.
     #[inline]
     fn schedule_dmac_tick_if_needed(&mut self) {
-        if !self.dmac_tick_scheduled && self.can_any_vif_dma_progress() {
+        self.schedule_dmac_tick_at_if_needed(self.scheduler.current_ee_cycle.saturating_add(2));
+    }
+
+    #[inline]
+    fn schedule_dmac_tick_at_if_needed(&mut self, trigger_cycle: u64) {
+        if !self.dmac_tick_scheduled && self.can_any_fifo_dma_progress() {
             self.dmac_tick_scheduled = true;
-            self.scheduler.schedule(2, HardwareEventKind::DmacTick);
+            self.scheduler
+                .schedule_at(trigger_cycle, HardwareEventKind::DmacTick);
+        }
+    }
+
+    /// Schedule the next BUSCLK `GifTick` if `GIF` currently has unblocked work for `GS`.
+    #[inline]
+    fn schedule_gif_tick_if_needed(&mut self) {
+        self.schedule_gif_tick_at_if_needed(self.scheduler.current_ee_cycle.saturating_add(2));
+    }
+
+    #[inline]
+    fn schedule_gif_tick_at_if_needed(&mut self, trigger_cycle: u64) {
+        if !self.gif_tick_scheduled && self.gif.can_step(&self.gs) {
+            self.gif_tick_scheduled = true;
+            self.scheduler
+                .schedule_at(trigger_cycle, HardwareEventKind::GifTick);
         }
     }
 
@@ -1070,10 +1127,16 @@ impl Bus {
     fn read_mmio32(&mut self, paddr: u32) -> u32 {
         match paddr {
             0x1000_0000..=0x1000_1FFF => self.timers.read32(paddr),
-            0x1000_3000..=0x1000_30FF => self.gif.read32(paddr),
+            0x1000_3000..=0x1000_30FF => self.gif.read32(paddr, self.gs.busdir_gs_to_ee()),
             0x1000_3800..=0x1000_39FF => self.vif0.read32(paddr),
             0x1000_3C00..=0x1000_3DFF => self.vif1.read32(paddr),
-            0x1000_4000..=0x1000_6FFF => 0,
+            0x1000_4000..=0x1000_5FFF => 0,
+            0x1000_6000..=0x1000_6FFF => {
+                if self.gs.busdir_gs_to_ee() {
+                    self.record_unimplemented_ee_reg(paddr, 4, false, 0);
+                }
+                0
+            }
             0x1000_8000..=0x1000_E060 | 0x1000_F500 | 0x1000_F520 | 0x1000_F590 => {
                 self.dmac.read32(paddr)
             }
@@ -1177,9 +1240,11 @@ impl Bus {
         match paddr {
             0x1000_0000..=0x1000_1FFF => self.timers.write32(paddr, val),
             0x1000_3000..=0x1000_30FF => {
-                self.gif.write32(paddr, val);
+                let path3_dma_ongoing = self.dmac.is_channel_active(dmac::dmac_ch::GIF);
+                self.gif.write32(paddr, val, path3_dma_ongoing);
                 self.step_vifs();
                 self.schedule_dmac_tick_if_needed();
+                self.schedule_gif_tick_if_needed();
             }
             0x1000_3800..=0x1000_39FF => {
                 self.vif0.write32(paddr, val);
@@ -1190,6 +1255,7 @@ impl Bus {
                 self.vif1.write32(paddr, val);
                 self.step_vifs();
                 self.schedule_dmac_tick_if_needed();
+                self.schedule_gif_tick_if_needed();
             }
             0x1000_4000..=0x1000_4FFF => {
                 let _ = self.vif0.push_cpu_fifo_word(val);
@@ -1200,8 +1266,13 @@ impl Bus {
                 let _ = self.vif1.push_cpu_fifo_word(val);
                 self.step_vifs();
                 self.schedule_dmac_tick_if_needed();
+                self.schedule_gif_tick_if_needed();
             }
-            0x1000_6000..=0x1000_6FFF => {}
+            0x1000_6000..=0x1000_6FFF => {
+                if self.gs.busdir_gs_to_ee() {
+                    self.record_unimplemented_ee_reg(paddr, 4, true, val);
+                }
+            }
             0x1000_8000..=0x1000_E060 | 0x1000_F500 | 0x1000_F520 | 0x1000_F590 => {
                 self.dmac.write32(
                     paddr,
@@ -1210,9 +1281,8 @@ impl Bus {
                     &mut self.scratchpad,
                     &mut self.scheduler,
                 );
-                if paddr == 0x1000_8000 || paddr == 0x1000_9000 {
-                    self.dmac_tick_scheduled =
-                        self.dmac.has_active_vif_transfer() && self.dmac.dma_enabled();
+                if matches!(paddr, 0x1000_8000 | 0x1000_9000 | 0x1000_A000) {
+                    self.dmac_tick_scheduled = self.can_any_fifo_dma_progress();
                 } else {
                     self.schedule_dmac_tick_if_needed();
                 }
@@ -1229,7 +1299,10 @@ impl Bus {
             0x1000_F1C0 => self.sio.rxfifo = val,
             0x1000_F200..=0x1000_F260 => self.sif.write32_ee(paddr, val),
             0x1000_F400..=0x1000_F4F0 if (paddr & 0xF) == 0 => self.rdram_mch.write32(paddr, val),
-            0x1200_0000..=0x1200_1FFF => self.gs.write32(paddr, val),
+            0x1200_0000..=0x1200_1FFF => {
+                self.gs.write32(paddr, val);
+                self.schedule_gif_tick_if_needed();
+            }
             _ => {
                 self.record_unimplemented_ee_reg(paddr, 4, true, val);
             }
@@ -1239,7 +1312,10 @@ impl Bus {
     #[cold]
     fn write_mmio64(&mut self, paddr: u32, val: u64) {
         match paddr {
-            0x1200_0000..=0x1200_1FFF => self.gs.write64(paddr, val),
+            0x1200_0000..=0x1200_1FFF => {
+                self.gs.write64(paddr, val);
+                self.schedule_gif_tick_if_needed();
+            }
             _ => {
                 self.write_mmio32(paddr, val as u32);
                 self.write_mmio32(paddr.wrapping_add(4), (val >> 32) as u32);
@@ -2011,7 +2087,7 @@ mod tests {
         assert_eq!(bus.read32(0xB000_8020), 0);
         assert_eq!(bus.pending_ee_mmio_error, None);
 
-        // Also test direct 128-bit `VIF1_FIFO` write forwarding `DIRECT` + `MSKPATH3` to `GifStub`.
+        // Also test direct 128-bit `VIF1_FIFO` write forwarding `DIRECT` + `MSKPATH3` to `GifUnit`.
         bus.write128(
             0xB000_5000,
             Reg128::from_u32x4(
@@ -2029,5 +2105,106 @@ mod tests {
             bus.gif.read_packet_qwc(&meta, 0),
             Some(Reg128::from_u32x4(10, 20, 30, 40))
         );
+    }
+
+    #[test]
+    fn bus_blocked_gif_path_never_advances_from_reads_and_writes_stay_event_driven() {
+        let mut bus = Bus::new();
+
+        // Pause GIF via `GIF_CTRL.PSE` (bit 3) and pre-set `GS_CSR.SIGNAL` (bit 0) -> stalled!
+        bus.write32(0xB000_3000, 1 << 3);
+        bus.write64(0xB200_1080, 0x1111_2222_0000_0000);
+        // Set `GS_CSR.SIGNAL` via internal packet then block, OR pause + mask PATH3 via `M3R`:
+        bus.write32(0xB000_3010, 1 << 0); // M3R=1 (masks PATH3)
+
+        // Write a 3-QWC PATH3 packet into `GIF_FIFO` (`0xB000_6000`):
+        // GIFtag (NLOOP=2, EOP=1, PACKED, NREG=1, A+D) + LABEL(0xAA, 0xFF) + LABEL(0xBB00, 0xFF00)
+        let tag = Reg128::from_u64_pair(2 | (1 << 15) | (1 << 60), 0xE);
+        let q1 = Reg128::from_u64_pair((0xFF << 32) | 0xAA, 0x62);
+        let q2 = Reg128::from_u64_pair((0xFF00 << 32) | 0xBB00, 0x62);
+        bus.write128(0xB000_6000, tag);
+        bus.write128(0xB000_6000, q1);
+        bus.write128(0xB000_6000, q2);
+
+        // Register writes MUST NOT synchronously run GIF to completion.
+        assert_eq!(bus.gif.path3_fifo_len(), 3);
+        assert_eq!(bus.read64(0xB200_1080), 0x1111_2222_0000_0000);
+
+        // Polling reads MUST NOT advance blocked GIF state or scheduler cycle.
+        let before_cycle = bus.scheduler.current_ee_cycle;
+        for _ in 0..50 {
+            let _ = bus.read32(0xB000_3020); // GIF_STAT
+            let _ = bus.read32(0xB000_3040); // GIF_TAG0
+            let _ = bus.read64(0xB200_1000); // GS_CSR
+            let _ = bus.read64(0xB200_1080); // GS_SIGLBLID
+        }
+        assert_eq!(bus.scheduler.current_ee_cycle, before_cycle);
+        assert_eq!(bus.gif.path3_fifo_len(), 3);
+        assert_eq!(bus.read64(0xB200_1080), 0x1111_2222_0000_0000);
+
+        // Advancing time while blocked (`PSE=1, M3R=1`) still makes ZERO progress.
+        bus.step_timers(100);
+        assert_eq!(bus.gif.path3_fifo_len(), 3);
+        assert_eq!(bus.read64(0xB200_1080), 0x1111_2222_0000_0000);
+
+        // Unblock `PSE` and `M3R`: register writes alone STILL must NOT execute GIF synchronously!
+        bus.write32(0xB000_3000, 0);
+        bus.write32(0xB000_3010, 0);
+        assert_eq!(bus.gif.path3_fifo_len(), 3);
+
+        // Scheduler progresses strictly bounded: beat 1 -> tag only (0xAA not yet written);
+        // beat 2 -> q1 (0xAA written), beat 3 -> q2 (0xBBAA written).
+        bus.step_timers(2);
+        assert_eq!(bus.gif.path3_fifo_len(), 2);
+        assert_eq!(bus.read64(0xB200_1080), 0x1111_2222_0000_0000);
+
+        bus.step_timers(2);
+        assert_eq!(bus.gif.path3_fifo_len(), 1);
+        assert_eq!(bus.read64(0xB200_1080), 0x1111_22AA_0000_0000);
+
+        bus.step_timers(2);
+        assert_eq!(bus.gif.path3_fifo_len(), 0);
+        assert_eq!(bus.read64(0xB200_1080), 0x1111_BBAA_0000_0000);
+    }
+
+    #[test]
+    fn bus_d2_gif_path3_signal_stall_unstalls_on_csr_clear() {
+        let mut bus = Bus::new();
+
+        // Build a 3-QWC DMA D2 packet in RAM at 0x4000:
+        // GIFtag (NLOOP=2, EOP=1, PACKED, NREG=1, A+D), SIGNAL(0xF0, 0xF0), SIGNAL(0x05, 0x0F).
+        let addr = 0x4000usize;
+        let tag = Reg128::from_u64_pair(2 | (1 << 15) | (1 << 60), 0xE);
+        let s1 = Reg128::from_u64_pair((0xF0 << 32) | 0xF0, 0x60);
+        let s2 = Reg128::from_u64_pair((0x0F << 32) | 0x05, 0x60);
+        for (i, q) in [tag, s1, s2].iter().enumerate() {
+            bus.ram[addr + i * 16..addr + (i + 1) * 16].copy_from_slice(&q.0.to_le_bytes());
+        }
+
+        bus.write64(0xB200_1080, 0x1234_5678_0000_0000);
+        bus.write32(0xB000_A010, addr as u32);
+        bus.write32(0xB000_A020, 3);
+        bus.write32(0xB000_A000, dmac::chcr_bits::STR | dmac::chcr_bits::DIR);
+
+        // Advance past DMA + first SIGNAL; second SIGNAL must stall cleanly leaving FQC == 1!
+        bus.step_timers(20);
+        assert_eq!(bus.read32(0xB000_A000) & dmac::chcr_bits::STR, 0);
+        assert_eq!(bus.read64(0xB200_1000) & 1, 1);
+        assert_eq!(bus.read64(0xB200_1080), 0x1234_5678_0000_00F0);
+        assert_eq!(bus.gif.path3_fifo_len(), 1);
+
+        // Reads never unstall or advance it.
+        for _ in 0..20 {
+            let _ = bus.read64(0xB200_1000);
+            let _ = bus.read32(0xB000_3020);
+        }
+        assert_eq!(bus.gif.path3_fifo_len(), 1);
+
+        // Writing GS_CSR.SIGNAL=1 clears stall -> schedules GifTick -> processes s2 cleanly.
+        bus.write64(0xB200_1000, 1);
+        bus.step_timers(4);
+        assert_eq!(bus.read64(0xB200_1000) & 1, 1);
+        assert_eq!(bus.read64(0xB200_1080), 0x1234_5678_0000_00F5);
+        assert_eq!(bus.gif.path3_fifo_len(), 0);
     }
 }

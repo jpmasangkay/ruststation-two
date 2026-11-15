@@ -16,7 +16,7 @@ pub mod unpack;
 
 use ps2_common::Reg128;
 
-use crate::bus::gif_stub::GifStub;
+use crate::gif::GifUnit;
 use crate::vu::{VuState, VU0_TPC_MASK, VU1_TPC_MASK};
 use unpack::{UnpackCmd, UnpackState, VIF0_DATA_QWC_MASK, VIF1_DATA_QWC_MASK};
 
@@ -90,6 +90,7 @@ enum VifCmdState {
     Idle,
     /// `FLUSHE` / `FLUSH` / `FLUSHA`: waits for `!vu.running` (`VEW`) and optionally GIF (`VGW`).
     WaitFlush {
+        wait_gif_path12: bool,
         check_gif_path3: bool,
         pending_irq: bool,
     },
@@ -539,7 +540,7 @@ impl VifUnit {
         vu: &mut VuState,
         vu_micro_mem: &mut [u8],
         vu_data_mem: &mut [u8],
-        mut gif: Option<&mut GifStub>,
+        mut gif: Option<&mut GifUnit>,
     ) -> bool {
         let mut raised_irq = false;
         let data_qwc_mask = self.kind.data_qwc_mask();
@@ -604,12 +605,15 @@ impl VifUnit {
                 }
 
                 VifCmdState::WaitFlush {
+                    wait_gif_path12,
                     check_gif_path3,
                     pending_irq,
                 } => {
                     let gif_busy = if self.kind.is_vif1() {
                         gif.as_deref().is_some_and(|g| {
-                            check_gif_path3 && (g.path3_image_active || g.is_paused())
+                            (check_gif_path3 && (g.is_any_path_busy() || g.is_paused()))
+                                || (wait_gif_path12
+                                    && (g.is_path1_or_path2_busy() || g.is_paused()))
                         })
                     } else {
                         false
@@ -619,6 +623,7 @@ impl VifUnit {
                         self.stat_vgw = gif_busy;
                         self.vps = VifVps::Transferring;
                         self.cmd_state = VifCmdState::WaitFlush {
+                            wait_gif_path12,
                             check_gif_path3,
                             pending_irq,
                         };
@@ -629,6 +634,7 @@ impl VifUnit {
                         self.stat_vgw = true;
                         self.vps = VifVps::Transferring;
                         self.cmd_state = VifCmdState::WaitFlush {
+                            wait_gif_path12,
                             check_gif_path3,
                             pending_irq,
                         };
@@ -644,7 +650,8 @@ impl VifUnit {
                     pending_irq,
                 } => {
                     let gif_busy = if wait_gif && self.kind.is_vif1() {
-                        gif.as_deref().is_some_and(GifStub::is_paused)
+                        gif.as_deref()
+                            .is_some_and(|g| g.is_path1_or_path2_busy() || g.is_paused())
                     } else {
                         false
                     };
@@ -891,7 +898,7 @@ impl VifUnit {
         imm: u16,
         i_bit: bool,
         micro_mask: usize,
-        gif: Option<&mut GifStub>,
+        gif: Option<&mut GifUnit>,
     ) -> bool {
         match cmd_id {
             0x00 => true, // `NOP`
@@ -943,6 +950,7 @@ impl VifUnit {
             0x10 => {
                 self.vps = VifVps::Transferring;
                 self.cmd_state = VifCmdState::WaitFlush {
+                    wait_gif_path12: false,
                     check_gif_path3: false,
                     pending_irq: i_bit,
                 };
@@ -955,6 +963,7 @@ impl VifUnit {
                 }
                 self.vps = VifVps::Transferring;
                 self.cmd_state = VifCmdState::WaitFlush {
+                    wait_gif_path12: true,
                     check_gif_path3: cmd_id == 0x13,
                     pending_irq: i_bit,
                 };
@@ -1087,14 +1096,14 @@ mod tests {
     fn run_vif_qwc(
         kind: VifKind,
         qwcs: &[Reg128],
-    ) -> (VifUnit, VuState, Vec<u8>, Vec<u8>, GifStub, bool) {
+    ) -> (VifUnit, VuState, Vec<u8>, Vec<u8>, GifUnit, bool) {
         let mut vif = VifUnit::new(kind);
         let mut vu = VuState::new();
         let micro_len = if kind.is_vif1() { 0x4000 } else { 0x1000 };
         let data_len = if kind.is_vif1() { 0x4000 } else { 0x1000 };
         let mut micro = vec![0u8; micro_len];
         let mut data = vec![0u8; data_len];
-        let mut gif = GifStub::new();
+        let mut gif = GifUnit::new();
         let mut any_irq = false;
 
         for &qwc in qwcs {
@@ -1365,7 +1374,7 @@ mod tests {
         let mut vu = VuState::new();
         let mut micro = vec![0u8; 0x4000];
         let mut data = vec![0u8; 0x4000];
-        let mut gif = GifStub::new();
+        let mut gif = GifUnit::new();
 
         // Write simple VU1 halt microprogram at TPC 0 (`E`-bit at slot 0 -> delay slot 1)
         micro[4..8].copy_from_slice(&UPPER_BIT_E.to_le_bytes());
