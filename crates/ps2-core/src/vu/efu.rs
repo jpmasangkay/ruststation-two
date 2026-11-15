@@ -35,10 +35,10 @@ pub fn exec_efu_op(vu: &mut VuState, instr: u32) -> bool {
         0x7BC => esqrt(vu.read_vf_lane(fs, fsf)),
         0x7BD => ersqrt(vu.read_vf_lane(fs, fsf)),
 
-        // Group B (pending)
-        0x73E => 0, // ELENG
-        0x73F => 0, // ERLENG
-        0x73D => 0, // ERSADD
+        // Group B
+        0x73E => eleng(vu.read_vf(fs).u32_lanes()),
+        0x73F => erleng(vu.read_vf(fs).u32_lanes()),
+        0x73D => ersadd(vu.read_vf(fs).u32_lanes()),
 
         // Group C (pending)
         0x7FE => 0, // EEXP
@@ -91,6 +91,29 @@ pub fn esqrt(val: u32) -> u32 {
 #[inline]
 pub fn ersqrt(val: u32) -> u32 {
     ps2float::rsqrt(0x3F80_0000, val).bits
+}
+
+/// `ELENG P, fs`: `sqrt(x^2 + (y^2 + z^2))` (`Play!` `MA_VU_Lower.cpp` evaluation order, `ps2float`).
+///
+/// Matches `15/16` vectors (`CVF_INCREASING` differs by +/-1 ULP from EFU `sqrt` approximation).
+#[inline]
+pub fn eleng(lanes: &[u32; 4]) -> u32 {
+    esqrt(esadd(lanes))
+}
+
+/// `ERLENG P, fs`: `1.0 / sqrt(x^2 + (y^2 + z^2))` (`ersqrt(esadd(lanes))`).
+///
+/// Both `ersqrt(esadd)` and `ercpr(eleng)` match `13/16` vectors (`PI/2`, `PI`, `3PI/2` differ
+/// by +/-1 ULP from EFU `rsqrt` approximation).
+#[inline]
+pub fn erleng(lanes: &[u32; 4]) -> u32 {
+    ersqrt(esadd(lanes))
+}
+
+/// `ERSADD P, fs`: `1.0 / (x^2 + (y^2 + z^2))` (`Play!` `MA_VU_Lower.cpp` evaluation order, `ps2float`).
+#[inline]
+pub fn ersadd(lanes: &[u32; 4]) -> u32 {
+    ercpr(esadd(lanes))
 }
 
 #[cfg(test)]
@@ -158,5 +181,48 @@ mod tests {
         // 1 / sqrt(+/-0.0) saturates to +PS2_MAX (0x7FFF_FFFF)
         assert_eq!(ersqrt(0), 0x7FFF_FFFF);
         assert_eq!(ersqrt(0x8000_0000), 0x7FFF_FFFF);
+    }
+
+    #[test]
+    fn test_eleng() {
+        // sqrt(1^2 + 2^2 + 2^2) = sqrt(9) = 3.0 (w lane ignored)
+        assert_eq!(
+            eleng(&[
+                1.0f32.to_bits(),
+                2.0f32.to_bits(),
+                (-2.0f32).to_bits(),
+                99.0f32.to_bits(),
+            ]),
+            3.0f32.to_bits()
+        );
+        // Zero vector -> +0.0
+        assert_eq!(eleng(&[0, 0x8000_0000, 0, 5.0f32.to_bits()]), 0);
+    }
+
+    #[test]
+    fn test_erleng() {
+        // 1 / sqrt(0^2 + 4^2 + 0^2) = 1 / 4 = 0.25
+        assert_eq!(
+            erleng(&[0, 4.0f32.to_bits(), 0, 99.0f32.to_bits()]),
+            0.25f32.to_bits()
+        );
+        // 1 / sqrt(2^2 + 6^2 + 3^2) = 1 / 7 -> use (0,0,8) => 0.125
+        assert_eq!(
+            erleng(&[0, 0, (-8.0f32).to_bits(), 1.0f32.to_bits()]),
+            0.125f32.to_bits()
+        );
+        // Zero vector -> +PS2_MAX
+        assert_eq!(erleng(&[0, 0, 0, 1.0f32.to_bits()]), 0x7FFF_FFFF);
+    }
+
+    #[test]
+    fn test_ersadd() {
+        // 1 / (2^2 + 2^2 + 0^2) = 1 / 8 = 0.125
+        assert_eq!(
+            ersadd(&[2.0f32.to_bits(), (-2.0f32).to_bits(), 0, 99.0f32.to_bits()]),
+            0.125f32.to_bits()
+        );
+        // Zero vector -> +PS2_MAX
+        assert_eq!(ersadd(&[0, 0, 0, 1.0f32.to_bits()]), 0x7FFF_FFFF);
     }
 }
