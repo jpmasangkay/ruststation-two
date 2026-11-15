@@ -1,0 +1,79 @@
+# Step 2.5 PCSX2 diagnostic probe (outside frozen GS_RENDER_GATE_SUITES until Step 4).
+# Exercises subpixel Point snapping (G-009), Line endpoints/tie-breaks/reversed/zero-length (G-011),
+# and Sprite corner order + half-pixel bounds (G-010) on a 320x240 PSMCT32 surface.
+surface 0 5 PSMCT32 320 240
+
+reg PRMODECONT 1
+reg FRAME_1 0x00000000_00050000
+reg ZBUF_1 0x00000001_00000096
+reg XYOFFSET_1 0x00008000_00008000
+reg SCISSOR_1 0x00EF0000_013F0000
+reg TEST_1 0x00030000
+
+# 1. Clear full 320x240 surface to black with A=0x80 (Sprite [0, 320) x [0, 240))
+reg PRIM 6
+reg RGBAQ 0x3F800000_80000000
+reg XYZ2 0x00000000_80008000
+reg XYZ2 0x00000000_8F009400
+
+# 2. Subpixel Points (PRIM = 0):
+# X offsets: .0, .4375 (7/16), .5 (8/16), .5625 (9/16) at y = 20
+reg PRIM 0
+reg RGBAQ 0x3F800000_804040FF
+reg XYZ2 0x00000000_81408140   # P0: (20.0,    20.0)
+reg RGBAQ 0x3F800000_8040FF40
+reg XYZ2 0x00000000_81408247   # P1: (36.4375, 20.0)
+reg RGBAQ 0x3F800000_80FF8040
+reg XYZ2 0x00000000_81408348   # P2: (52.5,    20.0)
+reg RGBAQ 0x3F800000_8040FFFF
+reg XYZ2 0x00000000_81408449   # P3: (68.5625, 20.0)
+
+# Y offsets: .4375 (7/16), .5 (8/16), .5625 (9/16) at x = 36, 52, 68
+reg RGBAQ 0x3F800000_80FFFF40
+reg XYZ2 0x00000000_82878240   # P4: (36.0, 40.4375)
+reg RGBAQ 0x3F800000_80FF40FF
+reg XYZ2 0x00000000_82888340   # P5: (52.0, 40.5)
+reg RGBAQ 0x3F800000_8040A0FF
+reg XYZ2 0x00000000_82898440   # P6: (68.0, 40.5625)
+
+# 3. Line probes (PRIM = 1):
+reg PRIM 1
+# L0: horizontal L->R (20,80) -> (28,80), White
+reg RGBAQ 0x3F800000_80FFFFFF
+reg XYZ2 0x00000000_85008140
+reg XYZ2 0x00000000_850081C0
+# L1: horizontal reversed R->L (58,80) -> (50,80), LightCyan
+reg RGBAQ 0x3F800000_80FFFF80
+reg XYZ2 0x00000000_850083A0
+reg XYZ2 0x00000000_85008320
+# L2: vertical T->B (90,76) -> (90,84), LightYellow
+reg RGBAQ 0x3F800000_8080FFFF
+reg XYZ2 0x00000000_84C085A0
+reg XYZ2 0x00000000_854085A0
+# L3: gentle slope 0.5 diagonal (20,110) -> (28,114), LightGreen
+reg RGBAQ 0x3F800000_8080FF80
+reg XYZ2 0x00000000_86E08140
+reg XYZ2 0x00000000_872081C0
+# L4: steep negative-dY diagonal (50,118) -> (54,110), Pink
+reg RGBAQ 0x3F800000_80C080FF
+reg XYZ2 0x00000000_87608320
+reg XYZ2 0x00000000_86E08360
+# L5: zero-length line (80,110) -> (80,110), Orange
+reg RGBAQ 0x3F800000_8040C0FF
+reg XYZ2 0x00000000_86E08500
+reg XYZ2 0x00000000_86E08500
+
+# 4. Sprite probes (PRIM = 6):
+reg PRIM 6
+# S0: normal corner order (20,150) -> (28,158), Teal
+reg RGBAQ 0x3F800000_80D0E040
+reg XYZ2 0x00000000_89608140
+reg XYZ2 0x00000000_89E081C0
+# S1: reversed corner order (58,158) -> (50,150), Coral
+reg RGBAQ 0x3F800000_805070FF
+reg XYZ2 0x00000000_89E083A0
+reg XYZ2 0x00000000_89608320
+# S2: subpixel bounds (80.5,150.0) -> (84.5,154.0), Lavender
+reg RGBAQ 0x3F800000_80FFA0C0
+reg XYZ2 0x00000000_89608508
+reg XYZ2 0x00000000_89A08548

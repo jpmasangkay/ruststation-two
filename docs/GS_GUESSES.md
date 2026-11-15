@@ -19,5 +19,60 @@ Every GS behavior that is `GUESS`, `SEARCH-ONLY`, or only partially specified in
 | `G-013` | `GUESS` | Step 2 | `TEST.ZTE == 0` behavior (`ps2tek`: *"0 is prohibited?"*) | When `TEST.ZTE == 0`, skips both depth comparison (all covered pixels pass) and Z-buffer writes even if `ZBUF.ZMSK == 0`, matching `Play!` `glDisable(GL_DEPTH_TEST)`. | `ps2_gs::raster::tests::ztest_all_four_modes_and_zmsk` | Step 4 PS2 hardware/PCSX2 test drawing with `TEST.ZTE = 0`. |
 | `G-014` | `GUESS` | Step 2 | `ZBUF` bit-width truncation & Step 3 deferred fragment bits | Masks both interpolated test `Z` and stored buffer `Z` by `z_format_mask` (`0xFFFF_FFFF` `PSMZ32`, `0x00FF_FFFF` `PSMZ24`, `0xFFFF` `PSMZ16/16S`); 16-bit framebuffers truncate 8-bit channels (`>> 3`) without `DTHE` dithering; `TME`/`FGE`/`ABE`/`AA1`/`ATE`/`DATE`/`DTHE`/`COLCLAMP`/`FBA` log once and are ignored until Step 3. | `ps2_gs::raster::tests::scissor_xyoffset_fbmsk_and_psm_16_24`, `ps2_gs::raster::tests::prmode_context2_gouraud_line_and_psmz16_truncation`, `gs_render/09_fbmsk_psm16_24_adc` | Step 3 feature implementation + Step 4 `PSMZ24`/`PSMZ16` & `DTHE` PCSX2 screenshot checks. |
 | `G-015` | `GUESS` | Step 2 | Initial `RasterizerState.prim_type` at GS reset | Initializes `prim_type = PrimitiveType::Point` (`queue_len = 0`) at GS reset rather than discarding vertex kicks issued before the first `PRIM` write. | `crates/ps2-gs/src/raster.rs` (`RasterizerState::new`) | Confirm whether real GS defaults `PRIM` to `0` (`Point`) or ignores kicks until `PRIM` is written. |
+| `G-016` | `GUESS` / `SEARCH-ONLY` | Step 2.5 | PCRTC `320x240` non-interlaced display registers (`PMODE`, `SMODE1`, `SMODE2`, `DISPFB1`, `DISPLAY1`, `BGCOLOR`) & alpha independence | See detailed field-by-field breakdown and alpha merge analysis below (`PMODE = 0x0000_0000_0000_FFA5`, `SMODE1 = 0x0000_0007_4080_4504`, `SMODE2 = 0`, `DISPFB1 = 0x0000_0000_0000_0A00` for `FBP=0, FBW=5`, `DISPLAY1 = 0x000E_F9FF_0381_927C` for `320x240`, `BGCOLOR = 0`). | `crates/ps2-gs-runner/src/elf_emit.rs` (`default_display_regs`, tests), `docs/PCSX2_COMPARE.md` | Verify PCSX2 boots no-syscall ELFs without `SetGsCrt`, produces unscaled `320x240` (or integer-upscaled) screenshots with `A=0x80` pixels undimmed, and check `PMODE.ALP = 0xFF` (`255/256` vs `255/255`) LSB behavior. |
+
+## `G-016` Field-by-Field Register Breakdown & Alpha Analysis (`320x240` `FBP=0, FBW=5, PSMCT32`)
+
+Every bit offset below was verified from `FETCHED` sources (`ps2sdk` `common/include/gs_privileged.h`, `ee/libgs/include/libgs.h`, `ee/graph/src/graph_mode.c`, `Play! GSHandler.h` / `GSHandler.cpp`, and `paraLLEl-GS` technical write-up); chosen mode constants for skipping BIOS `SetGsCrt` (`SMODE1` PLL/NTSC, `DX/DY`, `PMODE.ALP/SLBG`) are labeled `GUESS` / `SEARCH-ONLY`:
+
+- **`PMODE` (`0x1200_0000`) = `0x0000_0000_0000_FFA5`** (`FETCHED` layout; `ALP=0xFF`, `SLBG=1`, `MMOD=1` chosen to avoid `A=0x80` dimming):
+  - `EN1` (bit `0`) = `1` (enable Read Circuit 1)
+  - `EN2` (bit `1`) = `0` (disable Read Circuit 2)
+  - `CRTMD` (`bits 2..=4`) = `1` (`0b001`, standard CRT output; required non-zero on real GS)
+  - `MMOD` (bit `5`) = `1` (use `PMODE.ALP` constant alpha for PCRTC merge instead of `RC1` framebuffer alpha)
+  - `AMOD` (bit `6`) = `0` (`OUT1` alpha selector; unused by PCRTC color output)
+  - `SLBG` (bit `7`) = `1` (blend `RC1` against `BGCOLOR`, not `RC2`)
+  - `ALP` (`bits 8..=15`) = `0xFF` (fixed blend factor `0xFF`)
+  - Note: earlier draft `0x0000_0000_0000_FF85` omitted bit `5` (`0x20`), leaving `MMOD = 0`.
+- **Alpha independence (`A = 0x80` in fixtures `04`–`10`)**:
+  - Per `FETCHED` `paraLLEl-GS` / `ps2sdk` PCRTC merge circuit docs, the display output blends `OUT = alpha * RC1 + (1 - alpha) * BG_or_RC2`.
+  - When `MMOD = 0`, `alpha` comes from `RC1.A` (each pixel's alpha byte in `PSMCT32` VRAM). Because fixtures `04`–`10` follow standard GS convention (`A = 0x80`), **`MMOD = 0` or `ALP = 0x80` with `BGCOLOR = 0` dims every pixel to ~50% brightness** (`128/255` or `128/128` depending on hardware/emulator scaling) and turns `A = 0x00` pixels completely black.
+  - Setting **`MMOD = 1`, `SLBG = 1`, `ALP = 0xFF`, `BGCOLOR = 0`** forces `alpha` to fixed `0xFF` (`BG` weight `0`), making displayed RGB independent of framebuffer `A`.
+  - Diagnostic signatures if an implementation's `ALP` normalization differs from exact `1.0`: `(C * 0xFF) / 256` causes a systematic **`-1` LSB** across all channels (uniform yellow diff even on flat `04_sprite_flat`); `(C * 0xFF) >> 7` without `1.0` saturation causes ~`2x` over-brightening; `(C * ALP) / 255` yields `0` delta.
+- **`SMODE1` (`0x1200_0010`) = `0x0000_0007_4080_4504`** (`FETCHED` layout in `libgs.h`; NTSC PLL values `FETCHED` in `ps2sdk/graph_mode.c`; effectiveness without `SetGsCrt` is `GUESS`):
+  - `RC=4` (`0..=2`), `LC=32` (`3..=9`), `T1248=1` (`10..=11`), `SLCK=0` (`12`), `CMOD=2` [NTSC] (`13..=14`), `EX=0` (`15`), `PRST=0` (`16`), `SINT=0` (`17`), `XPCK=0` (`18`), `PCK2=0` (`19..=20`), `SPML=4` (`21..=24`), `GCONT=0` (`25`), `PHS=0` (`26`), `PVS=0` (`27`), `PEHS=0` (`28`), `PEVS=0` (`29`), `CLKSEL=1` (`30..=31`), `NVCK=1` (`32`), `SLCK2=1` (`33`), `VCKSEL=1` (`34..=35`), `VHP=0` (`36..=37`).
+- **`SMODE2` (`0x1200_0020`) = `0x0000_0000_0000_0000`** (`FETCHED` layout; progressive choice `SEARCH-ONLY`/`GUESS`):
+  - `INT=0` (bit `0`, non-interlaced), `FFMD=0` (bit `1`), `DPMS=0` (`bits 2..=3`, on).
+- **`DISPFB1` (`0x1200_0070`) = `0x0000_0000_0000_0A00`** for `FBP=0, FBW=5, PSMCT32` (`FETCHED`):
+  - `FBP` (`bits 0..=8`) = `bp_blocks / 32` (`0`), `FBW` (`bits 9..=14`) = `bw` (`5`, i.e. `320 px`), `PSM` (`bits 15..=19`) = `0` (`PSMCT32`), `DBX` (`bits 32..=42`) = `0`, `DBY` (`bits 43..=53`) = `0`.
+- **`DISPLAY1` (`0x1200_0080`) = `0x000E_F9FF_0381_927C`** for `320x240` (`FETCHED` layout & `(DW+1)/(MAGH+1) x (DH+1)/(MAGV+1)` formula; `DX/DY` framing `GUESS`):
+  - `DX` (`bits 0..=11`) = `636` (`0x27C`), `DY` (`bits 12..=22`) = `25` (`0x19`), `MAGH` (`bits 23..=26`) = `7` (`8` VCK/pixel so `320 * 8 = 2560` NTSC VCK active width), `MAGV` (`bits 27..=28`) = `0`, `DW` (`bits 32..=43`) = `2559` (`0x9FF`), `DH` (`bits 44..=54`) = `239` (`0xEF`).
+- **`BGCOLOR` (`0x1200_00E0`) = `0x0000_0000_0000_0000`** (`FETCHED`): `R=0` (`0..=7`), `G=0` (`8..=15`), `B=0` (`16..=23`).
+
+## Probe Predictions (`tests/gs_probes/10_subpixel_probe.gsp`, frozen pre-measurement)
+
+Written **before** emitting any PCSX2 ELF or capturing any PCSX2 screenshot, so observations in Step 4 cannot retroactively adjust expectations (`320x240` `PSMCT32`, `XYOFFSET_1 = (2048.0, 2048.0)`):
+
+1. **Subpixel `Point` (`PRIM = 0`, `G-009`)**:
+   - `P0 (20.0, 20.0)`: both `IntegerCenter` and `HalfPixelCenter` predict **`(20, 20)`**.
+   - `P1 (36.4375, 20.0)`: both `IntegerCenter` and `HalfPixelCenter` predict **`(36, 20)`**.
+   - `P2 (52.5, 20.0)`: `ps2-gs` (`IntegerCenter` half-up `(coord_fp + 8) >> 4`) predicts **`(53, 20)`**; `IntegerCenter` half-down or `HalfPixelCenter` (`floor`) predicts **`(52, 20)`**.
+   - `P3 (68.5625, 20.0)`: `ps2-gs` (`IntegerCenter`) predicts **`(69, 20)`**; `HalfPixelCenter` (`floor`) predicts **`(68, 20)`** (decisive `.5`-free separator).
+   - `P4 (36.0, 40.4375)`: both predict **`(36, 40)`**.
+   - `P5 (52.0, 40.5)`: `ps2-gs` predicts **`(52, 41)`**; half-down / `HalfPixelCenter` predicts **`(52, 40)`**.
+   - `P6 (68.0, 40.5625)`: `ps2-gs` predicts **`(68, 41)`**; `HalfPixelCenter` predicts **`(68, 40)`**.
+
+2. **`Line` Endpoints, Direction, Diagonal Ties, Zero-Length (`PRIM = 1`, `G-011`)**:
+   - `L0 (20,80) -> (28,80)`: `ps2-gs` (`IntegerCenter` inclusive end) draws **`x in 20..=28, y = 80`** (`9` px, including **`(28, 80)`**); half-open convention drops `(28, 80)` (`x in 20..=27`, `8` px).
+   - `L1 (58,80) -> (50,80)` (reversed): `ps2-gs` draws **`x in 50..=58, y = 80`** (`9` px, both endpoints drawn); un-sorted half-open drops `(50, 80)` (`x in 51..=58`, `8` px).
+   - `L2 (90,76) -> (90,84)` (vertical): `ps2-gs` draws **`x = 90, y in 76..=84`** (`9` px, including **`(90, 84)`**); half-open drops `(90, 84)`.
+   - `L3 (20,110) -> (28,114)` (slope `0.5` Bresenham tie-break): `ps2-gs` draws `9` pixels `(20,110), (21,111), (22,111), (23,112), (24,112), (25,113), (26,113), (27,114), (28,114)` (half-up on exact `.5` minor steps + inclusive end `(28,114)`). Half-down tie-breaks would yield `(21,110)` instead of `(21,111)` (similarly at `x=23,25,27`).
+   - `L4 (50,118) -> (54,110)` (steep negative `dY`): `ps2-gs` draws `9` pixels `(50,118), (51,117), (51,116), (52,115), (52,114), (53,113), (53,112), (54,111), (54,110)`.
+   - `L5 (80,110) -> (80,110)` (zero-length): `ps2-gs` draws **`(80, 110)`** (`1` px); half-open line (`line_includes_end = false`) draws **`0` pixels**.
+
+3. **`Sprite` Corner Order & Subpixel Bounds (`PRIM = 6`, `G-010`)**:
+   - `S0 (20,150) -> (28,158)`: `ps2-gs` draws `8x8` square **`x in 20..=27, y in 150..=157`**.
+   - `S1 (58,158) -> (50,150)` (reversed corners `x1 < x0, y1 < y0`): `ps2-gs` normalizes `min/max` and draws `8x8` square **`x in 50..=57, y in 150..=157`**; if real GS does not swap reversed corners and requires `v0 < v1`, `S1` produces **`0` pixels**.
+   - `S2 (80.5,150.0) -> (84.5,154.0)` (subpixel `[min, max)` bounds): `ps2-gs` (`IntegerCenter` sample at `(px, py)`) draws **`x in 81..=84, y in 150..=153`** (`4x4`); `HalfPixelCenter` (`sample at (px+0.5, py+0.5)`) shifts 1 px left to **`x in 80..=83, y in 150..=153`** (`4x4`).
 
 > Note: Step 3 will add textures (`TEX0`/`TEX1`/`CLAMP`/`MIPTBP`), CLUTs (`TEXCLUT`/`TRXDIR`), fog (`FGE`/`FOGCOL`), alpha blending (`ABE`/`ALPHA`), alpha/dest tests (`ATE`/`DATE`), dithering (`DTHE`/`DIMX`), and `COLCLAMP`/`FBA`.
