@@ -192,6 +192,11 @@ fn verify_03_local_to_local_dir(gs: &GsState) -> Result<(), String> {
 }
 
 fn verify_04_sprite_flat(gs: &GsState) -> Result<(), String> {
+    // Hand-derived coverage under half-open [min_x, max_x) x [min_y, max_y) with last-vertex color:
+    //   Sprite 1: [0, 320) x [0, 240) -> BG    (0x8024_1814)
+    //   Sprite 2: [32, 144) x [40, 160) -> AMBER (0x8020_90E8; v0 dummy red ignored)
+    //   Sprite 3: [112, 288) x [88, 208) -> TEAL  (0x809C_A828; overwrites amber on [112,144)x[88,160))
+    //   Sprite 4: [16, 24) x [16, 24) -> WHITE (0x80FF_FFFF)
     const BG: u32 = 0x8024_1814;
     const AMBER: u32 = 0x8020_90E8;
     const TEAL: u32 = 0x809C_A828;
@@ -459,27 +464,39 @@ fn verify_06_triangle_gouraud(gs: &GsState) -> Result<(), String> {
 }
 
 fn verify_07_ztest_overlap(gs: &GsState) -> Result<(), String> {
-    // Crossing depth triangles: left favors blue Tri A (higher Z on left), right favors orange Tri B.
-    let left_px = gs
-        .vram
-        .read_page_pixel_raw(PixelFormat::Psmct32, 0, 5, 96, 136);
-    let left_r = left_px & 0xFF;
-    let left_b = (left_px >> 16) & 0xFF;
-    if left_b <= left_r {
-        return Err(format!(
-            "left crossing pixel (96,136) expected blue > red, got {left_px:#010X}"
-        ));
-    }
-    let right_px = gs
-        .vram
-        .read_page_pixel_raw(PixelFormat::Psmct32, 0, 5, 224, 136);
-    let right_r = right_px & 0xFF;
-    let right_b = (right_px >> 16) & 0xFF;
-    if right_r <= right_b {
-        return Err(format!(
-            "right crossing pixel (224,136) expected red > blue, got {right_px:#010X}"
-        ));
-    }
+    // Hand-derived crossing-depth barycentric intersection (`TEST_1` = GEQUAL, bg Z = 0, ZMSK = 0):
+    //   Tri A: v0=(40,48) Z=1000 #2060FF, v1=(264,144) Z=100 #20E0FF, v2=(40,224) Z=1000 #1040D0
+    //     area2_px = 224 * 176 = 39424.
+    //     At (96, 136): (e0, e1, e2) = (15232, 9856, 14336) = 896 * (17, 11, 16), sum = 44*896.
+    //       Z_A = (17*1000 + 11*100 + 16*1000)/44 = 34100/44 = 775.
+    //       R_A = (17*32 + 11*32 + 16*16)/44 = 1152/44 = 26 (0x1A).
+    //       G_A = (17*96 + 11*224 + 16*64)/44 = 5120/44 = 116 (0x74).
+    //       B_A = (17*255 + 11*255 + 16*208)/44 = 10468/44 = 237 (0xED) -> 0x80ED_741A.
+    //   Tri B: v0=(280,48) Z=1000 #FF8010, v1=(280,224) Z=1000 #E04010, v2=(56,144) Z=100 #FFC030
+    //     At (96, 136): (e0, e1, e2) = (4992, 2048, 32384) => Z_B = 10278400/39424 = 260 < 775 (FAILS!).
+    //     At (224, 136) (symmetric mirror): Tri A gives Z_A = 260; Tri B gives weights (17, 16, 11)/44,
+    //       Z_B = 775 >= 260 (PASSES!):
+    //       R_B = (17*255 + 16*224 + 11*255)/44 = 10724/44 = 243 (0xF3).
+    //       G_B = (17*128 + 16*64 + 11*192)/44 = 5312/44 = 120 (0x78).
+    //       B_B = (17*16 + 16*16 + 11*48)/44 = 1056/44 = 24 (0x18) -> 0x8018_78F3.
+    expect_pixel(
+        gs,
+        PixelFormat::Psmct32,
+        0,
+        5,
+        (96, 136),
+        0x80ED_741A,
+        "left crossing pixel (Tri A Z=775 > Tri B Z=260)",
+    )?;
+    expect_pixel(
+        gs,
+        PixelFormat::Psmct32,
+        0,
+        5,
+        (224, 136),
+        0x8018_78F3,
+        "right crossing pixel (Tri B Z=775 >= Tri A Z=260)",
+    )?;
 
     // Control band: Box 0 NEVER (stays green 0x8050_C030), Box 1 ZMSK=1 allows Z=600 yellow (0x8030_F0F0),
     // Box 2 GEQUAL eq passes yellow (0x8030_F0F0), Box 3 GREATER eq fails green / Z=501 passes blue (0x80FF_6030).
@@ -582,7 +599,13 @@ fn verify_08_scissor_clip(gs: &GsState) -> Result<(), String> {
         BG,
         "outside scissor right",
     )?;
-    // Inside scissor [40..=279] x [30..=209]: coral banner at (50, 40), Gouraud triangle center.
+    // Inside scissor [40..=279] x [30..=209]: coral banner at (50, 40), Gouraud triangle at (160, 30).
+    // Hand derivation at (160, 30) after subtracting XYOFFSET=(2048,2048):
+    //   v0=(160,0) RGB=(255,224,48), v1=(318,238) RGB=(64,224,255), v2=(2,238) RGB=(192,64,255).
+    //   area2_px = 2 * 158 * 238 = 75208. At (160,30): e0=316*208, e1=158*30, e2=158*30 -> (208,15,15)/238.
+    //   R = (208*255 + 15*64 + 15*192)/238 = 56880/238 = 238 (0xEE)
+    //   G = (208*224 + 15*224 + 15*64)/238 = 50912/238 = 213 (0xD5)
+    //   B = (208*48 + 15*255 + 15*255)/238 = 17634/238 = 74  (0x4A), A = 0x80 -> 0x804A_D5EE.
     expect_pixel(
         gs,
         PixelFormat::Psmct32,
@@ -592,14 +615,15 @@ fn verify_08_scissor_clip(gs: &GsState) -> Result<(), String> {
         CORAL,
         "clipped banner",
     )?;
-    let tri_top_clip = gs
-        .vram
-        .read_page_pixel_raw(PixelFormat::Psmct32, 0, 5, 160, 30);
-    if tri_top_clip == BG || tri_top_clip == CORAL {
-        return Err(format!(
-            "clipped triangle apex at (160,30) expected interpolated color, got {tri_top_clip:#010X}"
-        ));
-    }
+    expect_pixel(
+        gs,
+        PixelFormat::Psmct32,
+        0,
+        5,
+        (160, 30),
+        0x804A_D5EE,
+        "clipped triangle apex interpolation",
+    )?;
     Ok(())
 }
 

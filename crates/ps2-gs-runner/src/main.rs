@@ -36,6 +36,10 @@ struct Cli {
     /// Export 4-channel RGBA PNG instead of opaque RGB (preserves GS destination alpha).
     #[arg(long)]
     rgba: bool,
+
+    /// Integer nearest-neighbor upscale factor (`N >= 1`) applied to exported PNG dimensions.
+    #[arg(long, default_value_t = 1, value_name = "N", value_parser = parse_nonzero_scale)]
+    scale: u32,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -98,6 +102,8 @@ enum RunnerError {
     MissingSurface(String),
     #[error("unsupported PNG dump pixel format {0:?} (expected 32/24/16-bit color/Z format)")]
     UnsupportedFormat(PixelFormat),
+    #[error("invalid PNG scale factor {0} (must be >= 1 and fit u32 dimensions)")]
+    InvalidScale(u32),
     #[error("I/O error writing '{path}': {source}")]
     WriteIo {
         path: String,
@@ -110,6 +116,14 @@ enum RunnerError {
         #[source]
         source: png::EncodingError,
     },
+}
+
+fn parse_nonzero_scale(token: &str) -> Result<u32, String> {
+    let scale = parse_u32_lit(token)?;
+    if scale == 0 {
+        return Err("scale factor must be >= 1".to_string());
+    }
+    Ok(scale)
 }
 
 fn parse_u32_lit(token: &str) -> Result<u32, String> {
@@ -179,29 +193,52 @@ fn encode_framebuffer_png<W: Write>(
     gs: &GsState,
     rect: DumpRect,
     rgba: bool,
+    scale: u32,
     writer: W,
     label: &str,
 ) -> Result<(), RunnerError> {
+    if scale == 0 {
+        return Err(RunnerError::InvalidScale(scale));
+    }
+    let out_w = rect
+        .width
+        .checked_mul(scale)
+        .ok_or(RunnerError::InvalidScale(scale))?;
+    let out_h = rect
+        .height
+        .checked_mul(scale)
+        .ok_or(RunnerError::InvalidScale(scale))?;
+
     let channels = if rgba { 4 } else { 3 };
-    let total = (rect.width as usize) * (rect.height as usize) * channels;
+    let total = (out_w as usize)
+        .checked_mul(out_h as usize)
+        .and_then(|px| px.checked_mul(channels))
+        .ok_or(RunnerError::InvalidScale(scale))?;
     let mut pixels = Vec::with_capacity(total);
+    let mut scaled_row = Vec::with_capacity((out_w as usize) * channels);
 
     for y in 0..rect.height {
+        scaled_row.clear();
         for x in 0..rect.width {
             let raw = gs
                 .vram
                 .read_pixel_raw(rect.format, rect.bp_blocks, rect.bw, x, y);
             let [r, g, b, a] = decode_pixel_rgba8(raw, rect.format)?;
-            pixels.push(r);
-            pixels.push(g);
-            pixels.push(b);
-            if rgba {
-                pixels.push(a);
+            for _ in 0..scale {
+                scaled_row.push(r);
+                scaled_row.push(g);
+                scaled_row.push(b);
+                if rgba {
+                    scaled_row.push(a);
+                }
             }
+        }
+        for _ in 0..scale {
+            pixels.extend_from_slice(&scaled_row);
         }
     }
 
-    let mut encoder = png::Encoder::new(writer, rect.width, rect.height);
+    let mut encoder = png::Encoder::new(writer, out_w, out_h);
     encoder.set_color(if rgba {
         png::ColorType::Rgba
     } else {
@@ -299,7 +336,14 @@ fn run(cli: Cli) -> Result<(), RunnerError> {
             path: out_str.clone(),
             source,
         })?;
-        encode_framebuffer_png(&gs, rect, cli.rgba, BufWriter::new(file), &out_str)?;
+        encode_framebuffer_png(
+            &gs,
+            rect,
+            cli.rgba,
+            cli.scale,
+            BufWriter::new(file),
+            &out_str,
+        )?;
         println!("wrote {}", out_path.display());
     }
 
@@ -381,7 +425,7 @@ mod tests {
 
         // Default opaque RGB export (R=0xFF, G=0x22, B=0x11 inside [0..2)x[0..2), black outside).
         let mut rgb_png = Vec::new();
-        encode_framebuffer_png(&gs, rect, false, &mut rgb_png, "test_rgb").expect("encode rgb");
+        encode_framebuffer_png(&gs, rect, false, 1, &mut rgb_png, "test_rgb").expect("encode rgb");
         let (info, rgb_pixels) = decode_png_bytes(&rgb_png);
         assert_eq!(info.width, 4);
         assert_eq!(info.height, 4);
@@ -395,7 +439,8 @@ mod tests {
 
         // RGBA mode preserves GS alpha byte 0x80.
         let mut rgba_png = Vec::new();
-        encode_framebuffer_png(&gs, rect, true, &mut rgba_png, "test_rgba").expect("encode rgba");
+        encode_framebuffer_png(&gs, rect, true, 1, &mut rgba_png, "test_rgba")
+            .expect("encode rgba");
         let (info_a, rgba_pixels) = decode_png_bytes(&rgba_png);
         assert_eq!(info_a.color_type, png::ColorType::Rgba);
         assert_eq!(&rgba_pixels[0..4], &[0xFF, 0x22, 0x11, 0x80]);
@@ -412,8 +457,62 @@ mod tests {
             height: 2,
         };
         let mut png16 = Vec::new();
-        encode_framebuffer_png(&gs16, rect16, true, &mut png16, "test_16").expect("encode 16");
+        encode_framebuffer_png(&gs16, rect16, true, 1, &mut png16, "test_16").expect("encode 16");
         let (_, pixels16) = decode_png_bytes(&png16);
         assert_eq!(&pixels16[0..4], &[0xFF, 0x00, 0x00, 0xFF]);
+    }
+
+    #[test]
+    fn nearest_neighbor_scale_replicates_pixels_and_rejects_zero() {
+        let mut gs = GsState::new();
+        // Distinct 2x2 pattern in PSMCT32:
+        // (0,0)=#11223344, (1,0)=#55667788, (0,1)=#99AABBCC, (1,1)=#DDEEFF00
+        gs.vram
+            .write_page_pixel_raw(PixelFormat::Psmct32, 0, 1, 0, 0, 0x4433_2211);
+        gs.vram
+            .write_page_pixel_raw(PixelFormat::Psmct32, 0, 1, 1, 0, 0x8877_6655);
+        gs.vram
+            .write_page_pixel_raw(PixelFormat::Psmct32, 0, 1, 0, 1, 0xCCBB_AA99);
+        gs.vram
+            .write_page_pixel_raw(PixelFormat::Psmct32, 0, 1, 1, 1, 0x00FF_EEDD);
+
+        let rect = DumpRect {
+            bp_blocks: 0,
+            bw: 1,
+            format: PixelFormat::Psmct32,
+            width: 2,
+            height: 2,
+        };
+        let mut png_scaled = Vec::new();
+        encode_framebuffer_png(&gs, rect, true, 3, &mut png_scaled, "test_scale3")
+            .expect("encode 3x");
+        let (info, px) = decode_png_bytes(&png_scaled);
+        assert_eq!(info.width, 6);
+        assert_eq!(info.height, 6);
+        assert_eq!(info.color_type, png::ColorType::Rgba);
+
+        for sy in 0..6u32 {
+            for sx in 0..6u32 {
+                let expected = match (sx / 3, sy / 3) {
+                    (0, 0) => [0x11, 0x22, 0x33, 0x44],
+                    (1, 0) => [0x55, 0x66, 0x77, 0x88],
+                    (0, 1) => [0x99, 0xAA, 0xBB, 0xCC],
+                    (1, 1) => [0xDD, 0xEE, 0xFF, 0x00],
+                    _ => unreachable!(),
+                };
+                let idx = ((sy * 6 + sx) * 4) as usize;
+                assert_eq!(&px[idx..idx + 4], &expected, "pixel ({sx}, {sy})");
+            }
+        }
+
+        let mut png_zero = Vec::new();
+        assert!(matches!(
+            encode_framebuffer_png(&gs, rect, false, 0, &mut png_zero, "test_zero"),
+            Err(RunnerError::InvalidScale(0))
+        ));
+        assert!(Cli::try_parse_from(["ps2-gs-runner", "--scale", "0", "dummy.gsp"]).is_err());
+        let parsed =
+            Cli::try_parse_from(["ps2-gs-runner", "--scale", "4", "dummy.gsp"]).expect("scale 4");
+        assert_eq!(parsed.scale, 4);
     }
 }
