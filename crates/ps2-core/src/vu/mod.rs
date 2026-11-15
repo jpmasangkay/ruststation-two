@@ -1,5 +1,6 @@
 //! Vector Units (`VU0` and `VU1`) state and micro/macro execution support.
 
+pub mod efu;
 pub mod micro;
 pub mod pipeline;
 pub mod state;

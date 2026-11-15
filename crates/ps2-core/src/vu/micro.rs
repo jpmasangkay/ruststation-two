@@ -1155,7 +1155,9 @@ pub fn step_micro_liw(vu: &mut VuState, code_mem: &[u8], data_mem: &mut [u8], tp
         let i_val = vu.i;
 
         if (lower & 0x8000_0000) != 0 {
-            exec_shared_lower_op(vu, data_mem, lower);
+            if tpc_mask != super::VU1_TPC_MASK || !super::efu::exec_efu_op(vu, lower) {
+                exec_shared_lower_op(vu, data_mem, lower);
+            }
         } else {
             exec_micro_lower_type789(vu, data_mem, lower, delay_slot_tpc, tpc_mask);
         }
