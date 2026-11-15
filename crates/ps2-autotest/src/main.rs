@@ -34,13 +34,25 @@ struct Args {
     #[arg(long)]
     gate: bool,
 
+    /// Run the 52 hardware autotest suites in headless benchmark mode (no GS repo fixtures required) and print throughput summary.
+    #[arg(long)]
+    bench: bool,
+
+    /// Number of timed iterations for `--bench` (minimum 1).
+    #[arg(long, default_value_t = 3)]
+    bench_runs: usize,
+
     /// Boot the PS2 BIOS image from reset (`0xBFC0_0000`) in coupled `(EE + IOP)` LLE mode until the first blocker.
     #[arg(long)]
     boot_bios: bool,
 
-    /// Path to the `ps2autotests` `tests/` directory.
-    #[arg(long, default_value = "local/ps2autotests/tests")]
-    suite_dir: PathBuf,
+    /// Path to the `ps2autotests` repository root or its `tests/` directory.
+    #[arg(
+        long = "tests-dir",
+        visible_alias = "suite-dir",
+        default_value = "local/ps2autotests/tests"
+    )]
+    tests_dir: PathBuf,
 
     /// Optional path to a 4 MB PS2 BIOS dump directory or file.
     #[arg(long, default_value = "local/bios/scph10000.bin")]
@@ -426,6 +438,103 @@ fn evaluate_gate_outcome(rel_path: &str, is_pass: bool) -> GateOutcome {
     }
 }
 
+/// Accept either `<repo>/tests` directly or a cloned `ps2autotests` repository root containing `tests/cpu`.
+fn resolve_tests_dir(path: &Path) -> PathBuf {
+    let nested = path.join("tests");
+    if !path.join("cpu").exists() && nested.join("cpu").is_dir() {
+        nested
+    } else {
+        path.to_path_buf()
+    }
+}
+
+struct SuiteExecSummary {
+    target_label: &'static str,
+    cycles: u64,
+    ee_cycles: u64,
+    iop_cycles: u64,
+    outcome: GateOutcome,
+    stop_display: String,
+    failure_diff: Option<String>,
+}
+
+fn execute_suite_bytes(
+    rel_path: &str,
+    bin_bytes: &[u8],
+    expected: &str,
+    max_cycles: u64,
+) -> SuiteExecSummary {
+    let (stdout, stop_reason, cycles, ee_cycles, iop_cycles, target_label) =
+        if is_irx_binary(bin_bytes) {
+            match run_irx_bytes(bin_bytes, max_cycles) {
+                Ok(rep) => (
+                    rep.stdout,
+                    rep.stop_reason,
+                    rep.iop_cycles,
+                    0,
+                    rep.iop_cycles,
+                    "IOP",
+                ),
+                Err(err) => {
+                    return SuiteExecSummary {
+                        target_label: "IOP",
+                        cycles: 0,
+                        ee_cycles: 0,
+                        iop_cycles: 0,
+                        outcome: GateOutcome::Fail,
+                        stop_display: format!("LoadError({err})"),
+                        failure_diff: Some(format!("IRX load error: {err}\n")),
+                    };
+                }
+            }
+        } else {
+            match run_elf_bytes(bin_bytes, max_cycles) {
+                Ok(rep) => (rep.stdout, rep.stop_reason, rep.cycles, rep.cycles, 0, "EE"),
+                Err(err) => {
+                    return SuiteExecSummary {
+                        target_label: "EE",
+                        cycles: 0,
+                        ee_cycles: 0,
+                        iop_cycles: 0,
+                        outcome: GateOutcome::Fail,
+                        stop_display: format!("LoadError({err})"),
+                        failure_diff: Some(format!("ELF load error: {err}\n")),
+                    };
+                }
+            }
+        };
+
+    match evaluate_gate_outcome(rel_path, stdout == expected) {
+        GateOutcome::Pass => SuiteExecSummary {
+            target_label,
+            cycles,
+            ee_cycles,
+            iop_cycles,
+            outcome: GateOutcome::Pass,
+            stop_display: stop_reason.to_string(),
+            failure_diff: None,
+        },
+        GateOutcome::Deferred(reason) => SuiteExecSummary {
+            target_label,
+            cycles,
+            ee_cycles,
+            iop_cycles,
+            outcome: GateOutcome::Deferred(reason),
+            stop_display: format!("{stop_reason} ({reason})"),
+            failure_diff: None,
+        },
+        GateOutcome::Fail => SuiteExecSummary {
+            target_label,
+            cycles,
+            ee_cycles,
+            iop_cycles,
+            outcome: GateOutcome::Fail,
+            stop_display: stop_reason.to_string(),
+            failure_diff: Some(format_expected_diff(expected, &stdout)),
+        },
+    }
+}
+
 fn run_hardware_gate(suite_dir: &Path, max_cycles: u64) -> ExitCode {
     let start_time = Instant::now();
     let mut passed_count = 0usize;
@@ -490,59 +599,21 @@ fn run_hardware_gate(suite_dir: &Path, max_cycles: u64) -> ExitCode {
         };
         let expected = normalize_newlines(&expected_raw);
 
-        let (stdout, stop_reason, cycles, target_label) = if is_irx_binary(&bin_bytes) {
-            match run_irx_bytes(&bin_bytes, max_cycles) {
-                Ok(rep) => (rep.stdout, rep.stop_reason, rep.iop_cycles, "IOP"),
-                Err(err) => {
-                    println!(
-                        "| {:>2} | {:<32} | {:<6} | {:<8} | {:>12} | {:<18} |",
-                        idx + 1,
-                        rel_path,
-                        "IOP",
-                        "FAIL",
-                        0,
-                        format!("LoadError({err})")
-                    );
-                    failure_diffs
-                        .push(((*rel_path).to_owned(), format!("IRX load error: {err}\n")));
-                    continue;
-                }
-            }
-        } else {
-            match run_elf_bytes(&bin_bytes, max_cycles) {
-                Ok(rep) => (rep.stdout, rep.stop_reason, rep.cycles, "EE"),
-                Err(err) => {
-                    println!(
-                        "| {:>2} | {:<32} | {:<6} | {:<8} | {:>12} | {:<18} |",
-                        idx + 1,
-                        rel_path,
-                        "EE",
-                        "FAIL",
-                        0,
-                        format!("LoadError({err})")
-                    );
-                    failure_diffs
-                        .push(((*rel_path).to_owned(), format!("ELF load error: {err}\n")));
-                    continue;
-                }
-            }
-        };
-
-        let (status_str, stop_display) = match evaluate_gate_outcome(rel_path, stdout == expected) {
+        let summary = execute_suite_bytes(rel_path, &bin_bytes, &expected, max_cycles);
+        let status_str = match summary.outcome {
             GateOutcome::Pass => {
                 passed_count += 1;
-                ("PASS", stop_reason.to_string())
+                "PASS"
             }
-            GateOutcome::Deferred(reason) => {
+            GateOutcome::Deferred(_) => {
                 deferred_count += 1;
-                ("DEFERRED", format!("{stop_reason} ({reason})"))
+                "DEFERRED"
             }
             GateOutcome::Fail => {
-                failure_diffs.push((
-                    (*rel_path).to_owned(),
-                    format_expected_diff(&expected, &stdout),
-                ));
-                ("FAIL", stop_reason.to_string())
+                if let Some(diff) = summary.failure_diff {
+                    failure_diffs.push(((*rel_path).to_owned(), diff));
+                }
+                "FAIL"
             }
         };
 
@@ -550,10 +621,10 @@ fn run_hardware_gate(suite_dir: &Path, max_cycles: u64) -> ExitCode {
             "| {:>2} | {:<32} | {:<6} | {:<8} | {:>12} | {:<18} |",
             idx + 1,
             rel_path,
-            target_label,
+            summary.target_label,
             status_str,
-            cycles,
-            stop_display
+            summary.cycles,
+            summary.stop_display
         );
     }
 
@@ -575,6 +646,249 @@ fn run_hardware_gate(suite_dir: &Path, max_cycles: u64) -> ExitCode {
         }
         return ExitCode::FAILURE;
     }
+
+    ExitCode::SUCCESS
+}
+
+struct LoadedGateSuite {
+    rel_path: &'static str,
+    bin_bytes: Vec<u8>,
+    expected: String,
+}
+
+fn load_gate_suite_bucket(
+    tests_dir: &Path,
+    suites: &[&'static str],
+) -> Result<Vec<LoadedGateSuite>, String> {
+    let mut loaded = Vec::with_capacity(suites.len());
+    for &rel_path in suites {
+        let full_path = tests_dir.join(rel_path);
+        let expected_path = full_path.with_extension("expected");
+        let bin_bytes = fs::read(&full_path)
+            .map_err(|err| format!("failed to read {}: {err}", full_path.display()))?;
+        let expected_raw = fs::read_to_string(&expected_path)
+            .map_err(|err| format!("failed to read {}: {err}", expected_path.display()))?;
+        loaded.push(LoadedGateSuite {
+            rel_path,
+            bin_bytes,
+            expected: normalize_newlines(&expected_raw),
+        });
+    }
+    Ok(loaded)
+}
+
+#[derive(Default)]
+struct BucketRunTotals {
+    cycles: u64,
+    ee_cycles: u64,
+    iop_cycles: u64,
+    passed: usize,
+    deferred: usize,
+    failures: Vec<(String, String)>,
+}
+
+fn run_loaded_bucket(suites: &[LoadedGateSuite], max_cycles: u64) -> BucketRunTotals {
+    let mut totals = BucketRunTotals::default();
+    for suite in suites {
+        let summary = execute_suite_bytes(
+            suite.rel_path,
+            &suite.bin_bytes,
+            &suite.expected,
+            max_cycles,
+        );
+        totals.cycles += summary.cycles;
+        totals.ee_cycles += summary.ee_cycles;
+        totals.iop_cycles += summary.iop_cycles;
+        match summary.outcome {
+            GateOutcome::Pass => totals.passed += 1,
+            GateOutcome::Deferred(_) => totals.deferred += 1,
+            GateOutcome::Fail => {
+                let detail = summary
+                    .failure_diff
+                    .unwrap_or_else(|| summary.stop_display.clone());
+                totals.failures.push((suite.rel_path.to_owned(), detail));
+            }
+        }
+    }
+    totals
+}
+
+/// Return `(best_min, median, worst_max)` elapsed seconds over non-empty positive duration samples.
+fn summarize_secs(samples: &[f64]) -> (f64, f64, f64) {
+    if samples.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let n = sorted.len();
+    let median = if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        0.5 * (sorted[n / 2 - 1] + sorted[n / 2])
+    };
+    (sorted[0], median, sorted[n - 1])
+}
+
+fn mcycles_per_sec(cycles: u64, secs: f64) -> f64 {
+    if secs > 0.0 {
+        (cycles as f64) / 1_000_000.0 / secs
+    } else {
+        0.0
+    }
+}
+
+fn format_commas(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (idx, ch) in digits.chars().rev().enumerate() {
+        if idx > 0 && idx % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+fn run_bench(tests_dir: &Path, max_cycles: u64, bench_runs: usize) -> ExitCode {
+    if !tests_dir.is_dir() {
+        eprintln!(
+            "ERROR: tests directory {} does not exist; pass --tests-dir <path> (ps2autotests repo root or its tests/ subdirectory)",
+            tests_dir.display()
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let phase1 = match load_gate_suite_bucket(tests_dir, &PHASE1_HW_GATE_SUITES) {
+        Ok(suites) => suites,
+        Err(err) => {
+            eprintln!("ERROR: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let phase2a = match load_gate_suite_bucket(tests_dir, &PHASE2A_HW_GATE_SUITES) {
+        Ok(suites) => suites,
+        Err(err) => {
+            eprintln!("ERROR: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let runs = bench_runs.max(1);
+    let total_suites = phase1.len() + phase2a.len();
+    let mut p1_times = Vec::with_capacity(runs);
+    let mut p2_times = Vec::with_capacity(runs);
+    let mut total_times = Vec::with_capacity(runs);
+    let mut run_records = Vec::with_capacity(runs);
+
+    let mut total_ee_cycles = 0u64;
+    let mut total_iop_cycles = 0u64;
+    let mut p1_cycles = 0u64;
+    let mut p2_cycles = 0u64;
+    let mut passed_count = 0usize;
+    let mut deferred_count = 0usize;
+    let mut failed_count = 0usize;
+
+    for run_idx in 0..runs {
+        let p1_start = Instant::now();
+        let p1_tot = run_loaded_bucket(&phase1, max_cycles);
+        let p1_secs = p1_start.elapsed().as_secs_f64();
+
+        let p2_start = Instant::now();
+        let p2_tot = run_loaded_bucket(&phase2a, max_cycles);
+        let p2_secs = p2_start.elapsed().as_secs_f64();
+
+        let run_secs = p1_secs + p2_secs;
+        let run_cycles = p1_tot.cycles + p2_tot.cycles;
+
+        if run_idx == 0 {
+            total_ee_cycles = p1_tot.ee_cycles + p2_tot.ee_cycles;
+            total_iop_cycles = p1_tot.iop_cycles + p2_tot.iop_cycles;
+            p1_cycles = p1_tot.cycles;
+            p2_cycles = p2_tot.cycles;
+            passed_count = p1_tot.passed + p2_tot.passed;
+            deferred_count = p1_tot.deferred + p2_tot.deferred;
+            failed_count = p1_tot.failures.len() + p2_tot.failures.len();
+        }
+
+        if !p1_tot.failures.is_empty() || !p2_tot.failures.is_empty() {
+            for (suite, diff) in p1_tot.failures.iter().chain(p2_tot.failures.iter()) {
+                eprintln!(
+                    "\n--- BENCH FAILURE ({suite}, run {}) ---\n{diff}",
+                    run_idx + 1
+                );
+            }
+            return ExitCode::FAILURE;
+        }
+
+        p1_times.push(p1_secs);
+        p2_times.push(p2_secs);
+        total_times.push(run_secs);
+        run_records.push((run_idx + 1, run_secs, run_cycles, p1_secs, p2_secs));
+    }
+
+    let total_cycles = total_ee_cycles + total_iop_cycles;
+    let (best_s, med_s, worst_s) = summarize_secs(&total_times);
+    let (p1_best_s, p1_med_s, _) = summarize_secs(&p1_times);
+    let (p2_best_s, p2_med_s, _) = summarize_secs(&p2_times);
+
+    println!("=== PS2-AUTOTEST BENCHMARK (Phase 1 + Phase 2a, headless interpreter) ===");
+    println!("Tests dir   : {}", tests_dir.display());
+    println!(
+        "Suites      : {} ({} Phase 1 + {} Phase 2a) | Measured runs: {}",
+        total_suites,
+        phase1.len(),
+        phase2a.len(),
+        runs
+    );
+    println!(
+        "Cycles/run  : {} EE + {} IOP = {} total",
+        format_commas(total_ee_cycles),
+        format_commas(total_iop_cycles),
+        format_commas(total_cycles)
+    );
+    println!(
+        "  Phase 1   : {} cycles ({} suites)",
+        format_commas(p1_cycles),
+        phase1.len()
+    );
+    println!(
+        "  Phase 2a  : {} cycles ({} suites)",
+        format_commas(p2_cycles),
+        phase2a.len()
+    );
+    for (num, run_s, run_cycles, p1_s, p2_s) in run_records {
+        println!(
+            "  Run {:>2}    : {:.3} s ({:.2} Mcycles/s) [Phase 1: {:.3} s, Phase 2a: {:.3} s]",
+            num,
+            run_s,
+            mcycles_per_sec(run_cycles, run_s),
+            p1_s,
+            p2_s
+        );
+    }
+    println!(
+        "Summary     : Median {:.3} s ({:.2} Mcycles/s) | Best {:.3} s ({:.2} Mcycles/s) | Worst {:.3} s ({:.2} Mcycles/s)",
+        med_s,
+        mcycles_per_sec(total_cycles, med_s),
+        best_s,
+        mcycles_per_sec(total_cycles, best_s),
+        worst_s,
+        mcycles_per_sec(total_cycles, worst_s)
+    );
+    println!(
+        "Breakdown   : Phase 1 median {:.3} s ({:.2} Mcycles/s), best {:.3} s ({:.2} Mcycles/s) | Phase 2a median {:.3} s ({:.2} Mcycles/s), best {:.3} s ({:.2} Mcycles/s)",
+        p1_med_s,
+        mcycles_per_sec(p1_cycles, p1_med_s),
+        p1_best_s,
+        mcycles_per_sec(p1_cycles, p1_best_s),
+        p2_med_s,
+        mcycles_per_sec(p2_cycles, p2_med_s),
+        p2_best_s,
+        mcycles_per_sec(p2_cycles, p2_best_s)
+    );
+    println!(
+        "Correctness : {passed_count}/{total_suites} PASSED, {deferred_count} DEFERRED, {failed_count} FAILED"
+    );
 
     ExitCode::SUCCESS
 }
@@ -994,13 +1308,19 @@ fn main() -> ExitCode {
         return run_single_elf_file(elf_path, args.max_cycles);
     }
 
-    if args.gate || args.suite_dir.exists() {
-        return run_hardware_gate(&args.suite_dir, args.max_cycles);
+    let resolved_tests_dir = resolve_tests_dir(&args.tests_dir);
+
+    if args.bench {
+        return run_bench(&resolved_tests_dir, args.max_cycles, args.bench_runs);
+    }
+
+    if args.gate || resolved_tests_dir.exists() {
+        return run_hardware_gate(&resolved_tests_dir, args.max_cycles);
     }
 
     eprintln!(
-        "ERROR: suite directory {} does not exist; pass --suite-dir <path> or a single test binary",
-        args.suite_dir.display()
+        "ERROR: tests directory {} does not exist; pass --tests-dir <path> (or --suite-dir <path>) or a single test binary",
+        args.tests_dir.display()
     );
     ExitCode::FAILURE
 }
@@ -1257,5 +1577,55 @@ mod tests {
             evaluate_gate_outcome("cpu/ee/alu.elf", false),
             GateOutcome::Fail
         );
+    }
+
+    #[test]
+    fn cli_accepts_bench_and_tests_dir_aliases() {
+        let parsed = Args::try_parse_from([
+            "ps2-autotest",
+            "--bench",
+            "--tests-dir",
+            "custom/ps2autotests",
+        ])
+        .expect("--bench and --tests-dir should parse");
+        assert!(parsed.bench);
+        assert!(!parsed.gate);
+        assert_eq!(parsed.bench_runs, 3);
+        assert_eq!(parsed.tests_dir, PathBuf::from("custom/ps2autotests"));
+
+        let alias_parsed =
+            Args::try_parse_from(["ps2-autotest", "--gate", "--suite-dir", "legacy/tests"])
+                .expect("--suite-dir alias should continue to parse");
+        assert!(alias_parsed.gate);
+        assert_eq!(alias_parsed.tests_dir, PathBuf::from("legacy/tests"));
+    }
+
+    #[test]
+    fn resolve_tests_dir_handles_repo_root_and_direct_tests_dir() {
+        let base = std::env::temp_dir().join(format!(
+            "ps2_autotest_tests_dir_check_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+
+        let repo_root = base.join("cloned_repo");
+        let nested_tests = repo_root.join("tests");
+        fs::create_dir_all(nested_tests.join("cpu")).expect("create nested tests/cpu dir");
+        assert_eq!(resolve_tests_dir(&repo_root), nested_tests);
+        assert_eq!(resolve_tests_dir(&nested_tests), nested_tests);
+
+        let missing = base.join("missing");
+        assert_eq!(resolve_tests_dir(&missing), missing);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn summarize_secs_and_formatting_work_for_odd_and_even_samples() {
+        assert_eq!(summarize_secs(&[2.5, 1.5, 2.0]), (1.5, 2.0, 2.5));
+        assert_eq!(summarize_secs(&[4.0, 1.0, 3.0, 2.0]), (1.0, 2.5, 4.0));
+        assert_eq!(summarize_secs(&[]), (0.0, 0.0, 0.0));
+        assert_eq!(format_commas(0), "0");
+        assert_eq!(format_commas(114_447_792), "114,447,792");
     }
 }
