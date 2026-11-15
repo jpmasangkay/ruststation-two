@@ -43,9 +43,9 @@ pub fn exec_efu_op(vu: &mut VuState, instr: u32) -> bool {
         // Group C
         0x7FE => eexp(vu.read_vf_lane(fs, fsf)),
         0x7FC => esin(vu.read_vf_lane(fs, fsf)),
-        0x7FD => 0, // EATAN
-        0x77C => 0, // EATANxy
-        0x77D => 0, // EATANxz
+        0x7FD => eatan(vu.read_vf_lane(fs, fsf)),
+        0x77C => eatan_xy(vu.read_vf(fs).u32_lanes()),
+        0x77D => eatan_xz(vu.read_vf(fs).u32_lanes()),
 
         _ => return false,
     };
@@ -199,6 +199,20 @@ fn vu_mul_rtz(a: u32, b: u32) -> u32 {
     res_sign | ((res_exp as u32) << 23) | res_mant
 }
 
+/// Evaluate an odd-degree polynomial `sum_i (coeff_i * x^(2i+1))` via `x^2` stepping with
+/// `vu_mul_rtz` (without EE COP1 Booth `-1`) and `ps2float::add`.
+fn eval_odd_series_vu_rtz(x: u32, terms: &[(u32, u8)]) -> u32 {
+    let x2 = vu_mul_rtz(x, x);
+    let mut power = x;
+    let mut sum = vu_mul_rtz(terms[0].0, power);
+    for &(coeff, _) in &terms[1..] {
+        power = vu_mul_rtz(power, x2);
+        let term = vu_mul_rtz(coeff, power);
+        sum = ps2float::add(sum, term).bits;
+    }
+    sum
+}
+
 /// `ESIN P, fs[fsf]`: `sin(x)` odd polynomial approximation (`sum c_i * x^i`).
 ///
 /// Uses `Play!` coefficients (`ESIN_TERMS`) with odd-power `x^2` stepping (`vu_mul_rtz`,
@@ -206,15 +220,65 @@ fn vu_mul_rtz(a: u32, b: u32) -> u32 {
 /// misses `CVF_ONE`/`CVF_NEGONE`/`CVF_DECREASING` by 1 ULP and `CVF_MAX_MANTISSA` by 2 ULP).
 #[inline]
 pub fn esin(val: u32) -> u32 {
-    let x2 = vu_mul_rtz(val, val);
-    let mut power = val;
-    let mut sum = vu_mul_rtz(ESIN_TERMS[0].0, power);
-    for &(coeff, _) in &ESIN_TERMS[1..] {
-        power = vu_mul_rtz(power, x2);
-        let term = vu_mul_rtz(coeff, power);
-        sum = ps2float::add(sum, term).bits;
-    }
-    sum
+    eval_odd_series_vu_rtz(val, &ESIN_TERMS)
+}
+
+/// `pi / 4` base angle truncated toward zero (`0x3F49_0FDA`, `trunc_f32(std::f64::consts::FRAC_PI_4)`),
+/// per `ps2tek` RTZ float convention (Cycle 2 hypothesis replacing IEEE-RNE `0x3F49_0FDB` from `Play!`).
+///
+/// Attribution: `Play!` uses IEEE-rounded `0x3F49_0FDB` (see `THIRD_PARTY_NOTICES.md`,
+/// `Source/ee/MA_VU_Lower.cpp`, `FETCHED`); truncating the mathematical constant `pi/4` toward zero
+/// yields `0x3F49_0FDA` (`EATAN(1.0) -> 3f490fda`).
+const EATAN_PI_OVER_4: u32 = 0x3F49_0FDA;
+
+/// `EATAN` odd-degree polynomial `(coeff_bits, power)` pairs for `pi/4 + sum c_i t^i`.
+///
+/// Attribution: numeric constants from `Play!` (BSD-2-Clause, see `THIRD_PARTY_NOTICES.md`,
+/// `Source/ee/MA_VU_Lower.cpp`, `FETCHED`).
+const EATAN_TERMS: [(u32, u8); 8] = [
+    (0x3F7F_FFF5, 1),
+    (0xBEAA_A61C, 3),
+    (0x3E4C_40A6, 5),
+    (0xBE0E_6C63, 7),
+    (0x3DC5_77DF, 9),
+    (0xBD65_01C4, 11),
+    (0x3CB3_1652, 13),
+    (0xBB84_D7E7, 15),
+];
+
+/// Evaluate `pi/4 + atan((y - x) / (y + x)) = atan(y / x)` (mathematical identity; consistent
+/// with `EATAN(1.0) -> 3f490fda`).
+///
+/// Uses `ps2float` add/sub/div and `eval_odd_series_vu_rtz` (`Play!` constants, `pi/4` RTZ).
+/// Matches `16/16` for `EATANxy`, `16/16` for `EATANxz`, and `11/16` (`PARTIAL`) for `EATAN`
+/// (`t = -1` zero inputs yield `0x3400_0000` vs hardware `0x33e6_0000`, `3PI_OVER2` differs
+/// by 1 ULP).
+#[inline]
+fn eatan_pair(y: u32, x: u32) -> u32 {
+    let num = ps2float::sub(y, x).bits;
+    let den = ps2float::add(y, x).bits;
+    let t = ps2float::div(num, den).bits;
+    let sum = eval_odd_series_vu_rtz(t, &EATAN_TERMS);
+    ps2float::add(EATAN_PI_OVER_4, sum).bits
+}
+
+/// `EATAN P, fs[fsf]`: `atan(z)` via `pi/4 + atan((z - 1) / (z + 1))`
+/// (mathematical identity; consistent with `ONE -> 3f490fda`).
+#[inline]
+pub fn eatan(val: u32) -> u32 {
+    eatan_pair(val, 0x3F80_0000)
+}
+
+/// `EATANxy P, fs`: `atan2`-style ratio `pi/4 + atan((y - x) / (y + x))` (`Play!`).
+#[inline]
+pub fn eatan_xy(lanes: &[u32; 4]) -> u32 {
+    eatan_pair(lanes[1], lanes[0])
+}
+
+/// `EATANxz P, fs`: `atan2`-style ratio `pi/4 + atan((z - x) / (z + x))` (`Play!`).
+#[inline]
+pub fn eatan_xz(lanes: &[u32; 4]) -> u32 {
+    eatan_pair(lanes[2], lanes[0])
 }
 
 #[cfg(test)]
@@ -349,5 +413,55 @@ mod tests {
         let neg = esin((-0.5f32).to_bits());
         assert_eq!(neg, pos ^ 0x8000_0000);
         assert!((f32::from_bits(pos) - 0.5f32.sin()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_eatan() {
+        // At z = 1.0, t = (1 - 1)/(1 + 1) = 0 -> exact pi/4 RTZ constant
+        assert_eq!(eatan(1.0f32.to_bits()), EATAN_PI_OVER_4);
+        // Formula sanity against mathematical atan(z) on (0.5, 2.5)
+        let a_half = f32::from_bits(eatan(0.5f32.to_bits()));
+        let a_two5 = f32::from_bits(eatan(2.5f32.to_bits()));
+        assert!((a_half - 0.5f32.atan()).abs() < 1e-5);
+        assert!((a_two5 - 2.5f32.atan()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_eatan_xy() {
+        // Equal nonzero x, y gives t = 0 -> pi/4 RTZ (z and w ignored)
+        assert_eq!(
+            eatan_xy(&[
+                3.0f32.to_bits(),
+                3.0f32.to_bits(),
+                99.0f32.to_bits(),
+                99.0f32.to_bits(),
+            ]),
+            EATAN_PI_OVER_4
+        );
+        // EATAN(y) == EATANxy(x = 1.0, y = y)
+        let y = 2.5f32.to_bits();
+        assert_eq!(eatan_xy(&[1.0f32.to_bits(), y, 0, 0]), eatan(y));
+    }
+
+    #[test]
+    fn test_eatan_xz() {
+        // Equal nonzero x, z gives t = 0 -> pi/4 RTZ (y and w ignored)
+        assert_eq!(
+            eatan_xz(&[
+                7.0f32.to_bits(),
+                99.0f32.to_bits(),
+                7.0f32.to_bits(),
+                99.0f32.to_bits(),
+            ]),
+            EATAN_PI_OVER_4
+        );
+        // Formula check for atan(4 / 2) = atan(2)
+        let got = f32::from_bits(eatan_xz(&[
+            2.0f32.to_bits(),
+            99.0f32.to_bits(),
+            4.0f32.to_bits(),
+            0,
+        ]));
+        assert!((got - 2.0f32.atan()).abs() < 1e-5);
     }
 }
