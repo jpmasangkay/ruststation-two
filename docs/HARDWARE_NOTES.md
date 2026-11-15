@@ -498,6 +498,29 @@ Non-sourced deviations discovered against `efu.expected` are explicitly labeled 
 | `EATANxy` | `0x77C` | `match` | `16 / 16` | `Play!` `MA_VU_Lower.cpp` (`FETCHED`) `(y-x)/(y+x)` + `EATAN_TERMS`; `0x3F49_0FDA` / `vu_mul_rtz` / `t^2` stepping: `inferred; may not generalize` | None. Reached `16/16` at Cycle 2; preserved under Cycle 3 (`vu_mul_rtz` + `t^2` stepping); reverted Cycle 4 `vu_div_rtz` to keep `EATANxz` at `16/16`. |
 | `EATANxz` | `0x77D` | `match` | `16 / 16` | `Play!` `MA_VU_Lower.cpp` (`FETCHED`) `(z-x)/(z+x)` + `EATAN_TERMS`; `0x3F49_0FDA` / `vu_mul_rtz` / `t^2` stepping: `inferred; may not generalize` | None. Reached `16/16` at Cycle 2; preserved under Cycle 3; Cycle 4 `vu_div_rtz` broke `CVF_DECREASING` (`3eed6339` vs `3eed633a`) -> reverted to Cycle 3 (`16/16`). |
 
+---
+
+## 13. Graphics Synthesizer (`crates/ps2-gs`) — Phase 2b Step 1 (Registers, 4 MB VRAM Swizzling & Transfers)
+
+Implemented in `crates/ps2-gs` (depends only on `ps2-common`, `bitflags`, `thiserror`, `tracing`; `#![forbid(unsafe_code)]`) and wired into `crates/ps2-core::bus::GsPrivilegedStub::core` while keeping `SIGNAL`/`FINISH`/`LABEL`/`CSR`/`IMR`/`SIGLBLID` unchanged in `GsPrivilegedStub`. See `docs/GS_GUESSES.md` for all `GUESS` / `SEARCH-ONLY` items (`G-001`..`G-006`) and `docs/GS_PACKET_FORMAT.md` for `.gsp` scripts.
+
+### 13.1 `FETCHED` Sources Used in Step 1
+
+- **`local/ps2tek/index.html`** (`#gs`, `#gsprimitives`, `#gsvertexattributes`, `#gsframeandzbuffers`, `#gstransfers`, `#gstextures`, `#gsfog`, `#gsalphablending`, `#gstestsandpixelcontrol`, `#giftags`, `#gifdataformats`, `FETCHED`): internal register indices (`0x00..=0x62`), GIFtag/`PACKED`/`REGLIST`/`IMAGE` unpacking, `% 2048` transfer coordinate wrap, equal-bpp requirement for `TRXDIR=2`, and `TRXPOS.DIR` `0..=3`.
+- **`Play!`** (`jpd002/Play-`, BSD-2-Clause, commit `1f27232772e484bfb79364b751b84f41f4c87481`, date read `2026-11-15`, `FETCHED` — see `THIRD_PARTY_NOTICES.md`):
+  - `Source/gs/GsPixelFormats.h`, `Source/gs/GsPixelFormats.cpp`: page dimensions and block/column/word swizzle tables (`PSMCT32/24`, `PSMCT16/16S`, `PSMZ32/24`, `PSMZ16/16S`, `PSMT8`, `PSMT4`, `PSMT8H`, `PSMT4HL`, `PSMT4HH`).
+  - `Source/gs/GSHandler.h`, `Source/gs/GSHandler.cpp`, `Source/gs/GSH_OpenGL/GSH_OpenGL.cpp`, `Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp`: register field layouts, `PSMT4HL`/`PSMT4HH` nibble offsets, `TEX2`->`TEX0` mask, `ALPHA.FIX`, `FOG.F`, and `PSMCT24` upper-byte preservation.
+- **`ps2dev/ps2sdk`** (`AFL-2.0`, commit `b04e8973c8a9839d0653d87a8d30cc67fd3c3f05`, date read `2026-11-15`, `FETCHED` — see `THIRD_PARTY_NOTICES.md`):
+  - `common/include/gs_gp.h`, `common/include/gs_privileged.h`, `common/include/gs_psm.h`, `ee/libgs/include/libgs.h`: cross-checked GP register bit layouts and PCRTC privileged display registers (`PMODE`, `SMODE2`, `DISPFB1/2`, `DISPLAY1/2`, `BGCOLOR`).
+
+### 13.2 Cross-Source Discrepancies Resolved (`FETCHED`)
+
+1. **`FOG` (`0x0A`) bit position**: `ps2tek` `#gsfog` says bits `0..=7`, whereas `ps2tek` `XYZF2`, `Play! GSHandler.cpp`, and `ps2sdk gs_gp.h` / `libgs.h` place 8-bit `F` in bits **`56..=63`**. Implemented bits `56..=63`.
+2. **`ALPHA_1/2` (`0x42/0x43`) `FIX` field**: `ps2tek` `#gsalphablending` says bits `8..=15`, whereas `Play! GSHandler.h` and `ps2sdk gs_gp.h` / `libgs.h` place `FIX` in bits **`32..=39`**. Implemented bits `32..=39`.
+3. **`DIMX` (`0x44`) element width**: `ps2sdk common/include/gs_gp.h` masks each matrix entry with `& 0x3` (2 bits, typo), whereas `ps2sdk ee/libgs/include/libgs.h` defines 16 signed **3-bit** entries (`-4..=+3`) at bit offsets `0, 4, 8, ..., 60`. Implemented 3-bit two's-complement entries (`(raw3 << 5) >> 5`).
+4. **`PSMT4HL` (`0x24`) vs `PSMT4HH` (`0x2C`)**: `ps2sdk common/include/gs_psm.h` comment swaps descriptions (`4HL` `"28 to 32"`, `4HH` `"24 to 27"`), whereas `Play! GSHandler.cpp` & `GSH_OpenGL_Texture.cpp` confirm `PSMT4HL = bits 24..=27` and `PSMT4HH = bits 28..=31`. Followed `Play!`.
+
+
 
 
 

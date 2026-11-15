@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/ps2-common",
+    "crates/ps2-gs",
     "crates/ps2-core",
     "crates/ps2-autotest",
 ]
@@ -16,6 +17,7 @@ license = "MIT OR Apache-2.0"
 bitflags = "2.6"
 bytemuck = { version = "1.19", features = ["derive", "min_const_generics"] }
 clap = { version = "4.5", features = ["derive"] }
+ps2-gs = { path = "crates/ps2-gs" }
 similar = "2.6"
 thiserror = "2.0"
 tracing = "0.1"

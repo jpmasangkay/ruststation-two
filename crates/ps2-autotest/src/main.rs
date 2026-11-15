@@ -9,6 +9,8 @@ use clap::Parser;
 use ps2_core::bus::{
     Bus, UnimplementedDmaTransfer, UnimplementedEeRegister, UnimplementedIopRegister,
 };
+
+mod gs_gate;
 use ps2_core::ee::{EeCpuState, EeHleState, HleStepResult};
 use ps2_core::iop::{
     is_irx_binary, load_irx, IopCpuState, IopStepResult, IrxError, LoadedIrx,
@@ -561,9 +563,15 @@ fn run_hardware_gate(suite_dir: &Path, max_cycles: u64) -> ExitCode {
         "\n=== HARDWARE GATE: {passed_count}/{total_count} PASSED, {deferred_count} DEFERRED, {failed_count} FAILED in {elapsed:.3} s ==="
     );
 
-    if !failure_diffs.is_empty() {
+    let (gs_passed, gs_failures) = gs_gate::run_gs_render_gate();
+    let _ = gs_passed;
+
+    if !failure_diffs.is_empty() || !gs_failures.is_empty() {
         for (suite, diff) in &failure_diffs {
             eprintln!("\n--- FAILURE DIFF: {suite} ---\n{diff}");
+        }
+        for (suite, reason) in &gs_failures {
+            eprintln!("\n--- GS RENDER GATE FAILURE: {suite} ---\n{reason}");
         }
         return ExitCode::FAILURE;
     }

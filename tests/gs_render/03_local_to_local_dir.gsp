@@ -1,0 +1,31 @@
+# Step 1 GS Render Gate #3: Local -> Local (`TRXDIR=2`) overlap DIR=3, % 2048 wrap, and privileged display write.
+priv PMODE 0x0000_0001
+priv BGCOLOR 0x0011_2233
+surface 32 1 PSMCT32 4 4
+
+# Upload 4x4 pattern at (DSAX=2046, DSAY=2047) in DBP=0, DBW=1 (tests % 2048 wrap)
+qwc 0x1000_0000_0000_8004 0xE
+qwc 0x0001_0000_0000_0000 0x50
+qwc 0x07FF_07FE_0000_0000 0x51
+qwc 0x0000_0004_0000_0004 0x52
+qwc 0x0000_0000_0000_0000 0x53
+# IMAGE (NLOOP=4): 16 pixels = 4 QWCs
+qwc 0x0800_0000_0000_8004 0x0
+qwc32 0x1001 0x1002 0x1003 0x1004
+qwc32 0x1005 0x1006 0x1007 0x1008
+qwc32 0x1009 0x100A 0x100B 0x100C
+qwc32 0x100D 0x100E 0x100F 0x1010
+
+# Overlapping Local -> Local (+1, +1) with DIR=3 (LR -> UL): src (2046,2047) -> dst (2047,0)
+qwc 0x1000_0000_0000_8004 0xE
+qwc 0x0001_0000_0001_0000 0x50
+qwc 0x1800_07FF_07FF_07FE 0x51
+qwc 0x0000_0004_0000_0004 0x52
+qwc 0x0000_0000_0000_0002 0x53
+
+# Copy shifted result from (2047, 0) SBP=0 to DBP=32 (0, 0) using DIR=0 (UL -> LR)
+qwc 0x1000_0000_0000_8004 0xE
+qwc 0x0001_0020_0001_0000 0x50
+qwc 0x0000_0000_0000_07FF 0x51
+qwc 0x0000_0004_0000_0004 0x52
+qwc 0x0000_0000_0000_0002 0x53

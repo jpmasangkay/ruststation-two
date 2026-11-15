@@ -15,6 +15,7 @@ use ps2_common::Reg128;
 
 use crate::bus::gs_stub::{gs_reg, GsPrivilegedStub};
 use crate::bus::intc::EeIntc;
+pub use ps2_gs::{decode_packed_qwc, GifDataFormat, GifTag};
 
 /// Capacity of the `PATH3` hardware GIF FIFO (`16` quadwords per `ps2tek` `#gifpath3masking`).
 pub const PATH3_FIFO_CAPACITY: usize = 16;
@@ -41,60 +42,6 @@ impl GifPath {
     #[inline(always)]
     const fn cursor_index(self) -> usize {
         (self as usize) - 1
-    }
-}
-
-/// GIFtag payload format (`GIFtag` bits `58..=59`).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-#[repr(u8)]
-pub enum GifDataFormat {
-    #[default]
-    Packed = 0,
-    Reglist = 1,
-    Image = 2,
-}
-
-/// Parsed 128-bit GIFtag (`ps2tek` `#giftags`).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct GifTag {
-    pub raw_words: [u32; 4],
-    pub nloop: u16,
-    pub eop: bool,
-    pub pre: bool,
-    pub prim: u16,
-    pub format: GifDataFormat,
-    pub nregs: u8,
-    pub regs: u64,
-}
-
-impl GifTag {
-    /// Decode a 128-bit `Reg128` quadword into a [`GifTag`].
-    #[inline]
-    pub fn from_qwc(qwc: Reg128) -> Self {
-        let lo = qwc.lo_u64();
-        let hi = qwc.hi_u64();
-        let raw_words = [lo as u32, (lo >> 32) as u32, hi as u32, (hi >> 32) as u32];
-        let nloop = (lo & 0x7FFF) as u16;
-        let eop = (lo & (1 << 15)) != 0;
-        let pre = (lo & (1 << 46)) != 0;
-        let prim = ((lo >> 47) & 0x7FF) as u16;
-        let format = match (lo >> 58) & 0x3 {
-            0 => GifDataFormat::Packed,
-            1 => GifDataFormat::Reglist,
-            _ => GifDataFormat::Image,
-        };
-        let raw_nregs = ((lo >> 60) & 0xF) as u8;
-        let nregs = if raw_nregs == 0 { 16 } else { raw_nregs };
-        Self {
-            raw_words,
-            nloop,
-            eop,
-            pre,
-            prim,
-            format,
-            nregs,
-            regs: hi,
-        }
     }
 }
 
@@ -759,72 +706,13 @@ impl GifUnit {
         let reg_idx = self.cursors[idx].cur_reg_idx;
         let reg_desc = ((self.cursors[idx].tag.regs >> (u32::from(reg_idx) * 4)) & 0xF) as u8;
 
-        let lo = qwc.lo_u64();
-        let hi = qwc.hi_u64();
-        let write_target: Option<(u8, u64)> = match reg_desc {
-            0x0 => Some((gs_reg::PRIM, lo & 0x7FF)),
-            0x1 => {
-                let r = lo & 0xFF;
-                let g = (lo >> 32) & 0xFF;
-                let b = hi & 0xFF;
-                let a = (hi >> 32) & 0xFF;
-                let rgbaq =
-                    r | (g << 8) | (b << 16) | (a << 24) | (u64::from(self.internal_q) << 32);
-                Some((gs_reg::RGBAQ, rgbaq))
-            }
-            0x2 => Some((gs_reg::ST, lo)),
-            0x3 => {
-                // TODO(verify): `ps2tek` omits standalone `03h UV` GS register bit offsets;
-                // follows PS2 GS `UV` layout (`U` in bits `0..=13`, `V` in bits `16..=29`).
-                let u = lo & 0x3FFF;
-                let v = (lo >> 32) & 0x3FFF;
-                Some((gs_reg::UV, u | (v << 16)))
-            }
-            0x4 => {
-                let disable_draw = ((hi >> 47) & 1) != 0;
-                let x = lo & 0xFFFF;
-                let y = (lo >> 32) & 0xFFFF;
-                let z = (hi >> 4) & 0x00FF_FFFF;
-                let f = (hi >> 36) & 0xFF;
-                let reg = if disable_draw {
-                    gs_reg::XYZF3
-                } else {
-                    gs_reg::XYZF2
-                };
-                Some((reg, x | (y << 16) | (z << 32) | (f << 56)))
-            }
-            0x5 => {
-                let disable_draw = ((hi >> 47) & 1) != 0;
-                let x = lo & 0xFFFF;
-                let y = (lo >> 32) & 0xFFFF;
-                let z = hi & 0xFFFF_FFFF;
-                let reg = if disable_draw {
-                    gs_reg::XYZ3
-                } else {
-                    gs_reg::XYZ2
-                };
-                Some((reg, x | (y << 16) | (z << 32)))
-            }
-            // Per `ps2tek` `#gifdataformats`, unspecified descriptors `0x6..=0x9`, `0xC..=0xD`
-            // forward `lo` directly to GS register `reg_desc`.
-            0x6..=0x9 | 0xC | 0xD => Some((reg_desc, lo)),
-            // TODO(verify): `ps2tek` `#gsvertexattributes` omits standalone `0Ah FOG` bit position;
-            // `04h XYZF2` places 8-bit `F` in GS register bits `56..=63`.
-            0xA => Some((gs_reg::FOG, ((hi >> 36) & 0xFF) << 56)),
-            // TODO(verify): `ps2tek` `#gifdataformats` omits descriptor `0Bh`.
-            0xB | 0xF => None,
-            0xE => Some(((hi & 0xFF) as u8, lo)),
-            _ => unreachable!("4-bit descriptor"),
-        };
-
-        if let Some((gs_reg_addr, gs_data)) = write_target {
+        let outcome = decode_packed_qwc(reg_desc, qwc, self.internal_q);
+        if let Some((gs_reg_addr, gs_data)) = outcome.reg_write {
             if !gs.write_internal_reg(gs_reg_addr, gs_data, intc) {
                 return false;
             }
         }
-        if reg_desc == 0x2 {
-            self.internal_q = hi as u32;
-        }
+        self.internal_q = outcome.next_internal_q;
 
         self.queue_for_path_mut(path).pop();
         self.advance_reg_loop(path);
@@ -1276,5 +1164,52 @@ mod tests {
         // When IMT=1, even `DIRECT` (`is_hl=false`) can queue alongside active non-IMAGE PATH3.
         gif.write32(0x1000_3010, 1 << 2, false);
         assert!(gif.can_accept_vif1_direct(false));
+    }
+
+    #[test]
+    fn gif_path3_packed_setup_and_image_writes_swizzled_vram() {
+        let mut gif = GifUnit::new();
+        let mut gs = GsPrivilegedStub::new();
+        let mut intc = EeIntc::new();
+
+        // Setup BITBLTBUF (dbp=0, dbw=1, PSMCT32), TRXPOS (2,1), TRXREG (2x2), TRXDIR=0 via PATH3 A+D.
+        assert!(gif.push_path3_qwc(make_giftag(4, false, false, 0, 0, 1, 0xE)));
+        assert!(gif.push_path3_qwc(Reg128::from_u64_pair(1 << 48, u64::from(gs_reg::BITBLTBUF))));
+        assert!(gif.push_path3_qwc(Reg128::from_u64_pair(
+            (1u64 << 48) | (2u64 << 32),
+            u64::from(gs_reg::TRXPOS),
+        )));
+        assert!(gif.push_path3_qwc(Reg128::from_u64_pair(
+            (2u64 << 32) | 2u64,
+            u64::from(gs_reg::TRXREG),
+        )));
+        assert!(gif.push_path3_qwc(Reg128::from_u64_pair(0, u64::from(gs_reg::TRXDIR))));
+
+        // Stream 1 QWC of IMAGE data (4 32-bit pixels = 2x2).
+        assert!(gif.push_path3_qwc(make_giftag(1, true, false, 0, 2, 1, 0)));
+        assert!(gif.push_path3_qwc(Reg128::from_u32x4(
+            0xAABB_CC01,
+            0xAABB_CC02,
+            0xAABB_CC03,
+            0xAABB_CC04,
+        )));
+
+        assert_eq!(drain_gif(&mut gif, &mut gs, &mut intc, 16), 7);
+        assert_eq!(
+            gs.core.vram.read_pixel_raw(ps2_gs::PixelFormat::Psmct32, 0, 1, 2, 1),
+            0xAABB_CC01
+        );
+        assert_eq!(
+            gs.core.vram.read_pixel_raw(ps2_gs::PixelFormat::Psmct32, 0, 1, 3, 1),
+            0xAABB_CC02
+        );
+        assert_eq!(
+            gs.core.vram.read_pixel_raw(ps2_gs::PixelFormat::Psmct32, 0, 1, 2, 2),
+            0xAABB_CC03
+        );
+        assert_eq!(
+            gs.core.vram.read_pixel_raw(ps2_gs::PixelFormat::Psmct32, 0, 1, 3, 2),
+            0xAABB_CC04
+        );
     }
 }

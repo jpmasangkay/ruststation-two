@@ -29,34 +29,18 @@
 //!     - bits 24..31: `gs_id` (`ID`, `0x55`, `SEARCH-ONLY`/`GUESS`)
 
 use crate::bus::intc::{EeIntc, IntcFlags};
+pub use ps2_gs::gs_reg;
 
 /// Default read-only `REV` (`0x1B`) and `ID` (`0x55`) plus `FIFO = Empty` (`1 << 14`) in `GS_CSR`
 /// (`ps2sdk` `ee/libgs/include/libgs.h`, `SEARCH-ONLY`/`GUESS`).
 const GS_CSR_FIXED_BITS: u64 = (0x55u64 << 24) | (0x1Bu64 << 16) | (1u64 << 14);
 
-/// Internal GS register indices handled by [`GsPrivilegedStub::write_internal_reg`].
-pub mod gs_reg {
-    pub const PRIM: u8 = 0x00;
-    pub const RGBAQ: u8 = 0x01;
-    pub const ST: u8 = 0x02;
-    pub const UV: u8 = 0x03;
-    pub const XYZF2: u8 = 0x04;
-    pub const XYZ2: u8 = 0x05;
-    pub const TEX0_1: u8 = 0x06;
-    pub const TEX0_2: u8 = 0x07;
-    pub const CLAMP_1: u8 = 0x08;
-    pub const CLAMP_2: u8 = 0x09;
-    pub const FOG: u8 = 0x0A;
-    pub const XYZF3: u8 = 0x0C;
-    pub const XYZ3: u8 = 0x0D;
-    pub const HWREG: u8 = 0x54;
-    pub const SIGNAL: u8 = 0x60;
-    pub const FINISH: u8 = 0x61;
-    pub const LABEL: u8 = 0x62;
-}
-
-/// Stub state for the GS Privileged Registers in Phase 1/2a (before full `ps2-gs` arrives in Phase 2b).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// GS Privileged Registers (`0x1200_0000..=0x1200_1FFF`) + forwarding into [`ps2_gs::GsState`].
+///
+/// `SIGNAL`/`FINISH`/`LABEL`/`CSR`/`IMR`/`SIGLBLID` interrupt & stall behavior stay here so EE
+/// timing and Phase 2a hardware gates remain exact (`gs/label`, `gs/signal`), while internal GS
+/// registers (`0x00..=0x62`) and PCRTC display writes forward to `core`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GsPrivilegedStub {
     pub pmode: u64,
     pub smode1: u64,
@@ -77,8 +61,8 @@ pub struct GsPrivilegedStub {
     pub imr: u64,
     pub busdir: u64,
     pub siglblid: u64,
-    /// Latched internal GS registers (`0x00..=0x7F`) written via GIF packets (pre-Phase 2b inspection).
-    internal_regs: [u64; 128],
+    /// Shared GS core state (decoded internal/display registers + VRAM + transfers).
+    pub core: ps2_gs::GsState,
     /// Total internal GS register writes accepted from GIF paths.
     pub internal_write_count: u64,
     /// Total `HWREG` (`0x54`) writes accepted (`IMAGE` mode).
@@ -92,7 +76,7 @@ impl Default for GsPrivilegedStub {
 }
 
 impl GsPrivilegedStub {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             pmode: 0,
             smode1: 0,
@@ -113,7 +97,7 @@ impl GsPrivilegedStub {
             imr: 0x7F00,
             busdir: 0,
             siglblid: 0,
-            internal_regs: [0; 128],
+            core: ps2_gs::GsState::new(),
             internal_write_count: 0,
             hwreg_write_count: 0,
         }
@@ -141,13 +125,8 @@ impl GsPrivilegedStub {
 
     /// Read the most recent 64-bit value written to internal GS register `reg` (`0x00..=0x7F`).
     #[inline(always)]
-    pub const fn internal_reg(&self, reg: u8) -> u64 {
-        let idx = reg as usize;
-        if idx < self.internal_regs.len() {
-            self.internal_regs[idx]
-        } else {
-            0
-        }
+    pub fn internal_reg(&self, reg: u8) -> u64 {
+        self.core.internal_reg(reg)
     }
 
     /// Write a 64-bit internal GS register (`0x00..=0x7F`) delivered via GIF.
@@ -161,10 +140,7 @@ impl GsPrivilegedStub {
             return false;
         }
         self.internal_write_count += 1;
-        let idx = reg as usize;
-        if idx < self.internal_regs.len() {
-            self.internal_regs[idx] = data;
-        }
+        self.core.write_internal_reg(reg, data);
         match reg {
             gs_reg::HWREG => {
                 self.hwreg_write_count += 1;
@@ -241,7 +217,8 @@ impl GsPrivilegedStub {
 
     /// Write a 64-bit GS privileged register at `paddr` (`0x1200_0000..=0x1200_1FFF`).
     pub fn write64(&mut self, paddr: u32, val: u64) {
-        match paddr & 0x1FFF {
+        let off = paddr & 0x1FFF;
+        match off {
             0x0000 => self.pmode = val,
             0x0010 => self.smode1 = val,
             0x0020 => self.smode2 = val,
@@ -267,6 +244,9 @@ impl GsPrivilegedStub {
             0x1040 => self.busdir = val,
             0x1080 => self.siglblid = val,
             _ => {}
+        }
+        if off <= 0x00E0 {
+            self.core.write_privileged_display(off, val);
         }
     }
 

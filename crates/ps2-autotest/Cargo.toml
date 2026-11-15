@@ -9,6 +9,7 @@ license.workspace = true
 clap.workspace = true
 ps2-common = { path = "../ps2-common" }
 ps2-core = { path = "../ps2-core" }
+ps2-gs.workspace = true
 similar.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

@@ -9,5 +9,6 @@ license.workspace = true
 bitflags.workspace = true
 bytemuck.workspace = true
 ps2-common = { path = "../ps2-common" }
+ps2-gs.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

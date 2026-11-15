@@ -221,6 +221,7 @@ dependencies = [
  "clap",
  "ps2-common",
  "ps2-core",
+ "ps2-gs",
  "similar",
  "thiserror",
  "tracing",
@@ -243,6 +244,17 @@ version = "0.1.0"
 dependencies = [
  "bitflags",
  "bytemuck",
+ "ps2-common",
+ "ps2-gs",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "ps2-gs"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
  "ps2-common",
  "thiserror",
  "tracing",
