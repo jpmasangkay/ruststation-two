@@ -28,34 +28,35 @@ use crate::scheduler::{HardwareEventKind, Scheduler};
 
 pub use dmac::{DmaChannel, EeDmac, UnimplementedDmaTransfer};
 pub use gs_stub::GsPrivilegedStub;
-pub use intc::{EeIntc, IntcFlags};
+pub use intc::{EeIntc, IntcFlags, IopIntc, IopIrqFlags};
 pub use rdram_mch::RdramMch;
 pub use sif::SifRegs;
 pub use timers::EeTimers;
 
-/// 32 MB Main RDRAM size in bytes (`ps2tek` `#memorymap`).
+/// 32 MB Main RDRAM size in bytes (`ps2tek` `#memorymap`, `FETCHED`).
 pub const EE_RAM_SIZE: usize = 32 * 1024 * 1024;
-/// 16 KB Scratchpad SRAM size in bytes (`ps2tek` `#memorymap`).
+/// 16 KB Scratchpad SRAM size in bytes (`ps2tek` `#memorymap`, `FETCHED`).
 pub const SCRATCHPAD_SIZE: usize = 16 * 1024;
-/// 4 MB System BIOS ROM size in bytes (`ps2tek` `#memorymap`).
+/// 4 MB System BIOS ROM size in bytes (`ps2tek` `#memorymap`, `FETCHED`).
 pub const BIOS_SIZE: usize = 4 * 1024 * 1024;
-/// 2 MB IOP Main RAM size in bytes (`ps2tek` `#memorymap`).
+/// 2 MB IOP Main RAM size in bytes (`ps2tek` `#memorymap`, `FETCHED`).
 pub const IOP_RAM_SIZE: usize = 2 * 1024 * 1024;
-/// 1 KB IOP Scratchpad SRAM size in bytes (`0x1F80_0000..=0x1F80_03FF`, `ps2tek` `#memorymap`).
+/// 1 KB IOP Scratchpad SRAM size in bytes (`0x1F80_0000..=0x1F80_03FF`, `ps2tek` `#memorymap`, `FETCHED`).
 pub const IOP_SCRATCHPAD_SIZE: usize = 1024;
-/// 64 KB VU0/1 memory window (`ps2tek` `#memorymap`).
+/// 64 KB VU0/1 memory window (`ps2tek` `#memorymap`, `FETCHED`).
 pub const VU_MEM_WINDOW_SIZE: usize = 64 * 1024;
 
 /// Emotion Engine on-chip Serial I/O (`EE_SIO` / UART, `0x1000_F100..=0x1000_F1C0`).
 ///
-/// Primary source references:
-/// - `ps2tek` (`https://psi-rockin.github.io/ps2tek/#iomaps`):
+/// Primary source references (`FETCHED`):
+/// - `ps2tek` (`https://psi-rockin.github.io/ps2tek/#iomaps`, `local/ps2tek/index.html` line 212):
 ///   * `0x1000_F180` (`KPUTCHAR` / `SIO_TXFIFO`, 8-bit): kernel serial console character output.
-/// - `ps2sdk` (`ee/kernel/include/sio.h`):
+/// - `ps2sdk` (`ee/kernel/include/sio.h` & `ee/kernel/src/sio.c`, `FETCHED`):
 ///   * `0x1000_F100` (`SIO_LCR`): Line Control Register.
 ///   * `0x1000_F110` (`SIO_LSR`): Line Status Register.
 ///   * `0x1000_F120` (`SIO_IER`): Interrupt Enable Register.
-///   * `0x1000_F130` (`SIO_ISR`): Interrupt Status Register.
+///   * `0x1000_F130` (`SIO_ISR`): Interrupt Status Register (`sio_putc` polls `(_lw(SIO_ISR) & 0xf000) == 0x8000`
+///     for TX FIFO full; `0` = ready to transmit; bits `0..=2` write-1-to-clear).
 ///   * `0x1000_F140` (`SIO_FCR`): FIFO Control Register.
 ///   * `0x1000_F150` (`SIO_BGR`): Baud Rate Generator Register.
 ///   * `0x1000_F180` (`SIO_TXFIFO`): Transmit FIFO.
@@ -80,15 +81,16 @@ pub struct EeSio {
 
 /// R3000A IOP Sub-System Bus Controller (`SSBUSC`) and Memory Control registers.
 ///
-/// Primary source references:
-/// - `psx-spx` (`Memory Control 1` `0x1F80_1000..=0x1F80_1020`, `Memory Control 2` `0x1F80_1060`):
-///   * `0x1F80_1000..=0x1F80_1020`: Expansion/BIOS/SPU/CDROM/Common bus delay and base registers
-///     (including `0x1F80_1010` `BIOS_ROM` delay/size and `0x1F80_1020` `COM_DELAY`).
-///   * `0x1F80_1060`: `RAM_SIZE` register.
-/// - `ps2sdk` (`iop/system/ssbusc` & `common/include/iop_regs.h`):
-///   * `0x1F80_1400..=0x1F80_1420`: PS2 extended `SSBUSC` device base/delay registers.
-// TODO(verify): `ps2tek` omits the IOP `SSBUSC` timing/delay register bitfields (`0x1F80_1000..=0x1F80_1020`,
-// `0x1F80_1060`, `0x1F80_1400..=0x1F80_1420`).
+/// Primary source references (`FETCHED`):
+/// - `ps2sdk` (`iop/system/ssbusc/include/ssbusc.h`, `iop/system/ssbusc/src/ssbusc.c`,
+///   `common/include/iop_regs.h`, and `common/include/iop_mmio_hwport.h`, `FETCHED`):
+///   * `0x1F80_1000..=0x1F80_1020`: `ssbus1_mmio_hwport_t` device base and delay/configuration
+///     registers (`0x1F80_1010` = `BIOS_ROM` delay/size; bit 12 `0x1000` is `ATYP` [`0 = 8-bit`, `1 = 16-bit`],
+///     preserved via read-modify-write during IOP BIOS boot at `PC = 0xBFC0_20C4`).
+///   * `0x1F80_1060`: `A_PS1_RAM_SIZE` (`RAM_SIZE` register).
+///   * `0x1F80_1400..=0x1F80_1420`: `ssbus2_mmio_hwport_t` extended PS2 `SSBUSC` base/delay registers.
+// TODO(verify): `ps2tek` (`FETCHED`) omits the IOP `SSBUSC` timing/delay register bitfields (`0x1F80_1000..=0x1F80_1020`,
+// `0x1F80_1060`, `0x1F80_1400..=0x1F80_1420`); verified against `ps2sdk` `iop/system/ssbusc/include/ssbusc.h` (`FETCHED`).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct IopSsbusc {
     /// `0x1F80_1000..=0x1F80_1023` (`9` words: `EXP1_BASE` .. `COM_DELAY`).
@@ -99,21 +101,48 @@ pub struct IopSsbusc {
     pub ssbus_ext: [u32; 9],
 }
 
-/// R3000A IOP DMA Controller Priority and Interrupt Control registers (`0x1F80_10F0..=0x1F80_10F4`,
-/// `0x1F80_1570..=0x1F80_157C`).
+/// Per-channel R3000A IOP DMA Controller registers (`Dn_MADR`, `Dn_BCR`, `Dn_CHCR`, `Dn_TADR`).
 ///
-/// Primary source references:
-/// - `ps2tek` (`https://psi-rockin.github.io/ps2tek/#iopdma`, lines 4051-4118):
+/// Primary source references (`FETCHED`):
+/// - `ps2tek` (`https://psi-rockin.github.io/ps2tek/#iopdma`, `local/ps2tek/index.html` lines 3970-4050).
+/// - `ps2sdk` (`iop/system/dmacman/src/dmacman.c` lines 20-73, 108-340).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct IopDmacChannel {
+    /// `Dn_MADR` (`+0x0`): Start address in IOP RAM (24-bit, `0x00FF_FFFF` mask).
+    pub madr: u32,
+    /// `Dn_BCR` (`+0x4`): Block Control Register (`[15:0]` block size in words, `[31:16]` block count).
+    pub bcr: u32,
+    /// `Dn_CHCR` (`+0x8`): Channel Control Register (bit `24` = start/busy).
+    pub chcr: u32,
+    /// `Dn_TADR` (`+0xC`): Tag Address Register in IOP RAM (24-bit, used in chain mode on `SPU`, `SIF0`, `SIF1`).
+    pub tadr: u32,
+}
+
+/// R3000A IOP DMA Controller channel, priority, and interrupt control registers
+/// (`0x1F80_1080..=0x1F80_10F4`, `0x1F80_1500..=0x1F80_157C`, `0x1F80_15F0`).
+///
+/// Primary source references (`FETCHED`):
+/// - `ps2tek` (`https://psi-rockin.github.io/ps2tek/#iopdma`, `local/ps2tek/index.html` lines 3965-4118):
+///   * `0x1F80_1080..=0x1F80_10EC`: Channels `0..6` (`MDECin`, `MDECout`, `SIF2`, `CDVD`, `SPU1`, `PIO`, `OTC`).
 ///   * `0x1F80_10F0` (`DPCR`): DMA Priority/Enable for channels 0..6 (initial value on PS2 reset: `0x0777_7777`).
 ///   * `0x1F80_10F4` (`DICR`): DMA Interrupt Register for channels 0..6 (bits `24..=30` write-1-to-clear,
-///     bit `31` = `DICR.15 | (DICR.23 && (DICR.24..30 || DICR2.24..29))` when `DMACINTEN.0 == 0`).
+///     bit `31` = `DICR.15 | (DICR.23 && (DICR.24..30 || DICR2.24..29))` when `DMACINTEN.0 == 1`).
+///   * `0x1F80_1500..=0x1F80_155C`: Channels `7..12` (`SPU2`, `DEV9`, `SIF0`, `SIF1`, `SIO2in`, `SIO2out`).
 ///   * `0x1F80_1570` (`DPCR2`): DMA Priority/Enable 2 for channels 7..12.
 ///   * `0x1F80_1574` (`DICR2`): DMA Interrupt Register 2 for channels 7..12 (bits `24..=29` write-1-to-clear).
 ///   * `0x1F80_1578` (`DMACEN`): Global DMA Enable (bit `0`: `0` = all transfers disabled, `1` = enabled).
 ///   * `0x1F80_157C` (`DMACINTEN`): Global DMA Interrupt Control (bit `0`: when `0`, master interrupt flag is `0`
 ///     except for bus error; bit `1`: when `1`, IRQ 3 is masked from INTC).
+/// - `ps2sdk` (`iop/system/dmacman/src/dmacman.c` lines 59-64, 342-401, 453-474, `FETCHED`):
+///   * `0x1F80_1560`, `0x1F80_1564`, `0x1F80_1568`: `dmac_channel_9_4_9_a` (`SIF0`), `dmac_channel_A_4_9_a` (`SIF1`),
+///     `dmac_channel_4_4_9_a` (`SPU`).
+///   * `0x1F80_15F0` (`DPCR3`): DMA Priority/Enable 3 for `FDMA0..2`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct IopDmacControl {
+    /// Per-channel register banks for IOP DMA channels `0..12`.
+    pub channels: [IopDmacChannel; 13],
+    /// `0x1F80_1560..=0x1F80_1568`: Auxiliary registers for `SIF0` (`[0]`), `SIF1` (`[1]`), and `SPU` (`[2]`).
+    pub ch_aux_4_9_a: [u32; 3],
     /// `0x1F80_10F0` (`DPCR`): DMA Priority/Enable (`0..6`).
     pub dpcr: u32,
     /// `0x1F80_10F4` (`DICR`): DMA Interrupt Register (`0..6`).
@@ -122,6 +151,8 @@ pub struct IopDmacControl {
     pub dpcr2: u32,
     /// `0x1F80_1574` (`DICR2`): DMA Interrupt Register 2 (`7..12`).
     pub dicr2: u32,
+    /// `0x1F80_15F0` (`DPCR3`): DMA Priority/Enable 3 (`FDMA0..2`).
+    pub dpcr3: u32,
     /// `0x1F80_1578` (`DMACEN`): Global DMA Enable.
     pub dmacen: u32,
     /// `0x1F80_157C` (`DMACINTEN`): Global DMA Interrupt Control.
@@ -135,20 +166,67 @@ impl Default for IopDmacControl {
 }
 
 impl IopDmacControl {
-    /// Initialize IOP DMA control registers to PS2 power-on defaults (`ps2tek` `#iopdma` line 4066).
+    /// Initialize IOP DMA control registers to PS2 power-on defaults (`ps2tek` `#iopdma` line 4066, `FETCHED`).
     #[inline]
     pub const fn new() -> Self {
         Self {
+            channels: [IopDmacChannel {
+                madr: 0,
+                bcr: 0,
+                chcr: 0,
+                tadr: 0,
+            }; 13],
+            ch_aux_4_9_a: [0; 3],
             dpcr: 0x0777_7777,
             dicr: 0,
             dpcr2: 0,
             dicr2: 0,
+            dpcr3: 0,
             dmacen: 0,
             dmacinten: 0,
         }
     }
 
-    /// Recompute `DICR.31` master interrupt flag (`ps2tek` `#iopdma` lines 4093-4094, 4116).
+    /// Read a per-channel register (`MADR`, `BCR`, `CHCR`, `TADR`) for channel `ch` (`0..12`).
+    #[inline]
+    pub const fn read_channel_reg(&self, ch: usize, reg_offset: u32) -> u32 {
+        let c = &self.channels[ch];
+        match reg_offset & 0xC {
+            0x0 => c.madr,
+            0x4 => c.bcr,
+            0x8 => c.chcr,
+            0xC => c.tadr,
+            _ => 0,
+        }
+    }
+
+    /// Write a per-channel register (`MADR`, `BCR`, `CHCR`, `TADR`) for channel `ch` (`0..12`).
+    /// Returns `true` if `Dn_CHCR` bit 24 (`Start/Busy`) was written as `1`.
+    #[inline]
+    pub fn write_channel_reg(&mut self, ch: usize, reg_offset: u32, val: u32) -> bool {
+        let c = &mut self.channels[ch];
+        match reg_offset & 0xC {
+            0x0 => {
+                c.madr = val & 0x00FF_FFFF;
+                false
+            }
+            0x4 => {
+                c.bcr = val;
+                false
+            }
+            0x8 => {
+                c.chcr = val;
+                (val & (1 << 24)) != 0
+            }
+            0xC => {
+                c.tadr = val & 0x00FF_FFFF;
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Recompute `DICR.31` master interrupt flag (`ps2tek` `#iopdma` lines 4093-4094, 4116, `FETCHED`).
     #[inline]
     pub fn recompute_master_flag(&mut self) {
         let bus_err = (self.dicr & (1 << 15)) != 0;
@@ -161,7 +239,13 @@ impl IopDmacControl {
         }
     }
 
-    /// Write `DICR` (`0x1F80_10F4`), clearing bits `24..=30` where `1` is written (`ps2tek` `#iopdma` line 4091).
+    /// Returns `true` if `DICR.31` is set and `DMACINTEN.1` does not mask `IRQ 3` (`ps2tek` `#iopdma` lines 4093, 4117, `FETCHED`).
+    #[inline(always)]
+    pub const fn irq3_asserted(&self) -> bool {
+        (self.dicr & (1 << 31)) != 0 && (self.dmacinten & 2) == 0
+    }
+
+    /// Write `DICR` (`0x1F80_10F4`), clearing bits `24..=30` where `1` is written (`ps2tek` `#iopdma` line 4091, `FETCHED`).
     #[inline]
     pub fn write_dicr(&mut self, val: u32) {
         const RW_MASK: u32 = 0x00FF_807F;
@@ -171,7 +255,7 @@ impl IopDmacControl {
         self.recompute_master_flag();
     }
 
-    /// Write `DICR2` (`0x1F80_1574`), clearing bits `24..=29` where `1` is written (`ps2tek` `#iopdma` line 4104).
+    /// Write `DICR2` (`0x1F80_1574`), clearing bits `24..=29` where `1` is written (`ps2tek` `#iopdma` line 4104, `FETCHED`).
     #[inline]
     pub fn write_dicr2(&mut self, val: u32) {
         const RW_MASK: u32 = 0x003F_1FFF;
@@ -257,23 +341,27 @@ pub struct Bus {
     pub sif: SifRegs,
     /// IOP Sub-System Bus Controller (`SSBUSC`, `0x1F80_1000..=0x1F80_1020`, `0x1F80_1060`, `0x1F80_1400..=0x1F80_1420`).
     pub iop_ssbusc: IopSsbusc,
+    /// IOP Interrupt Controller (`I_STAT` `0x1F80_1070`, `I_MASK` `0x1F80_1074`, `I_CTRL` `0x1F80_1078`).
+    pub iop_intc: IopIntc,
     /// IOP DMA Controller global priority and interrupt registers (`0x1F80_10F0..=0x1F80_10F4`, `0x1F80_1570..=0x1F80_157C`).
     pub iop_dmac: IopDmacControl,
-    /// IOP `0x1F80_1450` (`GM_IF` in `ps2sdk` `common/include/iop_regs.h`): IOP mode & CPU type register
-    /// (`0` on reset = PS2 mode / MIPS R3000A).
-    // TODO(verify): `ps2tek` omits `0x1F80_1450`; bit 3 (`0x08`) selects PS1 vs PS2 IOP bootstrap mode.
+    /// IOP `0x1F80_1450` (`GM_IF` in `ps2sdk` `common/include/iop_regs.h` & `iop/system/intrman/src/intrman.c`, `FETCHED`):
+    /// IOP mode & CPU type register (`0` on reset = PS2 mode / MIPS R3000A).
+    // TODO(verify): `ps2tek` `#ps1drv` line 5095 (`FETCHED`) writes `1F801570.3` (a digit-transposition typo for
+    // `1F801450.3`); `ps2sdk` `iop/system/intrman/src/intrman.c` lines 51-65 (`FETCHED`) confirms `0x1F80_1450` bit 3
+    // (`0x08`) selects PS1 (`1`) vs PS2 (`0`) IOP bootstrap mode.
     pub iop_gm_if: u32,
-    /// IOP Expansion Region 2 POST2 diagnostic status latch (`0x1F80_2070`).
-    // TODO(verify): `ps2tek` omits `0x1F80_2070` (`HW_POST2`); written by the IOP BIOS boot table
-    // (`PC = 0xBFC0_20E8`, `val = 0x0000_00FC`) as a power-on self-test status latch.
+    /// IOP Expansion Region 2 POST2 diagnostic status latch (`0x1F80_2070`, `ps2sdk` `common/include/iop_mmio_hwport.h`, `FETCHED`).
+    // TODO(verify): `ps2tek` (`FETCHED`) omits `0x1F80_2070` (`A_IOP_UNK_2070` / `HW_POST2`); written by the IOP BIOS
+    // boot table (`PC = 0xBFC0_20E8`, `val = 0x0000_00FC`) as a power-on self-test status latch.
     pub iop_post2: u32,
-    /// IOP `KSEG2` Cache Control registers (`0xFFFE_0130..=0xFFFE_014F`, `ps2tek` `#memorymap` line 106).
-    // TODO(verify): `ps2tek` `#memorymap` line 106 lists `FFFE0000h (KSEG2) Cache control` without
+    /// IOP `KSEG2` Cache Control registers (`0xFFFE_0130..=0xFFFE_014F`, `ps2tek` `#memorymap` line 106, `FETCHED`).
+    // TODO(verify): `ps2tek` `#memorymap` line 106 (`FETCHED`) lists `FFFE0000h (KSEG2) Cache control` without
     // per-offset bitfields (`0xFFFE_0130` `BIU_CONFIG` and `0xFFFE_0140..=0xFFFE_014F`).
     pub iop_cache_ctrl: [u32; 8],
     /// Central event-driven hardware scheduler (`294.912 MHz` EE cycle timebase).
     pub scheduler: Scheduler,
-    /// Captured EE/IOP serial & console stdout bytes (`KPUTCHAR` `0x1000_F180` + HLE stdout, `ps2tek` `#iomaps`).
+    /// Captured EE/IOP serial & console stdout bytes (`KPUTCHAR` `0x1000_F180` + HLE stdout, `ps2tek` `#iomaps`, `FETCHED`).
     pub stdout_buffer: Vec<u8>,
     /// Diagnostic error set if the EE reads or writes an unimplemented EE MMIO register.
     pub pending_ee_mmio_error: Option<UnimplementedEeRegister>,
@@ -307,6 +395,7 @@ impl Bus {
             dmac: EeDmac::new(),
             sif: SifRegs::new(),
             iop_ssbusc: IopSsbusc::default(),
+            iop_intc: IopIntc::new(),
             iop_dmac: IopDmacControl::new(),
             iop_gm_if: 0,
             iop_post2: 0,
@@ -894,10 +983,12 @@ impl Bus {
             }
             0x1F80_1000..=0x1F80_1023
             | 0x1F80_1060..=0x1F80_1063
-            | 0x1F80_10F0..=0x1F80_10F7
+            | 0x1F80_1070..=0x1F80_107B
+            | 0x1F80_1080..=0x1F80_10F7
             | 0x1F80_1400..=0x1F80_1423
             | 0x1F80_1450..=0x1F80_1453
-            | 0x1F80_1570..=0x1F80_157F
+            | 0x1F80_1500..=0x1F80_157F
+            | 0x1F80_15F0..=0x1F80_15F3
             | 0x1F80_2070..=0x1F80_2073
             | 0xFFFE_0130..=0xFFFE_014F => {
                 let shift = (paddr & 3) * 8;
@@ -926,10 +1017,12 @@ impl Bus {
             ),
             0x1F80_1000..=0x1F80_1023
             | 0x1F80_1060..=0x1F80_1063
-            | 0x1F80_10F0..=0x1F80_10F7
+            | 0x1F80_1070..=0x1F80_107B
+            | 0x1F80_1080..=0x1F80_10F7
             | 0x1F80_1400..=0x1F80_1423
             | 0x1F80_1450..=0x1F80_1453
-            | 0x1F80_1570..=0x1F80_157F
+            | 0x1F80_1500..=0x1F80_157F
+            | 0x1F80_15F0..=0x1F80_15F3
             | 0x1F80_2070..=0x1F80_2073
             | 0xFFFE_0130..=0xFFFE_014F => {
                 let shift = (paddr & 2) * 8;
@@ -962,16 +1055,31 @@ impl Bus {
                 self.iop_ssbusc.memctrl1[((paddr - 0x1F80_1000) >> 2) as usize]
             }
             0x1F80_1060 => self.iop_ssbusc.ram_size,
+            0x1F80_1070 => self.iop_intc.read_stat(),
+            0x1F80_1074 => self.iop_intc.read_mask(),
+            0x1F80_1078 => self.iop_intc.read_ctrl(),
+            0x1F80_1080..=0x1F80_10EC => {
+                let ch = ((paddr - 0x1F80_1080) >> 4) as usize;
+                self.iop_dmac.read_channel_reg(ch, paddr & 0xF)
+            }
             0x1F80_10F0 => self.iop_dmac.dpcr,
             0x1F80_10F4 => self.iop_dmac.dicr,
             0x1F80_1400..=0x1F80_1423 => {
                 self.iop_ssbusc.ssbus_ext[((paddr - 0x1F80_1400) >> 2) as usize]
             }
             0x1F80_1450 => self.iop_gm_if,
+            0x1F80_1500..=0x1F80_155C => {
+                let ch = 7 + (((paddr - 0x1F80_1500) >> 4) as usize);
+                self.iop_dmac.read_channel_reg(ch, paddr & 0xF)
+            }
+            0x1F80_1560..=0x1F80_1568 => {
+                self.iop_dmac.ch_aux_4_9_a[((paddr - 0x1F80_1560) >> 2) as usize]
+            }
             0x1F80_1570 => self.iop_dmac.dpcr2,
             0x1F80_1574 => self.iop_dmac.dicr2,
             0x1F80_1578 => self.iop_dmac.dmacen,
             0x1F80_157C => self.iop_dmac.dmacinten,
+            0x1F80_15F0 => self.iop_dmac.dpcr3,
             0x1F80_2070 => self.iop_post2,
             0xFFFE_0130..=0xFFFE_014F => self.iop_cache_ctrl[((paddr - 0xFFFE_0130) >> 2) as usize],
             0x1FC0_0000..=0x1FFF_FFFF => {
@@ -995,12 +1103,24 @@ impl Bus {
             0x1F80_0000..=0x1F80_03FF => {
                 self.iop_scratchpad[(paddr as usize) & (IOP_SCRATCHPAD_SIZE - 1)] = val;
             }
+            0x1F80_1070..=0x1F80_1073 => {
+                let shift = (paddr & 3) * 8;
+                let mask32 = !(0xFFu32 << shift) | (u32::from(val) << shift);
+                self.iop_intc.write_stat(mask32);
+            }
+            0x1F80_1078..=0x1F80_107B => {
+                if (paddr & 3) == 0 {
+                    self.iop_intc.write_ctrl(u32::from(val));
+                }
+            }
             0x1F80_1000..=0x1F80_1023
             | 0x1F80_1060..=0x1F80_1063
-            | 0x1F80_10F0..=0x1F80_10F7
+            | 0x1F80_1074..=0x1F80_1077
+            | 0x1F80_1080..=0x1F80_10F7
             | 0x1F80_1400..=0x1F80_1423
             | 0x1F80_1450..=0x1F80_1453
-            | 0x1F80_1570..=0x1F80_157F
+            | 0x1F80_1500..=0x1F80_157F
+            | 0x1F80_15F0..=0x1F80_15F3
             | 0x1F80_2070..=0x1F80_2073
             | 0xFFFE_0130..=0xFFFE_014F => {
                 let shift = (paddr & 3) * 8;
@@ -1042,12 +1162,24 @@ impl Bus {
                     val,
                 );
             }
+            0x1F80_1070..=0x1F80_1073 => {
+                let shift = (paddr & 2) * 8;
+                let mask32 = !(0xFFFFu32 << shift) | (u32::from(val) << shift);
+                self.iop_intc.write_stat(mask32);
+            }
+            0x1F80_1078..=0x1F80_107B => {
+                if (paddr & 2) == 0 {
+                    self.iop_intc.write_ctrl(u32::from(val));
+                }
+            }
             0x1F80_1000..=0x1F80_1023
             | 0x1F80_1060..=0x1F80_1063
-            | 0x1F80_10F0..=0x1F80_10F7
+            | 0x1F80_1074..=0x1F80_1077
+            | 0x1F80_1080..=0x1F80_10F7
             | 0x1F80_1400..=0x1F80_1423
             | 0x1F80_1450..=0x1F80_1453
-            | 0x1F80_1570..=0x1F80_157F
+            | 0x1F80_1500..=0x1F80_157F
+            | 0x1F80_15F0..=0x1F80_15F3
             | 0x1F80_2070..=0x1F80_2073
             | 0xFFFE_0130..=0xFFFE_014F => {
                 let shift = (paddr & 2) * 8;
@@ -1095,11 +1227,29 @@ impl Bus {
             0x1F80_1060 => {
                 self.iop_ssbusc.ram_size = val;
             }
+            0x1F80_1070 => {
+                self.iop_intc.write_stat(val);
+            }
+            0x1F80_1074 => {
+                self.iop_intc.write_mask(val);
+            }
+            0x1F80_1078 => {
+                self.iop_intc.write_ctrl(val);
+            }
+            0x1F80_1080..=0x1F80_10EC => {
+                let ch = ((paddr - 0x1F80_1080) >> 4) as usize;
+                if self.iop_dmac.write_channel_reg(ch, paddr & 0xF, val) {
+                    self.record_unimplemented_iop_reg(paddr, 4, true, val);
+                }
+            }
             0x1F80_10F0 => {
                 self.iop_dmac.dpcr = val;
             }
             0x1F80_10F4 => {
                 self.iop_dmac.write_dicr(val);
+                if self.iop_dmac.irq3_asserted() {
+                    self.iop_intc.raise_irq(IopIrqFlags::DMA);
+                }
             }
             0x1F80_1400..=0x1F80_1423 => {
                 self.iop_ssbusc.ssbus_ext[((paddr - 0x1F80_1400) >> 2) as usize] = val;
@@ -1107,11 +1257,23 @@ impl Bus {
             0x1F80_1450 => {
                 self.iop_gm_if = val;
             }
+            0x1F80_1500..=0x1F80_155C => {
+                let ch = 7 + (((paddr - 0x1F80_1500) >> 4) as usize);
+                if self.iop_dmac.write_channel_reg(ch, paddr & 0xF, val) {
+                    self.record_unimplemented_iop_reg(paddr, 4, true, val);
+                }
+            }
+            0x1F80_1560..=0x1F80_1568 => {
+                self.iop_dmac.ch_aux_4_9_a[((paddr - 0x1F80_1560) >> 2) as usize] = val;
+            }
             0x1F80_1570 => {
                 self.iop_dmac.dpcr2 = val;
             }
             0x1F80_1574 => {
                 self.iop_dmac.write_dicr2(val);
+                if self.iop_dmac.irq3_asserted() {
+                    self.iop_intc.raise_irq(IopIrqFlags::DMA);
+                }
             }
             0x1F80_1578 => {
                 self.iop_dmac.dmacen = val & 1;
@@ -1119,6 +1281,12 @@ impl Bus {
             0x1F80_157C => {
                 self.iop_dmac.dmacinten = val & 3;
                 self.iop_dmac.recompute_master_flag();
+                if self.iop_dmac.irq3_asserted() {
+                    self.iop_intc.raise_irq(IopIrqFlags::DMA);
+                }
+            }
+            0x1F80_15F0 => {
+                self.iop_dmac.dpcr3 = val;
             }
             0x1F80_2070 => {
                 self.iop_post2 = val;
@@ -1285,17 +1453,201 @@ mod tests {
         assert_eq!(bus.iop_read32(0x1F80_0100), 0xA5A5_5A5A);
         assert_eq!(bus.iop_read16(0x1F80_0102), 0xA5A5);
 
-        // Unimplemented IOP hardware register (e.g., IOP I_STAT at 0x1F80_1070) records explicit error.
+        // Unimplemented IOP hardware register (e.g., CDVD at 0x1F80_1800) records explicit error.
         assert_eq!(bus.pending_iop_mmio_error, None);
-        bus.iop_write32(0xBF80_1070, 0x0000_0001);
+        bus.iop_write32(0xBF80_1800, 0x0000_0001);
         assert_eq!(
             bus.pending_iop_mmio_error,
             Some(UnimplementedIopRegister {
-                paddr: 0x1F80_1070,
+                paddr: 0x1F80_1800,
                 width: 4,
                 is_write: true,
                 value: 1,
             })
         );
+    }
+
+    #[test]
+    fn ee_f500_and_mch_f4xx_read_write_and_reset_semantics() {
+        let mut bus = Bus::new();
+
+        // EE 0x1000_F500 reset value is 0; R/W does not disturb D_ENABLER (0x1000_F520 = 0x1201).
+        assert_eq!(bus.read32(0x1000_F500), 0);
+        assert_eq!(bus.read32(0x1000_F520), 0x1201);
+        bus.write32(0x1000_F500, 0x0000_0001);
+        assert_eq!(bus.read32(0x1000_F500), 0x0000_0001);
+        assert_eq!(bus.read8(0x1000_F500), 0x01);
+        assert_eq!(bus.read32(0x1000_F520), 0x1201);
+
+        // EE MCH 0x1000_F400..=0x1000_F4F0: non-F430/F440 slots (e.g. 0x1000_F410) round-trip 32-bit values.
+        assert_eq!(bus.read32(0x1000_F410), 0);
+        bus.write32(0x1000_F410, 0x8000_0000);
+        assert_eq!(bus.read32(0x1000_F410), 0x8000_0000);
+        assert_eq!(bus.pending_ee_mmio_error, None);
+    }
+
+    #[test]
+    fn ee_sio_registers_isr_w1c_and_txfifo_stdout_capture() {
+        let mut bus = Bus::new();
+
+        // Reset values are 0; SIO_ISR & 0xF000 != 0x8000 indicates TX FIFO ready.
+        for addr in [
+            0x1000_F100,
+            0x1000_F110,
+            0x1000_F120,
+            0x1000_F130,
+            0x1000_F140,
+            0x1000_F150,
+            0x1000_F180,
+            0x1000_F1C0,
+        ] {
+            assert_eq!(bus.read32(addr), 0);
+        }
+
+        // R/W on LCR, LSR, IER, FCR, BGR, RXFIFO.
+        bus.write32(0x1000_F100, 0x0000_0023);
+        bus.write32(0x1000_F110, 0x0000_0007);
+        bus.write32(0x1000_F120, 0x0000_0005);
+        bus.write32(0x1000_F140, 0x0000_000F);
+        bus.write32(0x1000_F150, 0x0000_004E);
+        bus.write32(0x1000_F1C0, 0x0000_0055);
+        assert_eq!(bus.read32(0x1000_F100), 0x23);
+        assert_eq!(bus.read32(0x1000_F110), 0x07);
+        assert_eq!(bus.read32(0x1000_F120), 0x05);
+        assert_eq!(bus.read32(0x1000_F140), 0x0F);
+        assert_eq!(bus.read32(0x1000_F150), 0x4E);
+        assert_eq!(bus.read32(0x1000_F1C0), 0x55);
+
+        // SIO_ISR (0x1000_F130): low 3 bits are write-1-to-clear.
+        bus.sio.isr = 0b111;
+        bus.write32(0x1000_F130, 0b101);
+        assert_eq!(bus.read32(0x1000_F130), 0b010);
+
+        // SIO_TXFIFO / KPUTCHAR (0x1000_F180): 8-bit and 32-bit writes append to stdout_buffer.
+        bus.write8(0x1000_F180, b'A');
+        bus.write32(0x1000_F180, u32::from(b'B'));
+        assert_eq!(&bus.stdout_buffer, b"AB");
+        assert_eq!(bus.read32(0x1000_F180), 0);
+        assert_eq!(bus.pending_ee_mmio_error, None);
+    }
+
+    #[test]
+    fn iop_gm_if_ssbusc_post2_and_kseg2_cache_ctrl_semantics() {
+        let mut bus = Bus::new();
+
+        // IOP GM_IF (0x1F80_1450): reset value 0 (bit 3 == 0 selects PS2 mode, bit 31 == 0 selects R3000A).
+        assert_eq!(bus.iop_read32(0xBF80_1450), 0);
+        bus.iop_write32(0xBF80_1450, 0x0000_00A5);
+        assert_eq!(bus.iop_read32(0xBF80_1450), 0x0000_00A5);
+        assert_eq!(bus.iop_read8(0xBF80_1450), 0xA5);
+
+        // IOP SSBUSC memctrl1 (0x1F80_1000..=0x1F80_1020), ram_size (0x1F80_1060), and ssbus_ext (0x1F80_1400..=0x1F80_1420).
+        // Verify ATYP bit 12 (0x1000) read-modify-write on 0xBF80_1010 (BIOS_ROM delay/size).
+        assert_eq!(bus.iop_read32(0xBF80_1010), 0);
+        bus.iop_write32(0xBF80_1010, 0x0000_1000);
+        let at = bus.iop_read32(0xBF80_1010) & 0x1000;
+        bus.iop_write32(0xBF80_1010, 0x0013_243F | at);
+        assert_eq!(bus.iop_read32(0xBF80_1010), 0x0013_343F);
+
+        bus.iop_write32(0xBF80_1060, 0x0000_0B88);
+        assert_eq!(bus.iop_read32(0xBF80_1060), 0x0000_0B88);
+
+        bus.iop_write32(0xBF80_1414, 0x0005_1234);
+        assert_eq!(bus.iop_read32(0xBF80_1414), 0x0005_1234);
+
+        // IOP POST2 (0x1F80_2070): 8-bit, 16-bit, and 32-bit R/W.
+        assert_eq!(bus.iop_read32(0xBF80_2070), 0);
+        bus.iop_write8(0xBF80_2070, 0xFC);
+        assert_eq!(bus.iop_read8(0xBF80_2070), 0xFC);
+        assert_eq!(bus.iop_read32(0xBF80_2070), 0x0000_00FC);
+
+        // IOP KSEG2 Cache Control (0xFFFE_0130..=0xFFFE_014F): does not alias BIOS ROM (0x1FFE_0130).
+        bus.bios[0x003E_0130..0x003E_0134].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        assert_eq!(bus.iop_read32(0xFFFE_0130), 0);
+        bus.iop_write32(0xFFFE_0130, 0x0001_E988);
+        bus.iop_write32(0xFFFE_0144, 0x0000_0001);
+        assert_eq!(bus.iop_read32(0xFFFE_0130), 0x0001_E988);
+        assert_eq!(bus.iop_read32(0xFFFE_0144), 0x0000_0001);
+        assert_eq!(bus.iop_read32(0xBFFE_0130), 0xDEAD_BEEF);
+        assert_eq!(bus.pending_iop_mmio_error, None);
+    }
+
+    #[test]
+    fn iop_dmac_control_and_intc_irq3_propagation() {
+        let mut bus = Bus::new();
+
+        // DPCR (0x1F80_10F0) resets to 0x0777_7777 on PS2 (`ps2tek` `#iopdma` line 4066).
+        assert_eq!(bus.iop_read32(0xBF80_10F0), 0x0777_7777);
+        assert_eq!(bus.iop_read32(0xBF80_10F4), 0);
+        assert_eq!(bus.iop_read32(0xBF80_1570), 0);
+        assert_eq!(bus.iop_read32(0xBF80_1574), 0);
+        assert_eq!(bus.iop_read32(0xBF80_1578), 0);
+        assert_eq!(bus.iop_read32(0xBF80_157C), 0);
+
+        // Simulate channel 0 interrupt flag set in DICR (bit 24) and channel 9 flag in DICR2 (bit 26).
+        bus.iop_dmac.dicr = 1 << 24;
+        bus.iop_dmac.dicr2 = 1 << 26;
+
+        // Enable master channel interrupt in DICR (bit 23) while DMACINTEN.0 == 0 -> DICR.31 stays 0.
+        bus.iop_write32(0xBF80_10F4, 1 << 23);
+        assert_eq!(bus.iop_read32(0xBF80_10F4) & (1 << 31), 0);
+        assert_eq!(bus.iop_read32(0xBF80_1070) & IopIrqFlags::DMA.bits(), 0);
+
+        // Enable DMACINTEN bit 0 (0xBF80_157C = 1) -> DICR.31 becomes 1 and asserts IRQ3 in I_STAT (0xBF80_1070).
+        bus.iop_write32(0xBF80_157C, 1);
+        assert_ne!(bus.iop_read32(0xBF80_10F4) & (1 << 31), 0);
+        assert_ne!(bus.iop_read32(0xBF80_1070) & IopIrqFlags::DMA.bits(), 0);
+
+        // Write-1-to-clear channel 0 flag in DICR (bit 24); DICR.31 stays 1 because DICR2 bit 26 is still set.
+        bus.iop_write32(0xBF80_10F4, (1 << 23) | (1 << 24));
+        assert_eq!(bus.iop_read32(0xBF80_10F4) & (1 << 24), 0);
+        assert_ne!(bus.iop_read32(0xBF80_10F4) & (1 << 31), 0);
+
+        // Write-1-to-clear channel 9 flag in DICR2 (bit 26) -> DICR.31 clears to 0.
+        bus.iop_write32(0xBF80_1574, 1 << 26);
+        assert_eq!(bus.iop_read32(0xBF80_1574) & (1 << 26), 0);
+        assert_eq!(bus.iop_read32(0xBF80_10F4) & (1 << 31), 0);
+        assert_eq!(bus.pending_iop_mmio_error, None);
+    }
+
+    #[test]
+    fn iop_dmac_channels_aux_and_dpcr3_semantics() {
+        let mut bus = Bus::new();
+
+        // DPCR3 (0x1F80_15F0) and auxiliary 4/9/A registers (0x1F80_1560..=0x1F80_1568).
+        assert_eq!(bus.iop_read32(0xBF80_15F0), 0);
+        bus.iop_write32(0xBF80_15F0, 0x0000_0777);
+        assert_eq!(bus.iop_read32(0xBF80_15F0), 0x0000_0777);
+
+        for (i, addr) in [0xBF80_1560u32, 0xBF80_1564, 0xBF80_1568]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(bus.iop_read32(addr), 0);
+            let val = 0x1111_0000 | (i as u32);
+            bus.iop_write32(addr, val);
+            assert_eq!(bus.iop_read32(addr), val);
+        }
+
+        // Old channels 0..6 (0x1F80_1080..=0x1F80_10EC) and new channels 7..12 (0x1F80_1500..=0x1F80_155C).
+        // Verify MADR and TADR mask to 24 bits (0x00FF_FFFF), BCR and CHCR store 32 bits, and CHCR bit 24 == 0 does not error.
+        bus.iop_write32(0xBF80_10C0, 0xFF12_3456); // Ch 4 (SPU) MADR
+        bus.iop_write32(0xBF80_10C4, 0x0010_0020); // Ch 4 (SPU) BCR
+        bus.iop_write32(0xBF80_10C8, 0x0000_0601); // Ch 4 (SPU) CHCR (stopped)
+        bus.iop_write32(0xBF80_10CC, 0xAB65_4320); // Ch 4 (SPU) TADR
+        assert_eq!(bus.iop_read32(0xBF80_10C0), 0x0012_3456);
+        assert_eq!(bus.iop_read32(0xBF80_10C4), 0x0010_0020);
+        assert_eq!(bus.iop_read32(0xBF80_10C8), 0x0000_0601);
+        assert_eq!(bus.iop_read32(0xBF80_10CC), 0x0065_4320);
+
+        bus.iop_write32(0xBF80_1520, 0x9900_8000); // Ch 9 (SIF0) MADR
+        bus.iop_write32(0xBF80_1524, 0x0001_0008); // Ch 9 (SIF0) BCR
+        bus.iop_write32(0xBF80_1528, 0x0000_0701); // Ch 9 (SIF0) CHCR (stopped)
+        bus.iop_write32(0xBF80_152C, 0xFE01_2340); // Ch 9 (SIF0) TADR
+        assert_eq!(bus.iop_read32(0xBF80_1520), 0x0000_8000);
+        assert_eq!(bus.iop_read32(0xBF80_1524), 0x0001_0008);
+        assert_eq!(bus.iop_read32(0xBF80_1528), 0x0000_0701);
+        assert_eq!(bus.iop_read32(0xBF80_152C), 0x0001_2340);
+        assert_eq!(bus.pending_iop_mmio_error, None);
     }
 }

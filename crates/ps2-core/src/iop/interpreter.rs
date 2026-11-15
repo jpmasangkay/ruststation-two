@@ -72,6 +72,14 @@ impl IopCpuState {
         enable_hle: bool,
         advance_bus_timers: bool,
     ) -> IopStepResult {
+        // Synchronize IOP INTC output line (`I_CTRL && (I_STAT & I_MASK)`) into `COP0.Cause.IP2`
+        // (`bit 10 = 0x0400`, verified against `ps2sdk` `iop/system/intrman/src/intrman.c` lines 838-843, 1216-1220, `FETCHED`).
+        if bus.iop_intc.irq_pending() {
+            self.cop0.cause |= 1 << 10;
+        } else {
+            self.cop0.cause &= !(1 << 10);
+        }
+
         // Check for pending hardware/software interrupts before fetching.
         if self.cop0.is_interrupt_pending() {
             let (vec_pc, vec_next) = self.cop0.raise_exception(
@@ -777,12 +785,18 @@ impl IopCpuState {
         if advance_bus_timers {
             bus.step_timers(EE_CYCLES_PER_IOP_CYCLE as u32);
         }
+        if bus.iop_intc.irq_pending() {
+            self.cop0.cause |= 1 << 10;
+        } else {
+            self.cop0.cause &= !(1 << 10);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::IopIrqFlags;
 
     fn write_iop_code(bus: &mut Bus, base: u32, words: &[u32]) {
         for (i, &w) in words.iter().enumerate() {
@@ -868,5 +882,86 @@ mod tests {
         iop.step(&mut bus);
         assert_eq!(iop.hi, (-53i32) as u32);
         assert_eq!(iop.lo, 1);
+    }
+
+    #[test]
+    fn iop_cop0_sr_isc_isolates_cache_stores_from_ram() {
+        let mut iop = IopCpuState::new();
+        let mut bus = Bus::new();
+
+        // Seed IOP RAM words at 0x0000_2000..=0x0000_2008.
+        bus.iop_write32(0x0000_2000, 0x1122_3344);
+        bus.iop_write32(0x0000_2004, 0x5566_7788);
+        bus.iop_write32(0x0000_2008, 0x99AA_BBCC);
+
+        iop.write_gpr(4, 0x0000_2000); // $a0 = target base
+        iop.write_gpr(8, 0xDEAD_BEEF); // $t0 = store payload
+        iop.write_gpr(9, 1 << 16); // $t1 = COP0.SR.IsC (bit 16)
+
+        // Program at 0x1000:
+        // 0x1000: mtc0 $t1, $12     (0x4089_6000) -> set SR.IsC = 1
+        // 0x1004: sw   $t0, 0($a0)  (0xAC88_0000) -> isolated store (must NOT overwrite 0x2000)
+        // 0x1008: sh   $t0, 4($a0)  (0xA488_0004) -> isolated store (must NOT overwrite 0x2004)
+        // 0x100C: sb   $t0, 8($a0)  (0xA088_0008) -> isolated store (must NOT overwrite 0x2008)
+        // 0x1010: swl  $t0, 3($a0)  (0xA888_0003) -> isolated store (must NOT overwrite 0x2000)
+        // 0x1014: swr  $t0, 0($a0)  (0xB888_0000) -> isolated store (must NOT overwrite 0x2000)
+        // 0x1018: mtc0 $zero, $12   (0x4080_6000) -> clear SR.IsC = 0
+        // 0x101C: sw   $t0, 0($a0)  (0xAC88_0000) -> normal store (overwrites 0x2000 with 0xDEAD_BEEF)
+        write_iop_code(
+            &mut bus,
+            0x0000_1000,
+            &[
+                0x4089_6000,
+                0xAC88_0000,
+                0xA488_0004,
+                0xA088_0008,
+                0xA888_0003,
+                0xB888_0000,
+                0x4080_6000,
+                0xAC88_0000,
+            ],
+        );
+        iop.set_pc(0x0000_1000);
+
+        // Execute first 6 instructions (while SR.IsC == 1): RAM must remain untouched.
+        for _ in 0..6 {
+            iop.step(&mut bus);
+        }
+        assert_eq!(bus.iop_read32(0x0000_2000), 0x1122_3344);
+        assert_eq!(bus.iop_read32(0x0000_2004), 0x5566_7788);
+        assert_eq!(bus.iop_read32(0x0000_2008), 0x99AA_BBCC);
+
+        // Execute remaining 2 instructions (clear SR.IsC, then sw): 0x2000 is updated.
+        iop.step(&mut bus);
+        iop.step(&mut bus);
+        assert_eq!(bus.iop_read32(0x0000_2000), 0xDEAD_BEEF);
+        assert_eq!(bus.iop_read32(0x0000_2004), 0x5566_7788);
+        assert_eq!(bus.iop_read32(0x0000_2008), 0x99AA_BBCC);
+    }
+
+    #[test]
+    fn iop_intc_delivers_ip2_interrupt_to_cop0_vector() {
+        let mut iop = IopCpuState::new();
+        let mut bus = Bus::new();
+
+        // Place nop at 0x0000_1000 and at RAM exception vector 0x0000_0080 (KSEG0 0x8000_0080).
+        bus.iop_write32(0x0000_1000, 0x0000_0000);
+        bus.iop_write32(0x0000_0080, 0x0000_0000);
+        iop.set_pc(0x0000_1000);
+
+        // Enable IM2 (bit 10 = 0x0400) and IEc (bit 0 = 1) in COP0.SR (BEV = 0).
+        iop.cop0.status = 0x0000_0401;
+
+        // Raise TMR0 in I_STAT, enable TMR0 in I_MASK, and set I_CTRL = 1.
+        bus.iop_intc.raise_irq(IopIrqFlags::TMR0);
+        bus.iop_write32(0xBF80_1074, IopIrqFlags::TMR0.bits());
+        bus.iop_write32(0xBF80_1078, 1);
+
+        // Stepping one cycle takes the interrupt exception into 0x8000_0080 and executes the nop at 0x8000_0080.
+        iop.step(&mut bus);
+        assert_eq!(iop.cop0.epc, 0x0000_1000);
+        assert_eq!(iop.cop0.cause & 0x0000_047C, 1 << 10); // IP2 set, ExcCode = 0 (Int)
+        assert_eq!(iop.cop0.status & 0x3F, 0x04); // IEp = 1, IEc = 0
+        assert_eq!(iop.pc, 0x8000_0084);
     }
 }

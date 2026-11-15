@@ -22,7 +22,7 @@
 /// Emotion Engine RDRAM controller (`MCH`, `0x1000_F400..=0x1000_F4F0`) state machine (`ps2tek` `#eerdram`).
 // TODO(verify): `ps2tek` `#eerdram` only documents `0x1000_F430` (`MCH_RICM`) and `0x1000_F440` (`MCH_DRD`).
 // Remaining 16-byte-aligned slots in `0x1000_F400..=0x1000_F4F0` (such as `0x1000_F410`, accessed by the EE BIOS
-// memory initialization routine at `PC = 0x9FC4_11B4`) are backed by 32-bit R/W latches in `regs`.
+// `Initialize memory` routine at `PC = 0x9FC4_11B4`) are backed by 32-bit R/W latches in `regs`.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct RdramMch {
     pub ricm: u32,
