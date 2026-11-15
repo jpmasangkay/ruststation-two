@@ -1196,19 +1196,27 @@ mod tests {
 
         assert_eq!(drain_gif(&mut gif, &mut gs, &mut intc, 16), 7);
         assert_eq!(
-            gs.core.vram.read_pixel_raw(ps2_gs::PixelFormat::Psmct32, 0, 1, 2, 1),
+            gs.core
+                .vram
+                .read_pixel_raw(ps2_gs::PixelFormat::Psmct32, 0, 1, 2, 1),
             0xAABB_CC01
         );
         assert_eq!(
-            gs.core.vram.read_pixel_raw(ps2_gs::PixelFormat::Psmct32, 0, 1, 3, 1),
+            gs.core
+                .vram
+                .read_pixel_raw(ps2_gs::PixelFormat::Psmct32, 0, 1, 3, 1),
             0xAABB_CC02
         );
         assert_eq!(
-            gs.core.vram.read_pixel_raw(ps2_gs::PixelFormat::Psmct32, 0, 1, 2, 2),
+            gs.core
+                .vram
+                .read_pixel_raw(ps2_gs::PixelFormat::Psmct32, 0, 1, 2, 2),
             0xAABB_CC03
         );
         assert_eq!(
-            gs.core.vram.read_pixel_raw(ps2_gs::PixelFormat::Psmct32, 0, 1, 3, 2),
+            gs.core
+                .vram
+                .read_pixel_raw(ps2_gs::PixelFormat::Psmct32, 0, 1, 3, 2),
             0xAABB_CC04
         );
     }

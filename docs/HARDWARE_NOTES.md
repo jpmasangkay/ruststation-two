@@ -520,6 +520,31 @@ Implemented in `crates/ps2-gs` (depends only on `ps2-common`, `bitflags`, `thise
 3. **`DIMX` (`0x44`) element width**: `ps2sdk common/include/gs_gp.h` masks each matrix entry with `& 0x3` (2 bits, typo), whereas `ps2sdk ee/libgs/include/libgs.h` defines 16 signed **3-bit** entries (`-4..=+3`) at bit offsets `0, 4, 8, ..., 60`. Implemented 3-bit two's-complement entries (`(raw3 << 5) >> 5`).
 4. **`PSMT4HL` (`0x24`) vs `PSMT4HH` (`0x2C`)**: `ps2sdk common/include/gs_psm.h` comment swaps descriptions (`4HL` `"28 to 32"`, `4HH` `"24 to 27"`), whereas `Play! GSHandler.cpp` & `GSH_OpenGL_Texture.cpp` confirm `PSMT4HL = bits 24..=27` and `PSMT4HH = bits 28..=31`. Followed `Play!`.
 
+---
+
+## 14. Graphics Synthesizer (`crates/ps2-gs`) — Phase 2b Step 2 (Non-Textured Rasterizer & `ps2-gs-runner`)
+
+### 14.1 Single-Source Coverage (`crates/ps2-gs/src/coverage.rs`)
+
+Pixel center, top-left fill, sprite boundary, point snap, and Bresenham line-endpoint rules live in a single function (`coverage::is_pixel_covered`), switched globally via one constant (`coverage::ACTIVE_COVERAGE: CoverageConvention`, defaulting to `CoverageConvention::IntegerCenter` with `IntegerCenterHalfOpenLine` and `HalfPixelCenterHalfOpenLine` available for Step 4 A/B comparison without touching `raster.rs`).
+
+Verbatim statements from Hans-Kristian Arntzen (`themaister`), *"PlayStation 2 GS emulation – The Final Frontier of Vulkan Compute Emulation"* (2024-07-03, `https://themaister.net/blog/2024/07/03/playstation-2-gs-emulation-the-final-frontier-of-vulkan-compute-emulation/`, `FETCHED`):
+- `"Triangles are top-left raster, just like modern GPUs."`
+- `"Pixel center is on integer coordinate, just like D3D9."`
+- `"Lines use Bresenham's algorithm"`
+- `"Points snap to nearest pixel. Unsure which rounding is used though ..."`
+- `"Sprites are simple quads with two coordinates."`
+
+Unconfirmed sub-pixel rounding, sprite corner normalization, Bresenham endpoint inclusion, attribute interpolation truncation, `ZTE=0` handling, and Z-format bit masks are catalogued in `docs/GS_GUESSES.md` (`G-009`..`G-015`).
+
+### 14.2 Primitives, Depth, Framebuffers & Dumper (`crates/ps2-gs/src/raster.rs`, `crates/ps2-gs-runner`)
+
+- **Vertex assembly & shading** (`Play! Source/gs/GSH_OpenGL/GSH_OpenGL.cpp`, BSD-2-Clause, `FETCHED`): `PRIM` writes clear the vertex queue while `PRMODE`/`PRMODECONT` updates do not (`GsRegs::effective_prim()`); `XYZ2`/`XYZF2` trigger a drawing kick when the primitive's vertex count is met while `XYZ3`/`XYZF3` (`ADC`) advance strip/fan queues without drawing; flat shading (`IIP=0`) takes the final vertex color (`v1` for lines, `v2` for triangles); `Sprite` takes both flat color and depth `Z` from `v1`.
+- **Coordinates, clipping & pixel tests** (`local/ps2tek/index.html`, `FETCHED`): `XYOFFSET_1/2` 12.4 fixed-point offsets are subtracted from `XYZ`/`XYZF`; `SCISSOR_1/2` clips inclusively to `[scax0..=scax1, scay0..=scay1]`; `TEST_1/2` implements `ZTE` and `ZTST` (`0=NEVER`, `1=ALWAYS`, `2=GEQUAL`, `3=GREATER`) alongside `ZBUF_1/2` (`ZMSK`, `PSMZ32`/`24`/`16`/`16S`).
+- **Framebuffer write masking & formats** (`local/ps2tek/index.html`, `FETCHED`; `Play! GSH_OpenGL_Texture.cpp`, `FETCHED`): `FRAME.FBMSK` is applied in 32-bit RGBA space prior to format conversion (`PSMCT32`, `PSMCT24` preserving upper 8 bits `24..=31`, `PSMCT16`/`16S` packing `R[0..4]`, `G[5..9]`, `B[10..14]`, `A[15]` with mask bit 63 controlling alpha bit 15). Texturing/fog/alpha-blending/AA/alpha-test/dithering (`TME`/`FGE`/`ABE`/`AA1`/`ATE`/`DATE`/`DTHE`/`COLCLAMP`/`FBA`) remain deferred to Step 3.
+- **Standalone dumper (`crates/ps2-gs-runner`)**: executes `.gsp` packet streams headless via `ps2-gs` and exports PNG images (defaulting to `local/gs_out/`), supporting `--rect FBP,FBW,PSM,W,H` or `.gsp` `surface` directives (`9/9` suites in `=== GS RENDER GATE ===`).
+
+
 
 
 

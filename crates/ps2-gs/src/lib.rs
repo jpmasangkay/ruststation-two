@@ -4,15 +4,22 @@
 
 #![forbid(unsafe_code)]
 
+pub mod coverage;
 pub mod packet;
+pub mod raster;
 pub mod regs;
 pub mod transfer;
 pub mod vram;
 
+pub use coverage::{
+    is_pixel_covered, is_pixel_covered_active, CoverageConvention, CoveragePrimitive,
+    ACTIVE_COVERAGE,
+};
 pub use packet::{
     decode_packed_qwc, execute_gsp_script, parse_gsp_script, GifDataFormat, GifStreamDecoder,
     GifTag, GspCommand, GspParseError, GspSurfaceHint, PackedDecodeOutcome,
 };
+pub use raster::{GsVertex, RasterizerState};
 pub use regs::{gs_reg, GsRegs};
 pub use transfer::{TransferMode, TransferState};
 pub use vram::{GsVram, PixelFormat, PixelLocation};
@@ -25,6 +32,7 @@ pub struct GsState {
     pub regs: GsRegs,
     pub vram: GsVram,
     pub transfer: TransferState,
+    pub rasterizer: RasterizerState,
 }
 
 impl Default for GsState {
@@ -39,14 +47,16 @@ impl GsState {
             regs: GsRegs::new(),
             vram: GsVram::new(),
             transfer: TransferState::new(),
+            rasterizer: RasterizerState::new(),
         }
     }
 
-    /// Clear registers, 4 MB VRAM, and active transfers in place.
+    /// Clear registers, 4 MB VRAM, active transfers, and rasterizer state in place.
     pub fn reset(&mut self) {
         self.regs = GsRegs::new();
         self.vram.clear();
         self.transfer.reset();
+        self.rasterizer.reset();
     }
 
     #[inline]
@@ -58,6 +68,25 @@ impl GsState {
     pub fn write_internal_reg(&mut self, reg: u8, data: u64) {
         self.regs.write_internal(reg, data);
         match reg {
+            gs_reg::PRIM => {
+                self.rasterizer.on_prim_write(self.regs.prim);
+            }
+            gs_reg::XYZF2 => {
+                self.rasterizer
+                    .vertex_kick(&self.regs, &mut self.vram, data, true, true);
+            }
+            gs_reg::XYZ2 => {
+                self.rasterizer
+                    .vertex_kick(&self.regs, &mut self.vram, data, false, true);
+            }
+            gs_reg::XYZF3 => {
+                self.rasterizer
+                    .vertex_kick(&self.regs, &mut self.vram, data, true, false);
+            }
+            gs_reg::XYZ3 => {
+                self.rasterizer
+                    .vertex_kick(&self.regs, &mut self.vram, data, false, false);
+            }
             gs_reg::TRXDIR => {
                 self.transfer
                     .start_trxdir(&self.regs, &mut self.vram, data as u8);

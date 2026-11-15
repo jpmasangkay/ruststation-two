@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 clap.workspace = true
+png.workspace = true
 ps2-common = { path = "../ps2-common" }
 ps2-core = { path = "../ps2-core" }
 ps2-gs.workspace = true
