@@ -25,7 +25,7 @@ use ps2_common::Reg128;
 
 use crate::mmu::{Tlb, TlbEntry, TranslatedAddr, Vtlb, VtlbTarget};
 use crate::scheduler::{HardwareEventKind, Scheduler};
-use crate::vu::micro::{exec_shared_lower_op, step_micro_liw};
+use crate::vu::micro::{exec_macro_op, step_micro_liw};
 use crate::vu::{VuState, VU0_TPC_MASK, VU1_TPC_MASK, VU_REVISION_ID};
 
 pub use dmac::{DmaChannel, EeDmac, UnimplementedDmaTransfer};
@@ -766,7 +766,7 @@ impl Bus {
     /// Execute a single `COP2` macro-mode instruction on `self.vu0`.
     #[inline]
     pub fn exec_vu0_macro(&mut self, instr: u32) {
-        exec_shared_lower_op(&mut self.vu0, &mut self.vu_mem[0x4000..0x5000], instr);
+        exec_macro_op(&mut self.vu0, &mut self.vu_mem[0x4000..0x5000], instr);
     }
 
     /// Start `VU0` microprogram execution at `start_tpc` (8-byte LIW instruction index).

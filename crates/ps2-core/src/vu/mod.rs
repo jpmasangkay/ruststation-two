@@ -66,4 +66,69 @@ mod tests {
         }
         assert_eq!(vu.tpc, 0x001F);
     }
+
+    #[test]
+    fn vu_loi_reads_previous_i_and_upper_wins_same_cycle_vf_conflict() {
+        let mut vu = VuState::new();
+        let mut code_mem = vec![0u8; 0x1000];
+        let mut data_mem = vec![0u8; 0x1000];
+
+        // Preload I = 2.0f (0x4000_0000), VF01.x = 3.0f (0x4040_0000).
+        vu.i = 0x4000_0000;
+        vu.write_vf_lane(1, 0, 0x4040_0000);
+
+        // LIW 0: Upper = ADDi.x vf02, vf01, I (dest=X=0b1000, fs=1, fd=2, funct=0x22) | UPPER_BIT_I;
+        //        Lower = 5.0f (0x40A0_0000).
+        // Upper must read previous I (2.0f -> 3.0 + 2.0 = 5.0f = 0x40A0_0000), then I becomes 5.0f.
+        let upper0 = UPPER_BIT_I | (0b1000 << 21) | (1 << 11) | (2 << 6) | 0x22;
+        let lower0 = 0x40A0_0000u32;
+        code_mem[0..4].copy_from_slice(&lower0.to_le_bytes());
+        code_mem[4..8].copy_from_slice(&upper0.to_le_bytes());
+
+        // LIW 1: Upper = ADDi.x vf03, vf02, I (5.0 + 5.0 = 10.0f = 0x4120_0000);
+        //        Lower = MOVE.xy vf03, vf01 (bit 31=1, dest=XY=0b1100, ft=3, fs=1, op11=0x33C).
+        // On lane X both write vf03.x -> Upper wins (10.0f); on lane Y only Lower writes vf03.y (0.0f).
+        vu.write_vf_lane(1, 1, 0x3F80_0000); // VF01.y = 1.0f
+        let upper1 = UPPER_BIT_E | (0b1000 << 21) | (2 << 11) | (3 << 6) | 0x22;
+        let lower1: u32 = 0x8000_0000 | (0b1100 << 21) | (3 << 16) | (1 << 11) | 0x33C;
+        code_mem[8..12].copy_from_slice(&lower1.to_le_bytes());
+        code_mem[12..16].copy_from_slice(&upper1.to_le_bytes());
+
+        vu.start_micro(0, VU0_TPC_MASK);
+        while vu.running {
+            step_micro_liw(&mut vu, &code_mem, &mut data_mem, VU0_TPC_MASK);
+        }
+        assert_eq!(vu.i, 0x40A0_0000);
+        assert_eq!(vu.read_vf_lane(2, 0), 0x40A0_0000);
+        assert_eq!(vu.read_vf_lane(3, 0), 0x4120_0000); // Upper won on X
+        assert_eq!(vu.read_vf_lane(3, 1), 0x3F80_0000); // Lower wrote Y
+    }
+
+    #[test]
+    fn vu_jalr_same_reg_and_r_lfsr_operations() {
+        let mut vu = VuState::new();
+        let mut data_mem = vec![0u8; 0x1000];
+
+        // JALR vi01, vi01 at TPC=2 (delay_slot_tpc=3): target is old vi01 (6), vi01 becomes 4.
+        vu.write_vi(1, 6);
+        let jalr = (0x25 << 25) | (1 << 16) | (1 << 11);
+        exec_micro_lower_type789(&mut vu, &mut data_mem, jalr, 3, VU0_TPC_MASK);
+        assert!(vu.branch_delay_active);
+        assert_eq!(vu.branch_delay_target, 6);
+        assert_eq!(vu.read_vi(1), 4);
+
+        // RINIT, RXOR, RGET, RNEXT via shared lower ops
+        vu.write_vf_lane(1, 0, 0x3FA3_4567);
+        let rinit = 0x8000_0000 | (1 << 11) | 0x43E; // RINIT R, vf01.x
+        exec_shared_lower_op(&mut vu, &mut data_mem, rinit);
+        assert_eq!(vu.r, 0x0023_4567);
+
+        let rget = 0x8000_0000 | (0b1111 << 21) | (2 << 16) | 0x43D; // RGET.xyzw vf02
+        exec_shared_lower_op(&mut vu, &mut data_mem, rget);
+        assert_eq!(vu.read_vf_lane(2, 0), 0x3FA3_4567);
+
+        let rnext = 0x8000_0000 | (0b1111 << 21) | (3 << 16) | 0x43C; // RNEXT.xyzw vf03
+        exec_shared_lower_op(&mut vu, &mut data_mem, rnext);
+        assert_eq!(vu.read_vf_lane(3, 0), 0x3FC6_8ACE);
+    }
 }
