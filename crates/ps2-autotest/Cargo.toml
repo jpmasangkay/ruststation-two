@@ -11,6 +11,7 @@ png.workspace = true
 ps2-common = { path = "../ps2-common" }
 ps2-core = { path = "../ps2-core" }
 ps2-gs.workspace = true
+ps2-gs-runner = { path = "../ps2-gs-runner" }
 similar.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

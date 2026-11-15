@@ -297,6 +297,7 @@ dependencies = [
  "ps2-common",
  "ps2-core",
  "ps2-gs",
+ "ps2-gs-runner",
  "similar",
  "thiserror",
  "tracing",

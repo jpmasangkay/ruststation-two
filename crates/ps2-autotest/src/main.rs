@@ -10,6 +10,7 @@ use ps2_core::bus::{
     Bus, UnimplementedDmaTransfer, UnimplementedEeRegister, UnimplementedIopRegister,
 };
 
+mod gs_elf_gate;
 mod gs_gate;
 use ps2_core::ee::{EeCpuState, EeHleState, HleStepResult};
 use ps2_core::iop::{
@@ -636,13 +637,17 @@ fn run_hardware_gate(suite_dir: &Path, max_cycles: u64) -> ExitCode {
 
     let (gs_passed, gs_failures) = gs_gate::run_gs_render_gate();
     let _ = gs_passed;
+    let (_elf_passed, elf_failures) = gs_elf_gate::run_gs_elf_gate();
 
-    if !failure_diffs.is_empty() || !gs_failures.is_empty() {
+    if !failure_diffs.is_empty() || !gs_failures.is_empty() || !elf_failures.is_empty() {
         for (suite, diff) in &failure_diffs {
             eprintln!("\n--- FAILURE DIFF: {suite} ---\n{diff}");
         }
         for (suite, reason) in &gs_failures {
             eprintln!("\n--- GS RENDER GATE FAILURE: {suite} ---\n{reason}");
+        }
+        for (suite, reason) in &elf_failures {
+            eprintln!("\n--- GS ELF GATE FAILURE: {suite} ---\n{reason}");
         }
         return ExitCode::FAILURE;
     }
