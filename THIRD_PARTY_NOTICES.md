@@ -54,8 +54,24 @@ DAMAGE.
   - `common/include/gs_psm.h`
   - `ee/libgs/include/libgs.h`
 - **Permissive-license & non-code hardware-fact usage rationale**:
-  - `ps2sdk`'s root `LICENSE` is `AFL-2.0` (a permissive, OSI-approved license compatible with this workspace's permissive-only rule; note this differs from AFL-3.0).
+  - `ps2sdk`'s root `LICENSE` is `AFL-2.0` (a permissive, OSI-approved academic license compatible with this workspace's permissive-only rule).
   - Moreover, no C source code or macro text from `ps2sdk` was copied into the repository. Only factual hardware register bit offsets, masks, and `PSM` numeric opcodes were consulted (and cross-checked with `local/ps2tek/index.html` and BSD-2 `Play!`), re-expressed in independent Rust structs in `crates/ps2-gs/src/regs.rs` and `crates/ps2-gs/src/vram.rs`.
+
+### Source Attribution & Copyright Notice (`ps2dev/ps2sdk` / `ee/libgs/include/libgs.h`)
+
+Per Section 6 (*Attribution Rights*) of `AFL-2.0`, this repository retains the copyright and licensing notices from the consulted `ps2sdk` headers (`common/include/gs_gp.h`, `common/include/gs_privileged.h`, `common/include/gs_psm.h`, `ee/libgs/include/libgs.h`) and notes that hardware register bit layouts and constants were re-expressed in independent Rust definitions rather than distributing modified copies of `ps2sdk` C headers:
+
+```text
+/*
+# _____     ___ ____     ___ ____
+#  ____|   |    ____|   |        | |____|
+# |     ___|   |____ ___|    ____| |    \    PS2DEV Open Source Project.
+#-----------------------------------------------------------------------
+# (c) 2009 Lion
+# Licenced under Academic Free License version 2.0
+# Review ps2sdk README & LICENSE files for further details.
+*/
+```
 
 ### Exact License Text (`LICENSE` in `ps2dev/ps2sdk`)
 

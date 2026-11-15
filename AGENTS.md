@@ -30,6 +30,7 @@
 ## Legal and content rules
 - Never commit BIOS dumps, game images, or memory cards. Keep them in a gitignored `local/` directory.
 - Do not copy code from PCSX2 (GPL-3). Read it for behavior and write independent code. Note any ported algorithm and its source in a comment.
+- PCSX2 (GPL-3) is a black-box comparison tool only. Never read its source, never copy any of its files into the repo, never modify its install. Its path is in local/PCSX2_PATH.txt. All PCSX2 outputs go under local/.
 - Do not add dependencies with GPL/AGPL licenses to the workspace without asking.
 
 ## Verification
