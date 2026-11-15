@@ -320,7 +320,7 @@ Implemented in `crates/ps2-core/src/vu/pipeline.rs` (`VuPipeline`) and integrate
   - **`EFU` (`P`)**: `efu_pending_p` / `efu_cycles` model the EFU busy timer using `efu_latency` (`ESADD=11`, `ERSADD=18`, `ELENG=18`, `ERLENG=24`, `EATANxy/EATANxz=54`, `ESUM=12`, `ESQRT=12`, `ERSQRT=18`, `ERCPR=12`, `ESIN=29`, `EATAN=54`, `EEXP=44`), stalling on `WAITP` (`0x7BF`) or another EFU op.
 - **Classification**:
   - **Sourced (`FETCHED`)**: `Q` latencies (`7` for `DIV`/`SQRT`, `13` for `RSQRT`), non-stalling reads returning old `Q`, and `FDIV`/`WAITQ` busy stalls — `ps2tek` `#vupipelining` (`local/ps2tek/index.html` lines 2887–2904, `FETCHED`) and `local/ps2autotests/tests/vu/lower/fdivdelay.cpp` + `fdivdelay.expected` (`FETCHED`). `EFU` latency numbers (`11..54`) — `ps2tek` `#vupipelining` (`local/ps2tek/index.html` lines 2915–2927, `FETCHED`).
-  - **`inferred; fits test vectors, may not generalize`**: Exact `CTC2 $22` cancellation behavior, exact `efu_cycles` vs `efu_cycles - 1` stall boundary (noting `ps2tek` line 2912 states EFU lacks the writeback hazard stage), and EFU numeric evaluation (EFU work is parked on local branch `wip/efu` pending Step 4 completion).
+  - **`inferred; fits test vectors, may not generalize`**: Exact `CTC2 $22` cancellation behavior and exact `efu_cycles` vs `efu_cycles - 1` stall boundary (noting `ps2tek` line 2912 states EFU lacks the writeback hazard stage); EFU numeric evaluation is implemented in `crates/ps2-core/src/vu/efu.rs` (`184/208`, see §12).
 
 ### 9.4 Stall / Branch Interaction
 
@@ -342,7 +342,7 @@ Implemented in `crates/ps2-core/src/vu/pipeline.rs` (`VuPipeline`) and integrate
 | `FCSET` queue flush & `CLIP`+`FCSET` same-cycle rule | `FCSET` overwrites `clip_queue[0..2]` & `vu.clip_flag` | **`inferred; fits test vectors, may not generalize`** | Not directly tested in `clip.cpp` |
 | `MAC` & `Status` 4-cycle flag pipelines | Direct access via `CTC2`/`FS*`/`FM*`; FMAC flag updates omitted | **Deferred** | Not exercised by current passing Phase 2a suites |
 | `Q` (`DIV`/`SQRT`=`7`, `RSQRT`=`13`), stale-`Q` reads, `WAITQ`/FDIV stalls | `fdiv_pending_q` committed on `fdiv_cycles == 0` | **Sourced (`FETCHED`)** | `ps2tek` `#vupipelining`; `fdivdelay.cpp` |
-| `EFU` `P` latency table (`11..54` cycles) | `efu_latency` table in `vu/pipeline.rs` | **Sourced (`FETCHED`)** (ops parked on `wip/efu`) | `ps2tek` `#vupipelining` |
+| `EFU` `P` latency table (`11..54` cycles) | `efu_latency` table in `vu/pipeline.rs` | **Sourced (`FETCHED`)** (ops in `vu/efu.rs`, `184/208`; see §12) | `ps2tek` `#vupipelining` |
 | `EFU` stall boundary (`efu_cycles` vs `efu_cycles - 1`) & `CTC2 $22` cancel | Stalls full `efu_cycles`; `CTC2 $22` zeroes `fdiv_cycles` | **`inferred; fits test vectors, may not generalize`** | Unverified pending Step 2c EFU resume |
 | Delay-slot RAW stalls draining `FDIV`/`CLIP` across branches | `before_liw` drains stall cycles cleanly with `branch_delay_active` | **Sourced (`FETCHED`)** | `fdivdelay.cpp` (`PerformStalledBranch`) |
 | Instantaneous stall drain per `step_micro_liw` in `Bus::step_timers` | `1.max(ee_cycles / 2)` LIW steps without slowing EE clock | **`inferred; fits test vectors, may not generalize`** | Untested against cycle-accurate EE/VU race tests |
@@ -475,7 +475,7 @@ All behaviors below are implemented strictly from `local/ps2tek/index.html` (`#g
 
 ## 12. VU1 Elementary Function Unit (`EFU`, `crates/ps2-core/src/vu/efu.rs`)
 
-Implemented for `VU1` (`efu.elf`: **`184 / 208`** vectors matching across all 13 instructions; `vu/lower/efu.elf` remains in `DEFERRED_GATE_SUITES` until `208/208` match). Pipeline latencies (`11..=54` cycles) and `P` destination behavior come from `local/ps2tek/index.html` (`#vu`, `#vupipelining`, `FETCHED`). Polynomial formulas, evaluation orders, and numeric constants originate from `Play!` (BSD-2-Clause, see `THIRD_PARTY_NOTICES.md`, `Source/ee/MA_VU_Lower.cpp`, `FETCHED`).
+Implemented for `VU1` (`efu.elf`: **`184 / 208`** vectors matching across all 13 instructions; `vu/lower/efu.elf` remains `DEFERRED` in `DEFERRED_GATE_SUITES` with reason `"partial: 184/208 vectors; see HARDWARE_NOTES.md EFU section"` until `208/208` match). Pipeline latencies (`11..=54` cycles) and `P` destination behavior come from `local/ps2tek/index.html` (`#vu`, `#vupipelining`, `FETCHED`). Polynomial formulas, evaluation orders, and numeric constants originate from `Play!` (BSD-2-Clause, see `THIRD_PARTY_NOTICES.md`, `Source/ee/MA_VU_Lower.cpp`, `FETCHED`).
 
 Non-sourced deviations discovered against `efu.expected` are explicitly labeled **`inferred; may not generalize`**:
 - `vu_mul_rtz` (truncating 24x24 multiply without EE COP1's Radix-4 Booth `-1` subtraction) paired with `x^2` odd-power stepping (`eval_odd_series_vu_rtz`) in `ESIN`, `EATAN`, `EATANxy`, and `EATANxz`.

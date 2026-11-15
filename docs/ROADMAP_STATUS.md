@@ -1,36 +1,30 @@
 # PS2 Emulator Roadmap Status (`docs/ROADMAP_STATUS.md`)
 
 ## Phase 1 Status: COMPLETE (`tag: phase1-done`)
-- **Hardware Gate**: **`35 / 35 PASS`** (`23` EE CPU/COP0/COP1/MMI/MMU + `5` EE DMAC/SPR + `7` IOP R3000A).
-- **Workspace Unit Tests**: **`60 / 60 PASS`** (`11` `ps2-common`, `45` `ps2-core`, `4` `ps2-autotest`).
-- **LLE BIOS Boot (`Task 6b`)**: **`PARTIAL`** — reaches `EECONF` (`2,180,464` EE cycles, `272,558` IOP cycles); stops at `IOP PC = 0x0000_AFA0` on `0x1F40_2005` (`CDVD` S-commands `0x40`/`0x41`/`0x43` & NVM config, deferred to Phase 3 `ps2-cdvd`).
+- **Hardware Gate**: `35 / 35 PASS` (`23` EE CPU/COP0/COP1/MMI/MMU + `5` EE DMAC/SPR + `7` IOP R3000A).
+- **LLE BIOS Boot (`Task 6b`)**: `PARTIAL` — reaches `EECONF` (`2,180,464` EE, `272,558` IOP cycles); stops at `IOP PC = 0x0000_AFA0` on CDVD `0x1F40_2005` (deferred to Phase 3 `ps2-cdvd`).
 
-## Speed Baseline (Release Profile: `lto = "fat"`, `codegen-units = 1`)
-- **Phase 1 Gate (`35` suites)**: `82,167,799` EE cycles + `30,724` IOP cycles = **`82,198,523` cycles in `1.408 s` (`58.38 Mcycles/s`)**.
+## Phase 2a Status: COMPLETE (`tags: phase2a-core`, `phase2a-done`, `51 / 52`, EFU partial)
+- **Hardware Gate**: `51 / 52 PASSED`, `1 DEFERRED`, `0 FAILED` (`cpu/vu0_macro` 2, `vu/` 6/7 pass, `dma/vif` 6, `gs/` 2).
+- **Deferred Suite (`vu/lower/efu.elf`)**: reason `"partial: 184/208 vectors; see HARDWARE_NOTES.md EFU section"` (`5` ops `16/16`, `8` ops `PARTIAL`, `0` fail).
 
-## Phase 2a Gate (`17` New Suites -> `51 / 52` Passing, `1` Deferred)
-- **Hardware Gate**: **`51 / 52 PASSED, 1 DEFERRED, 0 FAILED`** (`gs/label.elf` and `gs/signal.elf` passing; `vu/lower/efu.elf` `DEFERRED` with **`184 / 208`** EFU test vectors matching across all 13 instructions on `efu-redo`).
-- **Workspace Unit Tests**: **`107 / 107 PASS`** (`11` `ps2-common`, `91` `ps2-core`, `5` `ps2-autotest`).
-- **`cpu/vu0_macro` (2)**: `integer.elf`, `transfer.elf`.
-- **`vu/` Micro & EFU (7)**: `games/triace.elf`, `lower/{branch,efu,fdivdelay,integer,random}.elf`, `upper/clip.elf`.
-- **`dma/vif` (6)**: `basic.elf`, `intstall.elf`, `mskpath3.elf`, `stcycl.elf`, `stmod.elf`, `unpack.elf`.
-- **`gs/` Privileged & GIF (2)**: `label.elf`, `signal.elf`.
+## Speed Baseline (Release: `lto = "fat"`, `codegen-units = 1`)
+- **Phase 1 Gate (`35` suites)**: `82,198,523` cycles in `1.408 s` (`58.38 Mcycles/s`).
+- **Phase 2a Gate (`52` suites)**: `114,417,068` EE + `30,724` IOP = `114,447,792` cycles in `2.115 s` (`54.11 Mcycles/s`).
 
-## Phase 2b Scope (Deferred from Phase 2a)
-- **`VU1 XGKICK -> GIF PATH1`**: Executing `XGKICK` in `VU1` micromode to transfer GS packets directly into `GIF PATH1` (`GIF_CNT[20..=29]` VU address, double-buffered `TOP`/`XTOP` interaction) and Phase 2b GS rendering.
+## `GUESS` / `SEARCH-ONLY` / Untested-by-Hardware Areas (`docs/HARDWARE_NOTES.md`)
+- **EE/MCH Stubs (`GUESS`)**: `0x1000_F500` (`EeDmac::d_f500`) and non-`F430`/`F440` `RdramMch` slots (`TODO(verify)`).
+- **GS Privileged (`SEARCH-ONLY` / `GUESS`)**: `GS_CSR` bits beyond `SIGNAL`/`FINISH` (`HSINT`, `VSINT`, `EDWINT`, `FLUSH`/`RESET`, `NFIELD`/`FIELD`, `FIFO`, `REV`/`ID = 0x551B`), second-`SIGNAL` stall, `GS_IMR`, `GS_BUSDIR` (`BUSDIR=1` error), display register latches.
+- **GIF (`untested by hardware suites`)**: `IMT` intermittent preemption & `PATH3` save/restore (`GIF_P3CNT`/`GIF_P3TAG`), `M3R` boundary, `PSE`-gated debug reads, `REGLIST` odd-count discard, `PATH1` priority/masking, `PACKED` edge descriptors.
+- **VIF (`untested` / `inferred`)**: `STAT.FQC` 4-QWC pre-decode staging buffer inference, `MPG` (`0x4A`, unit-tested only; `0x46` unresolved), `VIF1_NUM` 9-bit / `CLIP`+`FCSET` rules.
+- **CPU/FPU/VU (`inferred` / Deferred)**: `BC1F`/`BC1T` chained delay slots; `ps2float` Booth-1 / `MADD` overflow / `(q25+1)>>1` rounding; `MAC`/`Status` flag pipelines deferred; `EFU` `vu_mul_rtz`, `x^2` stepping, RTZ `pi/4` (`0x3F49_0FDA`), and un-fitted `1..5` ULP / `2^-31` gaps.
 
-## Active `GUESS` Stubs & Inferred Behaviors (`docs/HARDWARE_NOTES.md`)
-- **`0x1000_F500` (`EeDmac::d_f500`)**: `GUESS` (`TODO(verify)`) — 32-bit R/W latch (reset `0`); write-only during BIOS boot (`EE PC = 0xBFC0_0838`), omitted in `ps2tek` `#dmacio`.
-- **`0x1000_F400..=0x1000_F4F0` (`RdramMch::regs`, non-`F430`/`F440` slots)**: `GUESS` (`TODO(verify)`) — 32-bit R/W slots (reset `0`) for undocumented MCH timing registers (`0x1000_F410`, `0x1000_F420`, etc.); `0x1000_F430` (`MCH_RICM`) and `0x1000_F440` (`MCH_DRD`) are verified from `ps2tek` `#eerdram`.
-- **`GS` Privileged Stub & `GIF` Edge Semantics (`bus/gs_stub.rs`, `gif/mod.rs`)**:
-  - `GS_CSR` bits beyond `SIGNAL`/`FINISH`, `GS_IMR`, `GS_BUSDIR`, `REV`/`ID` (`0x1B`/`0x55`), and second-`SIGNAL` stall are `SEARCH-ONLY` / `GUESS` (`TODO(verify)` `FLUSH`/`RESET`, `IMR` power-on mask, `GS->EE` `BUSDIR=1` readback, `M3R`/`IMT` exact boundary, `0x3`/`0xA`/`0xB`/`0xC`/`0xD` PACKED details).
-- **Inferred Test-Vector Behaviors (`fits test vectors; may not generalize`)**:
-  - `BC1F`/`BC1T` back-to-back delay-slot chaining (`ee/interpreter.rs`, `cpu/ee_fpu/branchdelay.elf`).
-  - `ps2float` `MUL.S`/`MULA.S` low-Booth-group truncation, `MADD.S`/`MSUB.S` product-overflow immediate saturation, and `(q25 + 1) >> 1` rounding in `DIV.S`/`SQRT.S`/`RSQRT.S` (`ps2-common/src/ps2float.rs`).
-  - `VU1` `EFU` (`vu/efu.rs`, `vu/lower/efu.elf`, `184/208` matching — `5` ops `16/16`, `8` ops `PARTIAL`): `vu_mul_rtz` without EE COP1 Booth `-1`, `x^2` odd-power stepping, and RTZ `pi/4` (`0x3F49_0FDA`); remaining `1..5` ULP & `EATAN(0)` `0x33e6_0000` gaps left un-fitted (see `HARDWARE_NOTES.md` §12).
+## Known Timing Debt (Phase 4)
+- Synchronous `finish_vu0_micro` on `MSCAL`/EE `COP2` stalls instead of cycle-interleaved EE/VU execution.
+- Instantaneous stall-cycle drain inside `step_micro_liw` without proportional EE clock advance/stall.
+- `VU1` cycle-accurate parallel timing and cycle-accurate stall backpressure deferred to Phase 4.
 
-## Known timing debt (Phase 4)
-- **VU timing shortcuts (`bus/mod.rs`, `vu/pipeline.rs`)**:
-  - Synchronous VU completion on `MSCAL`/`COP2` stalls (`finish_vu0_micro` / VU run-to-completion when stalled instead of cycle-accurate interleaved EE/VU execution).
-  - Instantaneous VU stall draining inside `step_micro_liw` without advancing or stalling the EE clock proportionally.
-  - Interleaved EE/VU races, `VU1` cycle-accurate parallel timing, and cycle-accurate stall backpressure are deferred to Phase 4 timing tightening.
+## Phase 2b Scope
+- **GS Software Rasterizer (`ps2-gs`)**: Implement the platform-independent GS software renderer.
+- **GS Dump Runner (`ps2-gs-runner`)**: Headless `.gs` dump replay and golden PNG pixel comparison.
+- **`VU1 XGKICK -> GIF PATH1`**: `VU1` micromode `XGKICK` feeding `GIF PATH1` (`GIF_CNT[20..=29]`, `TOP`/`XTOP`).

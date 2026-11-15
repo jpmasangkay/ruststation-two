@@ -395,7 +395,10 @@ pub const PHASE2A_HW_GATE_SUITES: [&str; 17] = [
 ];
 
 /// Checked-in list of gate suites explicitly deferred from blocking CI / gate exit code.
-pub const DEFERRED_GATE_SUITES: [(&str, &str); 1] = [("vu/lower/efu.elf", "parked on wip/efu")];
+pub const DEFERRED_GATE_SUITES: [(&str, &str); 1] = [(
+    "vu/lower/efu.elf",
+    "partial: 184/208 vectors; see HARDWARE_NOTES.md EFU section",
+)];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GateOutcome {
@@ -1225,11 +1228,14 @@ mod tests {
         );
         assert_eq!(
             DEFERRED_GATE_SUITES,
-            [("vu/lower/efu.elf", "parked on wip/efu")]
+            [(
+                "vu/lower/efu.elf",
+                "partial: 184/208 vectors; see HARDWARE_NOTES.md EFU section"
+            )]
         );
         assert_eq!(
             evaluate_gate_outcome("vu/lower/efu.elf", false),
-            GateOutcome::Deferred("parked on wip/efu")
+            GateOutcome::Deferred("partial: 184/208 vectors; see HARDWARE_NOTES.md EFU section")
         );
         assert_eq!(
             evaluate_gate_outcome("vu/lower/efu.elf", true),
