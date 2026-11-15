@@ -15,6 +15,7 @@
 use ps2_common::ps2float;
 use ps2_common::Reg128;
 
+use super::pipeline;
 use super::state::{VuState, DEST_W, DEST_X, DEST_Y, DEST_Z};
 
 /// Upper instruction bit 31: `LOI` (lower 32-bit word is loaded into `I` register).
@@ -1135,9 +1136,12 @@ pub fn step_micro_liw(vu: &mut VuState, code_mem: &[u8], data_mem: &mut [u8], tp
         vu.tpc = delay_slot_tpc;
     }
 
+    let pre = pipeline::before_liw(vu, upper, lower, has_i_bit);
+
     if has_i_bit {
         // Upper instruction reads the previous `I` register before `LOI` updates `I`
         // (`ps2autotests` `tests/vu/games/triace.cpp`, `FETCHED`).
+        pipeline::prepare_upper_clip(vu, upper);
         exec_upper_op(vu, upper);
         vu.i = lower;
     } else {
@@ -1156,8 +1160,11 @@ pub fn step_micro_liw(vu: &mut VuState, code_mem: &[u8], data_mem: &mut [u8], tp
             exec_micro_lower_type789(vu, data_mem, lower, delay_slot_tpc, tpc_mask);
         }
 
+        pipeline::prepare_upper_clip(vu, upper);
         exec_upper_op_with_sources(vu, upper, vs, vt, q_val, i_val);
     }
+
+    pipeline::after_liw(vu, upper, lower, has_i_bit, pre);
 
     if was_finishing {
         vu.running = false;

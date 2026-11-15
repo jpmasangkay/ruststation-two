@@ -831,11 +831,17 @@ impl Bus {
             r @ 1..=15 => self.vu0.vi[r] = val as u16,
             16 => self.vu0.status_flag = (val as u16) & 0x0FC0,
             17 => {}
-            18 => self.vu0.clip_flag = val & 0x00FF_FFFF,
+            18 => {
+                self.vu0.clip_flag = val & 0x00FF_FFFF;
+                self.vu0.pipeline.set_clip_flag(val);
+            }
             19 => {}
             20 => self.vu0.r = val & 0x007F_FFFF,
             21 => self.vu0.i = val,
-            22 => self.vu0.q = val,
+            22 => {
+                self.vu0.q = val;
+                self.vu0.pipeline.fdiv_cycles = 0;
+            }
             23 => {}
             24 => self.vu0.fbrst_ctrl = (val as u16) & 0x0C0C,
             25 | 26 => {}

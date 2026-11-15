@@ -15,6 +15,8 @@
 
 use ps2_common::Reg128;
 
+use super::pipeline::VuPipeline;
+
 /// Hardwired value of `vf00`: `x = 0.0, y = 0.0, z = 0.0, w = 1.0 (0x3F80_0000)`.
 pub const VF00_VALUE: Reg128 = Reg128::from_u32x4(0, 0, 0, 0x3F80_0000);
 
@@ -73,6 +75,8 @@ pub struct VuState {
     pub branch_delay_active: bool,
     /// Pending branch target in 8-byte LIW instruction units.
     pub branch_delay_target: u16,
+    /// Micro-mode pipeline timing and hazard tracker.
+    pub pipeline: VuPipeline,
 }
 
 impl Default for VuState {
@@ -105,6 +109,7 @@ impl VuState {
             finish_after_slot: false,
             branch_delay_active: false,
             branch_delay_target: 0,
+            pipeline: VuPipeline::new(),
         }
     }
 
@@ -119,6 +124,7 @@ impl VuState {
         self.finish_after_slot = false;
         self.branch_delay_active = false;
         self.branch_delay_target = 0;
+        self.pipeline.reset();
     }
 
     /// Read a 128-bit vector register `vf[idx]` (`vf[0]` always returns [`VF00_VALUE`]).
@@ -182,5 +188,6 @@ impl VuState {
         self.finish_after_slot = false;
         self.branch_delay_active = false;
         self.branch_delay_target = 0;
+        self.pipeline.on_start_micro(self.clip_flag);
     }
 }

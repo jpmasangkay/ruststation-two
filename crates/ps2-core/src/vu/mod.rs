@@ -1,6 +1,7 @@
 //! Vector Units (`VU0` and `VU1`) state and micro/macro execution support.
 
 pub mod micro;
+pub mod pipeline;
 pub mod state;
 
 pub use state::{VuState, DEST_W, DEST_X, DEST_Y, DEST_Z, VF00_VALUE, VU_REVISION_ID};
@@ -130,5 +131,51 @@ mod tests {
         let rnext = 0x8000_0000 | (0b1111 << 21) | (3 << 16) | 0x43C; // RNEXT.xyzw vf03
         exec_shared_lower_op(&mut vu, &mut data_mem, rnext);
         assert_eq!(vu.read_vf_lane(3, 0), 0x3FC6_8ACE);
+    }
+
+    #[test]
+    fn vu_pipeline_clip_4_cycle_latency_and_fdiv_raw_stall() {
+        let mut vu = VuState::new();
+        let mut code_mem = vec![0u8; 0x1000];
+        let mut data_mem = vec![0u8; 0x1000];
+
+        // VF01 = (2.0, 2.0, 2.0, 2.0) -> CLIP(VF01, VF00) produces +x, +y, +z = 0x15.
+        vu.write_vf(
+            1,
+            Reg128::from_u32x4(0x4000_0000, 0x4000_0000, 0x4000_0000, 0x4000_0000),
+        );
+        // VF16.w = 4.0 -> DIV(VF00.w, VF16.w) = 1.0 / 4.0 = 0.25 (0x3E80_0000), latency 7.
+        vu.write_vf_lane(16, 3, 0x4080_0000);
+        vu.q = 0x3F80_0000; // Initial Q = 1.0f
+
+        let clip_vf01_vf00: u32 = (0b1110 << 21) | (1 << 11) | 0x1FF;
+        let nop_upper: u32 = 0x0000_02FF;
+        let fcget = |it: u32| -> u32 { (0x1C << 25) | (it << 16) };
+        let nop_lower: u32 = 0x8000_033C; // MOVE with dest=0
+
+        // LIW 0..4: CLIP at LIW 0 with FCGET(vi01..vi05) across LIW 0..4.
+        // vi01..vi04 must read 0x0000; vi05 (4 cycles after LIW 0) must read 0x0015.
+        let liws = [
+            (clip_vf01_vf00, fcget(1)),
+            (nop_upper, fcget(2)),
+            (nop_upper, fcget(3)),
+            (nop_upper, fcget(4)),
+            (UPPER_BIT_E | nop_upper, fcget(5)),
+            (nop_upper, nop_lower),
+        ];
+        for (i, &(u, l)) in liws.iter().enumerate() {
+            code_mem[i * 8..i * 8 + 4].copy_from_slice(&l.to_le_bytes());
+            code_mem[i * 8 + 4..i * 8 + 8].copy_from_slice(&u.to_le_bytes());
+        }
+
+        vu.start_micro(0, VU0_TPC_MASK);
+        while vu.running {
+            step_micro_liw(&mut vu, &code_mem, &mut data_mem, VU0_TPC_MASK);
+        }
+        assert_eq!(vu.read_vi(1), 0x0000);
+        assert_eq!(vu.read_vi(2), 0x0000);
+        assert_eq!(vu.read_vi(3), 0x0000);
+        assert_eq!(vu.read_vi(4), 0x0000);
+        assert_eq!(vu.read_vi(5), 0x0015);
     }
 }
