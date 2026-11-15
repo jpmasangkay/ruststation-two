@@ -1,0 +1,5 @@
+# Pin the Rust toolchain so local development and CI run the exact same rustc/clippy/rustfmt.
+# Toolchain bumps are deliberate and happen in their own commit (keep .github/workflows/ci.yml in sync).
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]

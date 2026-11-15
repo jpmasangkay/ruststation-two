@@ -180,9 +180,7 @@ impl EeTimers {
 
     /// Advance all BUSCLK-driven timers (`CLKS` `0..=2`) by `ee_cycles` (`ps2tek` `#eetimers`).
     pub fn step_ee_cycles(&mut self, ee_cycles: u32, intc: &mut EeIntc) {
-        for idx in 0..EE_TIMER_COUNT {
-            let irq_flag = Self::timer_irq_flag(idx);
-            let ch = &mut self.channels[idx];
+        for (idx, ch) in self.channels.iter_mut().enumerate() {
             if !ch.is_enabled() {
                 continue;
             }
@@ -191,7 +189,7 @@ impl EeTimers {
                 let ticks = total_cycles / divider;
                 ch.ee_cycle_remainder = total_cycles % divider;
                 if ticks > 0 {
-                    ch.advance_ticks(ticks, irq_flag, intc);
+                    ch.advance_ticks(ticks, Self::timer_irq_flag(idx), intc);
                 }
             }
         }
@@ -199,11 +197,9 @@ impl EeTimers {
 
     /// Advance any HBLANK-clocked timers (`CLKS == 3`) by 1 tick on HBlank (`ps2tek` `#eetimers`).
     pub fn on_hblank(&mut self, intc: &mut EeIntc) {
-        for idx in 0..EE_TIMER_COUNT {
-            let irq_flag = Self::timer_irq_flag(idx);
-            let ch = &mut self.channels[idx];
+        for (idx, ch) in self.channels.iter_mut().enumerate() {
             if ch.is_enabled() && ch.ee_cycles_per_tick().is_none() {
-                ch.advance_ticks(1, irq_flag, intc);
+                ch.advance_ticks(1, Self::timer_irq_flag(idx), intc);
             }
         }
     }
