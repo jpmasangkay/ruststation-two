@@ -5,8 +5,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use ps2_core::bus::{Bus, UnimplementedDmaTransfer};
+use ps2_core::bus::{Bus, UnimplementedDmaTransfer, UnimplementedIopRegister};
 use ps2_core::ee::{EeCpuState, EeHleState, HleStepResult};
+use ps2_core::iop::{
+    is_irx_binary, load_irx, IopCpuState, IopStepResult, IrxError, LoadedIrx,
+    UnimplementedIopImport,
+};
 use ps2_core::{load_elf32, ElfError, LoadedElf};
 use similar::TextDiff;
 
@@ -51,6 +55,10 @@ pub enum RunStopReason {
     },
     /// Attempted a DMA transfer on an unimplemented peripheral channel (`0..=7`).
     UnimplementedDmaTransfer(UnimplementedDmaTransfer),
+    /// Hit an unimplemented IOP `.irx` module import stub.
+    UnimplementedIopImport(UnimplementedIopImport),
+    /// Accessed an unimplemented IOP hardware register (`0x1F80_1000..=0x1F9F_FFFF`).
+    UnimplementedIopRegister(UnimplementedIopRegister),
 }
 
 impl std::fmt::Display for RunStopReason {
@@ -76,6 +84,12 @@ impl std::fmt::Display for RunStopReason {
                 "UnimplementedDmaTransfer(ch={} [{}], chcr=0x{:08X}, madr=0x{:08X}, qwc=0x{:04X}, tadr=0x{:08X})",
                 info.channel, info.channel_name, info.chcr, info.madr, info.qwc, info.tadr
             ),
+            Self::UnimplementedIopImport(imp) => write!(f, "{imp}"),
+            Self::UnimplementedIopRegister(reg) => write!(
+                f,
+                "UnimplementedIopRegister(paddr=0x{:08X}, width={}, is_write={}, value=0x{:08X})",
+                reg.paddr, reg.width, reg.is_write, reg.value
+            ),
         }
     }
 }
@@ -91,6 +105,72 @@ pub struct ElfRunReport {
     pub stop_reason: RunStopReason,
     /// Captured EE stdout (normalized to `\n` line endings).
     pub stdout: String,
+}
+
+/// Complete result of executing an IOP `.irx` test binary in `ps2-autotest`.
+#[derive(Clone, Debug)]
+pub struct IrxRunReport {
+    /// Loaded IRX metadata (`base_addr`, `entry_pc`, `gp`, `relocations_applied`).
+    pub loaded: LoadedIrx,
+    /// Total IOP cycles executed (`1` IOP cycle = `8` EE cycles).
+    pub iop_cycles: u64,
+    /// Total EE cycles elapsed on the central `Scheduler` (`iop_cycles * 8`).
+    pub ee_cycles: u64,
+    /// Why execution stopped.
+    pub stop_reason: RunStopReason,
+    /// Captured IOP stdout (normalized to `\n` line endings).
+    pub stdout: String,
+}
+
+/// Load and execute an IOP `.irx` binary image headlessly for up to `max_ee_cycles` EE cycles
+/// (`1` IOP cycle = `8` EE cycles on the central `Scheduler`).
+pub fn run_irx_bytes(irx_bytes: &[u8], max_ee_cycles: u64) -> Result<IrxRunReport, IrxError> {
+    let mut iop = IopCpuState::new();
+    let mut bus = Bus::new();
+
+    let loaded = load_irx(irx_bytes, &mut iop, &mut bus)?;
+    let max_iop_cycles = (max_ee_cycles / 8).max(1);
+    let mut iop_cycles = 0u64;
+    let stop_reason = loop {
+        if iop_cycles >= max_iop_cycles {
+            break RunStopReason::MaxCyclesReached(bus.scheduler.current_ee_cycle);
+        }
+        let step_res = iop.step_hle(&mut bus);
+        if matches!(step_res, IopStepResult::Exited(_)) {
+            if let IopStepResult::Exited(code) = step_res {
+                break RunStopReason::Exited(code);
+            }
+        }
+        iop_cycles += 1;
+        match step_res {
+            IopStepResult::Continue => {}
+            IopStepResult::Exited(code) => break RunStopReason::Exited(code),
+            IopStepResult::UnimplementedImport(imp) => {
+                break RunStopReason::UnimplementedIopImport(imp);
+            }
+            IopStepResult::UnimplementedRegister(reg) => {
+                break RunStopReason::UnimplementedIopRegister(reg);
+            }
+            IopStepResult::UnimplementedInstruction { pc, instr } => {
+                break RunStopReason::UnimplementedInstruction {
+                    pc,
+                    instr,
+                    category: "IOP_R3000A",
+                };
+            }
+        }
+    };
+
+    let raw_stdout = String::from_utf8_lossy(&bus.stdout_buffer);
+    let stdout = normalize_newlines(&raw_stdout);
+
+    Ok(IrxRunReport {
+        loaded,
+        iop_cycles,
+        ee_cycles: bus.scheduler.current_ee_cycle,
+        stop_reason,
+        stdout,
+    })
 }
 
 /// Load and execute an ELF32 binary image headlessly for up to `max_cycles` EE cycles.
@@ -164,22 +244,46 @@ fn run_single_elf_file(elf_path: &Path, max_cycles: u64) -> ExitCode {
         }
     };
 
-    let report = match run_elf_bytes(&elf_bytes, max_cycles) {
-        Ok(rep) => rep,
-        Err(err) => {
-            eprintln!("ERROR: failed to load ELF {}: {err}", elf_path.display());
-            return ExitCode::FAILURE;
-        }
+    let (stdout, stop_reason, cycles, entry_pc, label) = if is_irx_binary(&elf_bytes) {
+        let report = match run_irx_bytes(&elf_bytes, max_cycles) {
+            Ok(rep) => rep,
+            Err(err) => {
+                eprintln!("ERROR: failed to load IRX {}: {err}", elf_path.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        (
+            report.stdout,
+            report.stop_reason,
+            report.iop_cycles,
+            report.loaded.entry_pc,
+            "IOP",
+        )
+    } else {
+        let report = match run_elf_bytes(&elf_bytes, max_cycles) {
+            Ok(rep) => rep,
+            Err(err) => {
+                eprintln!("ERROR: failed to load ELF {}: {err}", elf_path.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        (
+            report.stdout,
+            report.stop_reason,
+            report.cycles,
+            report.loaded.entry_pc,
+            "EE",
+        )
     };
 
-    println!("=== EE STDOUT ({}) ===", elf_path.display());
-    print!("{}", report.stdout);
-    if !report.stdout.ends_with('\n') && !report.stdout.is_empty() {
+    println!("=== {label} STDOUT ({}) ===", elf_path.display());
+    print!("{stdout}");
+    if !stdout.ends_with('\n') && !stdout.is_empty() {
         println!();
     }
     println!(
         "=== STOP: {} after {} cycles (entry=0x{:08X}) ===",
-        report.stop_reason, report.cycles, report.loaded.entry_pc
+        stop_reason, cycles, entry_pc
     );
 
     let expected_path = elf_path.with_extension("expected");
@@ -187,12 +291,12 @@ fn run_single_elf_file(elf_path: &Path, max_cycles: u64) -> ExitCode {
         match fs::read_to_string(&expected_path) {
             Ok(raw_expected) => {
                 let expected = normalize_newlines(&raw_expected);
-                if report.stdout == expected {
+                if stdout == expected {
                     println!("RESULT: PASS ({})", elf_path.display());
                     ExitCode::SUCCESS
                 } else {
                     println!("RESULT: FAIL ({})", elf_path.display());
-                    print!("{}", format_expected_diff(&expected, &report.stdout));
+                    print!("{}", format_expected_diff(&expected, &stdout));
                     ExitCode::FAILURE
                 }
             }
@@ -349,6 +453,68 @@ mod tests {
                 instr: 0x4A00_0000,
                 category: "COP2 / VU0 Macro (Out of Phase 1 Scope)",
             }
+        );
+    }
+
+    #[test]
+    fn runner_executes_irx_and_reports_unimplemented_iop_import() {
+        // Build a synthetic ET_SCE_IOPRELEXEC (0xFF80) IRX image:
+        // Offset 0x00..0x14: .iop.import header for "stdio\0\0\0"
+        // Offset 0x14..0x1C: jr $ra; addiu $zero, $zero, 4 (printf)
+        // Offset 0x1C..0x24: 0, 0 terminator
+        // Offset 0x24..0x38: _start:
+        //   0x24: lui   $a0, 0x0001       (0x3C04_0001)
+        //   0x28: ori   $a0, $a0, 0x0038  (0x3484_0038) -> "HI\n\0" at base + 0x38
+        //   0x2C: jal   0x0001_0014       (0x0C00_4005) -> call printf stub at 0x0001_0014
+        //   0x30: nop                     (0x0000_0000)
+        //   0x34: jr    $ra               (0x03E0_0008) -> wait: _start saves $ra or jumps after
+        // Better: since _start here is leaf-calling printf, save $ra in $s0 ($16):
+        let words = [
+            0x41E0_0000, // 0x00: import magic
+            0x0000_0000, // 0x04: next
+            0x0000_0102, // 0x08: version
+            u32::from_le_bytes(*b"stdi"),
+            u32::from_le_bytes(*b"o\0\0\0"),
+            0x03E0_0008, // 0x14: jr $ra
+            0x2400_0004, // 0x18: addiu $zero, $zero, 4 (printf)
+            0x0000_0000, // 0x1C: terminator
+            0x0000_0000, // 0x20: terminator
+            // _start at 0x24:
+            0x001F_8025, // 0x24: or $s0, $zero, $ra
+            0x3C04_0001, // 0x28: lui $a0, 0x0001
+            0x3484_0040, // 0x2C: ori $a0, $a0, 0x0040 ("HI\n\0")
+            0x0C00_4005, // 0x30: jal 0x0001_0014
+            0x0000_0000, // 0x34: nop
+            0x0200_0008, // 0x38: jr $s0
+            0x2402_0000, // 0x3C: addiu $v0, $zero, 0
+            u32::from_le_bytes(*b"HI\n\0"),
+        ];
+        let mut irx = build_synthetic_mips_elf(0x0000_0024, &words, &[]);
+        irx[16..18].copy_from_slice(&0xFF80u16.to_le_bytes()); // ET_SCE_IOPRELEXEC
+        irx[52 + 8..52 + 12].copy_from_slice(&0u32.to_le_bytes()); // p_vaddr = 0
+        irx[52 + 12..52 + 16].copy_from_slice(&0u32.to_le_bytes()); // p_paddr = 0
+
+        let rep = run_irx_bytes(&irx, 1_000).expect("synthetic IRX should load");
+        assert_eq!(rep.stop_reason, RunStopReason::Exited(0));
+        assert_eq!(rep.stdout, "HI\n");
+        assert_eq!(rep.ee_cycles, rep.iop_cycles * 8);
+
+        // Change import index from 4 (printf) to 99 (unimplemented) and verify explicit error:
+        let mut words_unimp = words;
+        words_unimp[6] = 0x2400_0063; // index 99
+        let mut irx_unimp = build_synthetic_mips_elf(0x0000_0024, &words_unimp, &[]);
+        irx_unimp[16..18].copy_from_slice(&0xFF80u16.to_le_bytes());
+        irx_unimp[52 + 8..52 + 12].copy_from_slice(&0u32.to_le_bytes());
+        irx_unimp[52 + 12..52 + 16].copy_from_slice(&0u32.to_le_bytes());
+
+        let rep_unimp = run_irx_bytes(&irx_unimp, 1_000).expect("synthetic IRX should load");
+        assert_eq!(
+            rep_unimp.stop_reason,
+            RunStopReason::UnimplementedIopImport(UnimplementedIopImport {
+                pc: 0x0001_0014,
+                module: "stdio".to_owned(),
+                index: 99,
+            })
         );
     }
 }

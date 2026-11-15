@@ -126,3 +126,40 @@ This document records non-obvious PlayStation 2 hardware behaviors encountered d
   - When `DmacChannelComplete(ch)` becomes due and is popped in `bus.step_timers`, `EeDmac::complete_channel(ch)` clears `CHCR.STR` to `0` and sets `D_STAT.CIS[ch]` to `1`.
 - **Evidence**: `ps2tek` (`https://psi-rockin.github.io/ps2tek/#dmac`), `local/ps2autotests/tests/dma/dmasend.cpp` lines 31–34 & 60–63 (`while (--i > 0 && chan->chcr.Ongoing())`), and `dma/dmac/cpcond.expected` / `tagintr.expected`.
 - **Source Classification**: **Primary source** for `1 QWC / BUSCLK` (`2 EE cycles / QWC`) rate (`ps2tek` `#dmac`); **Phase 1 architectural simplification** for moving the payload bytes upfront at transfer start while deferring `CHCR.STR = 0` and `D_STAT.CIS[ch] = 1` to the cycle-accurate completion event.
+
+---
+
+## 6. R3000A IOP CPU, Load Delay Slot, and `.irx` Relocations (`crates/ps2-core/src/iop/`)
+
+### 6.1 R3000A 1-Instruction Load Delay Slot & Delay-Slot Overwrite Cancellation
+- **Behavior**:
+  - Unlike the R5900 EE (which has hardware interlocks on loads), the R3000A IOP (`MIPS I`) has a 1-instruction architectural load delay slot for `LB`, `LBU`, `LH`, `LHU`, `LW`, `LWL`, `LWR`, and `MFC0`.
+  - The instruction immediately following a load (`N + 1`, the load delay slot) reads the **old** value of the target register `rt`.
+  - If the load delay slot instruction `N + 1` itself writes to `rt` (either via an ALU/link write such as `ori $t0, $0, 0` or by queuing a new load targeting `rt`), the pending load from instruction `N` is **cancelled** so that `N + 1`'s write wins.
+  - When `LWL` and `LWR` are executed back-to-back targeting the same register `rt`, the second instruction merges against the in-flight `PendingLoad` value from the first instruction rather than the stale architectural register value.
+- **Evidence**: `local/ps2autotests/tests/cpu/iop/lsudelay.c` and `lsudelay.expected` lines 2–10 (`lb 0: 00000000`, `lw 0: 00000000`, `lb 1: 11223344`, `lw 1: 11223344`, `ld 1: 13371337 00000000`, `lw then branch: 2`), and `local/ps2autotests/tests/cpu/iop/lsu.expected` lines 56–68.
+- **Source Classification**: **Primary source** (MIPS I R3000A architecture & `ps2autotests` `cpu/iop/lsudelay.c`).
+
+### 6.2 R3000A Branch-and-Link Register Write Order vs. Branch Delay Slot
+- **Behavior**:
+  - `JAL`, `JALR`, `BLTZAL`, and `BGEZAL` write the link register (`$ra` or `rd`) during the branch instruction **before** the branch delay slot instruction executes, so if the delay slot modifies the link register (`li $ra, 2`), the delay slot's write overwrites the return address.
+  - For `JALR rd, rs` where `rd == rs`, `rs` is read as the branch target before `rd` is overwritten with `inst_pc + 8`.
+  - `BLTZAL` (`REGIMM` `rt = 0x10`) and `BGEZAL` (`REGIMM` `rt = 0x11`) write `$ra = inst_pc + 8` unconditionally, even when the branch condition is false.
+- **Evidence**: `local/ps2autotests/tests/cpu/iop/branchdelay.expected` lines 2–10 and `local/ps2autotests/tests/cpu/iop/branch.expected` lines 57–83 & 144–170.
+- **Source Classification**: **Primary source** (MIPS I R3000A architecture & `ps2autotests` `cpu/iop/{branch,branchdelay}.c`).
+
+### 6.3 R3000A `DIV` / `DIVU` Corner Cases and Non-Stalling `MFHI` / `MFLO`
+- **Behavior**:
+  - Signed `DIV` by zero (`rt == 0`): `HI = rs`; `LO = 0xFFFF_FFFF` (`-1`) if `(rs as i32) >= 0`, else `0x0000_0001` (`+1`).
+  - Signed `DIV` overflow (`0x8000_0000 / -1`): `HI = 0x0000_0000`, `LO = 0x8000_0000`.
+  - Unsigned `DIVU` by zero (`rt == 0`): `HI = rs`, `LO = 0xFFFF_FFFF`.
+  - `MFHI` and `MFLO` have no architectural delay slot (`hilodelay.expected` lines 2–5).
+- **Evidence**: `local/ps2autotests/tests/cpu/iop/muldiv.expected` lines 2–58 and `local/ps2autotests/tests/cpu/iop/hilodelay.expected` lines 2–5.
+- **Source Classification**: **Primary source** (`ps2autotests` `cpu/iop/{muldiv,hilodelay}.c`).
+
+### 6.4 IOP `.irx` (`ET_SCE_IOPRELEXEC = 0xFF80`) Pre-Linked Addends and `.iop.import` Stubs
+- **Behavior**:
+  - In IOP `.irx` binaries (`e_type = 0xFF80`), the `PT_LOAD` segment is linked at virtual address `0x0000_0000` with internal symbol values already encoded into the instruction/data words at `r_offset`; relocating the module to `base_addr` (`0x0001_0000`) adds `base_addr` to each `SHT_REL` target (`R_MIPS_32`, `R_MIPS_26`, and paired `R_MIPS_HI16` / `R_MIPS_LO16`).
+  - Import stub tables in `.text` start with a 20-byte header (`0x41E0_0000`, `0`, `version`, 8-byte module name) followed by 8-byte function stubs (`0x03E0_0008` `jr $ra`; `0x2400_xxxx` `addiu $zero, $zero, import_index`).
+- **Evidence**: `local/ps2autotests/tests/cpu/iop/*.irx` ELF headers, `SHT_REL` sections, and `.iop.import` tables.
+- **Source Classification**: **Primary source** (`ps2autotests` `cpu/iop/*.irx` binaries).

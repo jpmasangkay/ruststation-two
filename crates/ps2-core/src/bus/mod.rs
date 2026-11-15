@@ -41,8 +41,23 @@ pub const SCRATCHPAD_SIZE: usize = 16 * 1024;
 pub const BIOS_SIZE: usize = 4 * 1024 * 1024;
 /// 2 MB IOP Main RAM size in bytes (`ps2tek` `#memorymap`).
 pub const IOP_RAM_SIZE: usize = 2 * 1024 * 1024;
+/// 1 KB IOP Scratchpad SRAM size in bytes (`0x1F80_0000..=0x1F80_03FF`, `ps2tek` `#memorymap`).
+pub const IOP_SCRATCHPAD_SIZE: usize = 1024;
 /// 64 KB VU0/1 memory window (`ps2tek` `#memorymap`).
 pub const VU_MEM_WINDOW_SIZE: usize = 64 * 1024;
+
+/// Diagnostic error recorded when the IOP accesses an unimplemented hardware register.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct UnimplementedIopRegister {
+    /// Physical IOP address (`0x1F80_1000..=0x1F9F_FFFF`).
+    pub paddr: u32,
+    /// Access width in bytes (`1`, `2`, or `4`).
+    pub width: u8,
+    /// `true` if the access was a write, `false` if a read.
+    pub is_write: bool,
+    /// Value written (or `0` for reads).
+    pub value: u32,
+}
 
 // TODO(verify): 4x mirroring of 4 KB VU0 Micro (0x1100_0000..=0x1100_3FFF) and 4 KB VU0 Data
 // (0x1100_4000..=0x1100_7FFF) across the 16 KB windows is not explicitly stated in ps2tek #memorymap.
@@ -69,6 +84,8 @@ pub struct Bus {
     pub bios: Box<[u8]>,
     /// 2 MB IOP Main RAM (`0x1C00_0000..=0x1C1F_FFFF` on EE, `0x0000_0000..=0x001F_FFFF` on IOP).
     pub iop_ram: Box<[u8]>,
+    /// 1 KB IOP Scratchpad SRAM (`0x1F80_0000..=0x1F80_03FF` on IOP, `ps2tek` `#memorymap`).
+    pub iop_scratchpad: Box<[u8]>,
     /// 64 KB VU0/VU1 Micro & Data memory window (`0x1100_0000..=0x1100_FFFF`).
     pub vu_mem: Box<[u8]>,
     /// Architectural 48-entry COP0 TLB.
@@ -89,8 +106,10 @@ pub struct Bus {
     pub sif: SifRegs,
     /// Central event-driven hardware scheduler (`294.912 MHz` EE cycle timebase).
     pub scheduler: Scheduler,
-    /// Captured EE serial / console stdout bytes (`KPUTCHAR` `0x1000_F180` + HLE stdout, `ps2tek` `#iomaps`).
+    /// Captured EE/IOP serial & console stdout bytes (`KPUTCHAR` `0x1000_F180` + HLE stdout, `ps2tek` `#iomaps`).
     pub stdout_buffer: Vec<u8>,
+    /// Diagnostic error set if the IOP reads or writes an unimplemented IOP MMIO register (`0x1F80_1000..=0x1F9F_FFFF`).
+    pub pending_iop_mmio_error: Option<UnimplementedIopRegister>,
 }
 
 impl Default for Bus {
@@ -107,6 +126,7 @@ impl Bus {
             scratchpad: vec![0u8; SCRATCHPAD_SIZE].into_boxed_slice(),
             bios: vec![0u8; BIOS_SIZE].into_boxed_slice(),
             iop_ram: vec![0u8; IOP_RAM_SIZE].into_boxed_slice(),
+            iop_scratchpad: vec![0u8; IOP_SCRATCHPAD_SIZE].into_boxed_slice(),
             vu_mem: vec![0u8; VU_MEM_WINDOW_SIZE].into_boxed_slice(),
             tlb: Tlb::new(),
             vtlb: Vtlb::new(),
@@ -118,6 +138,7 @@ impl Bus {
             sif: SifRegs::new(),
             scheduler: Scheduler::new(),
             stdout_buffer: Vec::new(),
+            pending_iop_mmio_error: None,
         }
     }
 
@@ -552,6 +573,214 @@ impl Bus {
             }
         }
     }
+
+    // -------------------------------------------------------------------------
+    // R3000A IOP Memory Map (`ps2tek` `#memorymap`)
+    // - `0x0000_0000..=0x001F_FFFF` (mirrored across `0x0000_0000..=0x007F_FFFF` in KUSEG/KSEG0/KSEG1):
+    //   2 MB IOP Main RAM.
+    // - `0x1F80_0000..=0x1F80_03FF`: 1 KB IOP Scratchpad SRAM.
+    // - `0x1F80_1000..=0x1F9F_FFFF`: IOP Hardware Registers (unimplemented in Task 6a; raises
+    //   `UnimplementedIopRegister`).
+    // - `0x1FC0_0000..=0x1FFF_FFFF`: 4 MB System BIOS ROM (Read-Only).
+    // -------------------------------------------------------------------------
+
+    /// Read an 8-bit byte from the R3000A IOP virtual address space.
+    #[inline]
+    pub fn iop_read8(&mut self, vaddr: u32) -> u8 {
+        let paddr = vaddr & 0x1FFF_FFFF;
+        match paddr {
+            0x0000_0000..=0x007F_FFFF => self.iop_ram[(paddr as usize) & (IOP_RAM_SIZE - 1)],
+            0x1F80_0000..=0x1F80_03FF => {
+                self.iop_scratchpad[(paddr as usize) & (IOP_SCRATCHPAD_SIZE - 1)]
+            }
+            0x1FC0_0000..=0x1FFF_FFFF => self.bios[(paddr as usize) & (BIOS_SIZE - 1)],
+            0x1F80_1000..=0x1F9F_FFFF => {
+                self.record_unimplemented_iop_reg(paddr, 1, false, 0);
+                0
+            }
+            _ => {
+                tracing::debug!(vaddr = format_args!("0x{vaddr:08X}"), "IOP unmapped read8");
+                0
+            }
+        }
+    }
+
+    /// Read a 16-bit little-endian halfword from the R3000A IOP virtual address space.
+    #[inline]
+    pub fn iop_read16(&mut self, vaddr: u32) -> u16 {
+        let paddr = vaddr & 0x1FFF_FFFF;
+        match paddr {
+            0x0000_0000..=0x007F_FFFF => {
+                read_le_u16(&self.iop_ram, (paddr as usize) & (IOP_RAM_SIZE - 2))
+            }
+            0x1F80_0000..=0x1F80_03FF => read_le_u16(
+                &self.iop_scratchpad,
+                (paddr as usize) & (IOP_SCRATCHPAD_SIZE - 2),
+            ),
+            0x1FC0_0000..=0x1FFF_FFFF => {
+                read_le_u16(&self.bios, (paddr as usize) & (BIOS_SIZE - 2))
+            }
+            0x1F80_1000..=0x1F9F_FFFF => {
+                self.record_unimplemented_iop_reg(paddr, 2, false, 0);
+                0
+            }
+            _ => {
+                tracing::debug!(vaddr = format_args!("0x{vaddr:08X}"), "IOP unmapped read16");
+                0
+            }
+        }
+    }
+
+    /// Read a 32-bit little-endian word from the R3000A IOP virtual address space.
+    #[inline]
+    pub fn iop_read32(&mut self, vaddr: u32) -> u32 {
+        let paddr = vaddr & 0x1FFF_FFFF;
+        match paddr {
+            0x0000_0000..=0x007F_FFFF => {
+                read_le_u32(&self.iop_ram, (paddr as usize) & (IOP_RAM_SIZE - 4))
+            }
+            0x1F80_0000..=0x1F80_03FF => read_le_u32(
+                &self.iop_scratchpad,
+                (paddr as usize) & (IOP_SCRATCHPAD_SIZE - 4),
+            ),
+            0x1FC0_0000..=0x1FFF_FFFF => {
+                read_le_u32(&self.bios, (paddr as usize) & (BIOS_SIZE - 4))
+            }
+            0x1F80_1000..=0x1F9F_FFFF => {
+                self.record_unimplemented_iop_reg(paddr, 4, false, 0);
+                0
+            }
+            _ => {
+                tracing::debug!(vaddr = format_args!("0x{vaddr:08X}"), "IOP unmapped read32");
+                0
+            }
+        }
+    }
+
+    /// Write an 8-bit byte to the R3000A IOP virtual address space.
+    #[inline]
+    pub fn iop_write8(&mut self, vaddr: u32, val: u8) {
+        let paddr = vaddr & 0x1FFF_FFFF;
+        match paddr {
+            0x0000_0000..=0x007F_FFFF => {
+                self.iop_ram[(paddr as usize) & (IOP_RAM_SIZE - 1)] = val;
+            }
+            0x1F80_0000..=0x1F80_03FF => {
+                self.iop_scratchpad[(paddr as usize) & (IOP_SCRATCHPAD_SIZE - 1)] = val;
+            }
+            0x1FC0_0000..=0x1FFF_FFFF => {
+                tracing::debug!(
+                    vaddr = format_args!("0x{vaddr:08X}"),
+                    "IOP ignored write8 to BIOS ROM"
+                );
+            }
+            0x1F80_1000..=0x1F9F_FFFF => {
+                self.record_unimplemented_iop_reg(paddr, 1, true, val as u32);
+            }
+            _ => {
+                tracing::debug!(
+                    vaddr = format_args!("0x{vaddr:08X}"),
+                    val,
+                    "IOP unmapped write8"
+                );
+            }
+        }
+    }
+
+    /// Write a 16-bit little-endian halfword to the R3000A IOP virtual address space.
+    #[inline]
+    pub fn iop_write16(&mut self, vaddr: u32, val: u16) {
+        let paddr = vaddr & 0x1FFF_FFFF;
+        match paddr {
+            0x0000_0000..=0x007F_FFFF => {
+                write_le_u16(
+                    &mut self.iop_ram,
+                    (paddr as usize) & (IOP_RAM_SIZE - 2),
+                    val,
+                );
+            }
+            0x1F80_0000..=0x1F80_03FF => {
+                write_le_u16(
+                    &mut self.iop_scratchpad,
+                    (paddr as usize) & (IOP_SCRATCHPAD_SIZE - 2),
+                    val,
+                );
+            }
+            0x1FC0_0000..=0x1FFF_FFFF => {
+                tracing::debug!(
+                    vaddr = format_args!("0x{vaddr:08X}"),
+                    "IOP ignored write16 to BIOS ROM"
+                );
+            }
+            0x1F80_1000..=0x1F9F_FFFF => {
+                self.record_unimplemented_iop_reg(paddr, 2, true, val as u32);
+            }
+            _ => {
+                tracing::debug!(
+                    vaddr = format_args!("0x{vaddr:08X}"),
+                    val,
+                    "IOP unmapped write16"
+                );
+            }
+        }
+    }
+
+    /// Write a 32-bit little-endian word to the R3000A IOP virtual address space.
+    #[inline]
+    pub fn iop_write32(&mut self, vaddr: u32, val: u32) {
+        let paddr = vaddr & 0x1FFF_FFFF;
+        match paddr {
+            0x0000_0000..=0x007F_FFFF => {
+                write_le_u32(
+                    &mut self.iop_ram,
+                    (paddr as usize) & (IOP_RAM_SIZE - 4),
+                    val,
+                );
+            }
+            0x1F80_0000..=0x1F80_03FF => {
+                write_le_u32(
+                    &mut self.iop_scratchpad,
+                    (paddr as usize) & (IOP_SCRATCHPAD_SIZE - 4),
+                    val,
+                );
+            }
+            0x1FC0_0000..=0x1FFF_FFFF => {
+                tracing::debug!(
+                    vaddr = format_args!("0x{vaddr:08X}"),
+                    "IOP ignored write32 to BIOS ROM"
+                );
+            }
+            0x1F80_1000..=0x1F9F_FFFF => {
+                self.record_unimplemented_iop_reg(paddr, 4, true, val);
+            }
+            _ => {
+                tracing::debug!(
+                    vaddr = format_args!("0x{vaddr:08X}"),
+                    val,
+                    "IOP unmapped write32"
+                );
+            }
+        }
+    }
+
+    #[cold]
+    fn record_unimplemented_iop_reg(&mut self, paddr: u32, width: u8, is_write: bool, value: u32) {
+        tracing::warn!(
+            paddr = format_args!("0x{paddr:08X}"),
+            width,
+            is_write,
+            value = format_args!("0x{value:08X}"),
+            "Unimplemented IOP hardware register access"
+        );
+        if self.pending_iop_mmio_error.is_none() {
+            self.pending_iop_mmio_error = Some(UnimplementedIopRegister {
+                paddr,
+                width,
+                is_write,
+                value,
+            });
+        }
+    }
 }
 
 #[inline(always)]
@@ -663,5 +892,35 @@ mod tests {
         assert_eq!(bus.read32(0x1000_F520), 0x1201);
         bus.write32(0x1000_F590, 0x0001_1201);
         assert_eq!(bus.read32(0x1000_F520), 0x0001_1201);
+    }
+
+    #[test]
+    fn iop_memory_map_ram_scratchpad_and_unimplemented_mmio_error() {
+        let mut bus = Bus::new();
+
+        // 2 MB IOP RAM mirrored across KUSEG (0x0001_0000), KSEG0 (0x8001_0000), and KSEG1 (0xA001_0000).
+        bus.iop_write32(0x0001_0000, 0x1122_3344);
+        assert_eq!(bus.iop_read32(0x8001_0000), 0x1122_3344);
+        assert_eq!(bus.iop_read32(0xA001_0000), 0x1122_3344);
+        assert_eq!(bus.iop_read16(0x0001_0002), 0x1122);
+        assert_eq!(bus.iop_read8(0x0001_0000), 0x44);
+
+        // 1 KB IOP Scratchpad at 0x1F80_0000..=0x1F80_03FF.
+        bus.iop_write32(0x1F80_0100, 0xA5A5_5A5A);
+        assert_eq!(bus.iop_read32(0x1F80_0100), 0xA5A5_5A5A);
+        assert_eq!(bus.iop_read16(0x1F80_0102), 0xA5A5);
+
+        // Unimplemented IOP hardware register (e.g., IOP I_STAT at 0x1F80_1070) records explicit error.
+        assert_eq!(bus.pending_iop_mmio_error, None);
+        bus.iop_write32(0xBF80_1070, 0x0000_0001);
+        assert_eq!(
+            bus.pending_iop_mmio_error,
+            Some(UnimplementedIopRegister {
+                paddr: 0x1F80_1070,
+                width: 4,
+                is_write: true,
+                value: 1,
+            })
+        );
     }
 }

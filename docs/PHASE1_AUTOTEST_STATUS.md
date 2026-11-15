@@ -1,4 +1,4 @@
-# Phase 1 `ps2autotests` Suite Status (Task 5 Update)
+# Phase 1 `ps2autotests` Suite Status (Task 6a Update)
 
 `local/ps2autotests/tests/` contains **78 prebuilt test binaries**:
 - **55 EE `.elf` suites** (MIPS R5900 Emotion Engine binaries)
@@ -6,14 +6,14 @@
 
 ---
 
-## Revised Phase 1 Gate (`35` Hardware Suites)
+## Revised Phase 1 Gate (`35` Hardware Suites — `35 / 35 PASS`)
 
-| Track / Scope Bucket | Total Suites | Passing Now (Task 5) | Target Task / Milestone | Details |
+| Track / Scope Bucket | Total Suites | Passing Now (Task 6a) | Target Task / Milestone | Details |
 | :--- | ---: | ---: | :--- | :--- |
 | **Phase 1 Hardware Gate — EE CPU, COP0, COP1 FPU, MMI SIMD, Memory** | **23 `.elf`** | **`23 / 23 PASS` (100%)** | **Task 4 (Done)** | `cpu/ee` (6), `cpu/ee_cop0` (1), `cpu/ee_fpu` (9), `cpu/ee_simd` (6), `memory/ee` (1). |
 | **Phase 1 Hardware Gate — EE DMAC & Scratchpad DMA** | **5 `.elf`** | **`5 / 5 PASS` (100%)** | **Task 5 (Done)** | `dma/dmac/{cpcond,tagintr}`, `dma/spr/{chain,interleave,normal}`. |
-| **Phase 1 Hardware Gate — IOP R3000A CPU** | **7 `.irx`** | `0 / 7` (`DEFERRED`) | **Task 6** | `cpu/iop/{alu,branch,branchdelay,hilodelay,lsu,lsudelay,muldiv}.irx`. |
-| **Phase 1 Hardware Gate Total** | **35 suites** | **`28 / 35 PASS` (`100%` of EE)** | **End of Phase 1** | **`28 / 28` EE + DMAC/SPR suites passing in `1.778 s` release wall time (`82,167,799` EE cycles).** |
+| **Phase 1 Hardware Gate — IOP R3000A CPU** | **7 `.irx`** | **`7 / 7 PASS` (100%)** | **Task 6a (Done)** | `cpu/iop/{alu,branch,branchdelay,hilodelay,lsu,lsudelay,muldiv}.irx`. |
+| **Phase 1 Hardware Gate Total** | **35 suites** | **`35 / 35 PASS` (100%)** | **Task 6a (Done)** | **`35 / 35` EE + DMAC/SPR + IOP suites passing in `1.892 s` release wall time (`82,167,799` EE cycles + `30,724` IOP cycles).** |
 | **Kernel Track (Post-LLE BIOS) — EE & IOP Kernel Behavior** | **26 suites** | `0 / 26` (`DEFERRED`) | **Post-LLE BIOS** | `kernel/ee` (10 `.elf`) + `kernel/iop` (16 `.irx`). Not part of the Phase 1 hardware gate; revisit after LLE BIOS boot works. |
 | **Out-of-Scope Phase 2+ EE Suites (VU0, VU1, VIF1, GS)** | **17 `.elf`** | `0 / 17` (`DEFERRED`) | **Phase 2+** | `cpu/vu0_macro` (2), `vu/` (7), `dma/vif` (6), `gs/` (2). |
 
@@ -108,17 +108,17 @@ These suites test BIOS kernel behavior (`AddIntcHandler`, `AddDmacHandler`, `Cre
 
 ## All 23 IOP `.irx` Suites — Per-Suite Status Table
 
-### 1. Phase 1 Hardware Gate: IOP R3000A CPU Suites (`7 .irx` suites — Deferred to Task 6)
+### 1. Phase 1 Hardware Gate: IOP R3000A CPU Suites (`7 / 7 PASS`)
 
-| # | Suite (`tests/...`) | Category | Status | Target Task | Dependency |
-| ---: | :--- | :--- | :--- | :--- | :--- |
-| 1 | `cpu/iop/alu.irx` | IOP R3000A ALU | `DEFERRED` | Task 6 | R3000A interpreter + `.irx` runner. |
-| 2 | `cpu/iop/branch.irx` | IOP R3000A Branch | `DEFERRED` | Task 6 | R3000A interpreter + `.irx` runner. |
-| 3 | `cpu/iop/branchdelay.irx` | IOP R3000A Branch Delay | `DEFERRED` | Task 6 | R3000A interpreter + `.irx` runner. |
-| 4 | `cpu/iop/hilodelay.irx` | IOP R3000A HI/LO Delay | `DEFERRED` | Task 6 | R3000A interpreter + `.irx` runner. |
-| 5 | `cpu/iop/lsu.irx` | IOP R3000A Load/Store | `DEFERRED` | Task 6 | R3000A interpreter + `.irx` runner. |
-| 6 | `cpu/iop/lsudelay.irx` | IOP R3000A LSU Delay | `DEFERRED` | Task 6 | R3000A interpreter + `.irx` runner. |
-| 7 | `cpu/iop/muldiv.irx` | IOP R3000A Mul/Div | `DEFERRED` | Task 6 | R3000A interpreter + `.irx` runner. |
+| # | Suite (`tests/...`) | Category | Status | Emulated IOP Cycles (`x8` EE Cycles) | Notes / Verification |
+| ---: | :--- | :--- | :--- | ---: | :--- |
+| 1 | `cpu/iop/alu.irx` | IOP R3000A ALU | `PASS` | `10,542` (`84,336` EE) | Matches `alu.expected` (100%, `ADDU`, `ADDIU`, `SUBU`, `AND*`, `OR*`, `XOR*`, `NOR`, `LUI`, `SLT*`, `SLL*`, `SRL*`, `SRA*`). |
+| 2 | `cpu/iop/branch.irx` | IOP R3000A Branch | `PASS` | `7,906` (`63,248` EE) | Matches `branch.expected` (100%, `BEQ`, `BNE`, `BLEZ`, `BGTZ`, `BLTZ`, `BGEZ`, `BLTZAL`, `BGEZAL`). |
+| 3 | `cpu/iop/branchdelay.irx` | IOP R3000A Branch Delay | `PASS` | `219` (`1,752` EE) | Matches `branchdelay.expected` (100%, `BEQ` in delay slot, `JAL`/`JALR`/`BLTZAL`/`BGEZAL` link order vs delay slot, `JALR rs == rd`). |
+| 4 | `cpu/iop/hilodelay.irx` | IOP R3000A HI/LO Delay | `PASS` | `112` (`896` EE) | Matches `hilodelay.expected` (100%, `MFHI`/`MFLO`/`DIV`/`MULT` pipeline behavior). |
+| 5 | `cpu/iop/lsu.irx` | IOP R3000A Load/Store | `PASS` | `2,748` (`21,984` EE) | Matches `lsu.expected` (100%, `LB`, `LBU`, `LH`, `LHU`, `LW`, `SB`, `SH`, `SW`, `LD`/`SD` macros, and unaligned `LWL`/`LWR`/`SWL`/`SWR`). |
+| 6 | `cpu/iop/lsudelay.irx` | IOP R3000A LSU Delay | `PASS` | `232` (`1,856` EE) | Matches `lsudelay.expected` (100%, 1-instruction load delay slot visibility and delay-slot overwrite cancellation). |
+| 7 | `cpu/iop/muldiv.irx` | IOP R3000A Mul/Div | `PASS` | `8,965` (`71,720` EE) | Matches `muldiv.expected` (100%, `DIV`, `DIVU`, `MULT`, `MULTU`, `MFHI`, `MFLO`, `MTHI`, `MTLO`, divide-by-zero, and `i32::MIN / -1`). |
 
 ### 2. Kernel Track: IOP Kernel Module Suites (`16 .irx` suites — Post-LLE BIOS Track)
 
