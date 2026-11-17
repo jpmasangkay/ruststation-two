@@ -19,7 +19,7 @@
 | Tier / Role | Device & OS | Performance Goal | Status / Label |
 | :--- | :--- | :--- | :--- |
 | **Developer machine** | AMD Ryzen 9 8945HX with Radeon Graphics (`16C / 32T`, OS-reported `MaxClockSpeed: 2501 MHz`), `31.8 GiB` RAM (`34,142,187,520` bytes), NVIDIA GeForce RTX 5070 Laptop GPU (`8151 MiB`, driver `616.92`), Microsoft Windows 11 Home (`10.0.26300`, `64-bit`) | **Measured baseline only** (development & regression reference; **not** a minimum spec target) | **Measured** (headless Phase 1+2a interpreter baseline below; JIT/GPU unbuilt) |
-| **Tier A** | Asus laptop: Intel Core i7-8750H (`6C / 12T`), NVIDIA GTX 1050 Ti `4 GB`, `8 GB` DDR4, Windows | **Heavy games at native resolution (`1x`) at full speed** (`59.94 Hz` NTSC / `50.00 Hz` PAL) | **Interpreter baseline measured** (`27.68 Mcycles/s`, CPU model/power state unconfirmed; heavy `1x` game target remains **unverified aspiration** until JIT + GPU exist) |
+| **Tier A** | Asus laptop: Intel Core i7-8750H (`6C / 12T`), NVIDIA GTX 1050 Ti `4 GB`, `8 GB` DDR4, Windows | **Heavy games at native resolution (`1x`) at full speed** (`59.94 Hz` NTSC / `50.00 Hz` PAL) | **Interpreter baseline measured** (`27.87 Mcycles/s`, 10 runs; power state/mode not reported; heavy `1x` game target remains **unverified aspiration** until JIT + GPU exist) |
 | **Tier B** | Raspberry Pi 5 (`ARM64` Linux SBC; Blueprint §6 notes BCM2712 `4x Cortex-A76 @ 2.4 GHz`) | **Light/medium games; heavy best-effort** (e.g., native `1x`, with `75%` EE cycle rate / minimal blending fallback if needed in Phase 6) | **Unverified target** (Phase 6 `ARM64` JIT) |
 | **Tier C** | Raspberry Pi 4 (`ARM64` Linux SBC) | **Stretch** (exploratory / lightweight homebrew only; full-speed commercial games not guaranteed) | **Unverified stretch goal** |
 
@@ -53,23 +53,23 @@ Measured after final Phase 2b audit formatting using the release profile (`opt-l
 
 ---
 
-## Measured Baseline — Tier A Laptop (Headless Interpreter, Preliminary)
+## Measured Baseline — Tier A Laptop (Current Headless Interpreter)
 
-Preliminary measurement on the Tier A Windows laptop (**exact CPU model and power state / AC vs battery not yet reported**):
+Measured on the Tier A Windows laptop (**reported by the owner as `i7-8750H`, `GTX 1050 Ti`, `8 GB`; power state and power mode not reported**):
 
-- **Command:** `ps2-autotest --bench` (`3` runs)
+- **Command:** `ps2-autotest --bench --bench-runs 10`
 - **Correctness:** `51/52 PASSED`, `1 DEFERRED` (`vu/lower/efu.elf`), `0 FAILED` — identical to the developer machine.
-- **Timing summary (`3` passes):**
-  - **Median:** `4.134 s` (`27.68 Mcycles/s`)
-  - **Best:** `4.055 s` (`28.22 Mcycles/s`)
-  - **Worst:** `5.355 s` (`21.37 Mcycles/s`)
+- **Timing summary (`10` runs):**
+  - **Median:** `4.106 s` (`27.87 Mcycles/s`)
+  - **Best:** `4.074 s` (`28.09 Mcycles/s`)
+  - **Worst:** `4.199 s` (`27.26 Mcycles/s`)
+  - **Spread:** about `3%`
 - **Cross-machine comparison & EE-only real-time arithmetic:**
-  - **Throughput ratio vs developer machine:** **`0.52`**
-  - **EE-only real-time ratio (interpreter):** **`0.094`** (developer machine: **`0.18`**)
-  - **Speedup needed for `1.0x` EE-only real time:** **about `10.7x`** (arithmetic only; excludes VU, GS, and audio; makes no prediction of what a JIT would achieve).
-- **Notes & pending follow-up:**
-  - **Run 3 slowdown:** `Run 3` was **`24%` slower than `Run 1`** (cause unconfirmed: possible thermal throttling or power-saving state).
-  - **Scope caveat:** Headless interpreter test (`ps2autotests`), **not** a game benchmark.
-  - **Pending:** Re-measurement plugged in to AC power with `--bench-runs 10` (recording exact CPU model and active Windows power plan).
+  - **Throughput ratio vs developer machine:** **`0.52`** (`27.87 / 53.28`)
+  - **EE-only real-time ratio (interpreter):** **`0.094`** on Tier A, **`0.18`** on the developer machine (EE clock `294.912 MHz`)
+  - **Speedup needed for `1.0x` EE-only on Tier A:** **about `10.6x`** (arithmetic only; excludes VU, GS, and audio; makes no claim about what a JIT would achieve).
+- **Notes:**
+  - An earlier `3`-run measurement had one outlier at `5.355 s` (`21.37 Mcycles/s`) that did not recur; cause unknown.
+  - Headless interpreter test (`ps2autotests`), **not** a game benchmark.
 
 To collect matching measurements on another Windows machine without installing Rust, follow [BENCH_ON_ANOTHER_MACHINE.md](BENCH_ON_ANOTHER_MACHINE.md).
