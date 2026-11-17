@@ -544,6 +544,26 @@ Unconfirmed sub-pixel rounding, sprite corner normalization, Bresenham endpoint 
 - **Framebuffer write masking & formats** (`local/ps2tek/index.html`, `FETCHED`; `Play! GSH_OpenGL_Texture.cpp`, `FETCHED`): `FRAME.FBMSK` is applied in 32-bit RGBA space prior to format conversion (`PSMCT32`, `PSMCT24` preserving upper 8 bits `24..=31`, `PSMCT16`/`16S` packing `R[0..4]`, `G[5..9]`, `B[10..14]`, `A[15]` with mask bit 63 controlling alpha bit 15). Texturing/fog/alpha-blending/AA/alpha-test/dithering (`TME`/`FGE`/`ABE`/`AA1`/`ATE`/`DATE`/`DTHE`/`COLCLAMP`/`FBA`) remain deferred to Step 3.
 - **Standalone dumper (`crates/ps2-gs-runner`)**: executes `.gsp` packet streams headless via `ps2-gs` and exports PNG images (defaulting to `local/gs_out/`), supporting `--rect FBP,FBW,PSM,W,H` or `.gsp` `surface` directives (`9/9` suites in `=== GS RENDER GATE ===`).
 
+---
+
+## 15. Observed in PCSX2 (not hardware)
+
+> [!NOTE]
+> The measurements below are black-box comparisons against PCSX2, recorded for differential diagnosis prior to hardware/GS-dump verification. **PCSX2 is an emulator, not PS2 hardware**: matching PCSX2 raises confidence in conventional interpretations, while discrepancies remain open hypotheses until corroborated across additional probes or real PS2 hardware (`docs/GS_GUESSES.md`).
+
+- **Reference setup (2026-11-17)**: PCSX2 `v2.8.2`, GS renderer `Software`, `Deinterlacing: No Deinterlacing`, `Bilinear Filtering: None`, `Anti-Blur` off, no post-processing, internal-resolution `320x240` screenshots booted via `Start File` from `local/pcsx2/{04,05,06,08,10}.elf`. Full diff report saved in `local/pcsx2/results.txt` (untracked).
+- **Display & exact-match scenes (`04`, `05`, `06`)**:
+  - `04_sprite_flat.gsp`, `05_triangle_flat.gsp`, `06_triangle_gouraud.gsp`: **`76800/76800` (`100.00%`) exact pixel match** (`pm1=0`, `gt1=0`, `max_delta=(0,0,0)`).
+  - Confirms our no-syscall ELF stub (`local/pcsx2/*.elf`) + PCRTC setup (`G-016`: `PMODE=0xFFA5`, `SMODE1=0x7_4080_4504`, `SMODE2=0`, `DISPFB1=0xA00`, `DISPLAY1=0xE_F9FF_0381_927C`, `BGCOLOR=0`) yields unscaled `320x240` output with `A=0x80` pixels undimmed.
+- **Scene `10_subpixel_probe.gsp` (`76794/76800`, `99.99%`)**:
+  - **Points (`7/7` match)**: PCSX2 snapped `P2 (52.5, 20.0) -> (53, 20)` and `P5 (52.0, 40.5) -> (52, 41)` (with `P0..P6` matching `IntegerCenter` half-up rounding in `G-009`, distinguishing it from `HalfPixelCenterHalfOpenLine` which misses `P2, P3, P5, P6` = `3/7`).
+  - **Sprites (`3/3` match)**: PCSX2 rendered `S0`, reversed-corner `S1` (normalized `[50..57] x [150..157]`), and subpixel `S2` (`[81..84] x [150..153]`, excluding `x=80`), matching `IntegerCenter` (`G-010`, distinguishing it from `HalfPixelCenterHalfOpenLine` which misses `S2` = `2/3`).
+  - **Lines (`0/6` under `IntegerCenter`; `6/6` under `IntegerCenterHalfOpenLine`)**: All 6 mismatches (`(28,80)`, `(50,80)`, `(90,84)`, `(28,114)`, `(54,110)`, `(80,110)`) are the exact final endpoints omitted by PCSX2, including reversed horizontal `L1`, steep negative-`dY` `L4`, and zero-length `L5` (`G-011`). Slope-`0.5` diagonal `L3` tie-breaks matched at all remaining pixels.
+- **Scene `08_scissor_clip.gsp` (`73751/76800`, `96.03%`, `pm1=3049`, `gt1=0`)**:
+  - All `3049` mismatches lie inside the scissored Gouraud triangle (`28009` pixels total) and differ by at most `±1` LSB (`dR` in `{0,+1}`, `dG` in `{-1,0,+1}` with a single `dG=+1` at `(68,150)` where exact `G=126.9976`, `dB=0` everywhere because `v1.b == v2.b == 255` with `v1.y == v2.y`).
+  - Scene `06` matched `76800/76800` despite `±1` diffs in `08` because `06` has integer horizontal color gradients (`dR/dx=0`, `dG/dx=+1`, `dB/dx=-1`) with truncating rounding, whereas `08` has fractional horizontal gradients (`dR/dx=-32/79`, `dG/dx=+40/79`).
+  - Offline scratch tests rule out round-to-nearest (`half_up` / `half_even` / `f32_round`: `7140` mismatches on `06`), `ceil` (`14400` on `06`), `f32_bary` (`254` on `06`), and unclipped/exact rational floor (`3049` on `08`). A 4-pixel `Q7` (`s8.7`) SIMD span stepper reproduces clipped rows `y=181..209` and all `min_x % 4 == 0` rows with `0/6960` errors (**fits one scene on aligned spans; may not generalize**; `124` / `192` unaligned-row diffs remain open), while single-pixel `Q9`/`Q10` plane-equation stepping leaves `191` diffs on `08`. Follow-up probes `tests/gs_probes/{11,12,13}_*.gsp` are prepared for Step 2.5 follow-up captures.
+
 
 
 

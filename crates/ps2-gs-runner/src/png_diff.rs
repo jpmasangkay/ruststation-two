@@ -470,10 +470,24 @@ fn find_best_shift_hint(
     best
 }
 
-/// Normalize `reference` against `expected` and compute pixel-level diff metrics and diff image.
+/// Default maximum number of mismatched coordinates recorded in [`PngDiffReport::first_mismatches`].
+pub const DEFAULT_MAX_MISMATCHES: usize = 16;
+
+/// Normalize `reference` against `expected` and compute pixel-level diff metrics and diff image,
+/// keeping up to [`DEFAULT_MAX_MISMATCHES`] mismatch coordinates.
 pub fn compare_rgb_images(
     expected: &RgbImage,
     reference: &RgbImage,
+) -> Result<PngDiffReport, PngDiffError> {
+    compare_rgb_images_with_limit(expected, reference, DEFAULT_MAX_MISMATCHES)
+}
+
+/// Normalize `reference` against `expected` and compute pixel-level diff metrics and diff image,
+/// keeping up to `max_mismatches` mismatch coordinates in scanline order.
+pub fn compare_rgb_images_with_limit(
+    expected: &RgbImage,
+    reference: &RgbImage,
+    max_mismatches: usize,
 ) -> Result<PngDiffReport, PngDiffError> {
     let NormalizedReference {
         image: aligned,
@@ -521,7 +535,7 @@ pub fn compare_rgb_images(
                     gt1_pixels += 1;
                     diff_pixels.push([0xFF, 0x20, 0x80]);
                 }
-                if first_mismatches.len() < 16 {
+                if first_mismatches.len() < max_mismatches {
                     first_mismatches.push(PixelMismatch {
                         x,
                         y,
@@ -651,5 +665,26 @@ mod tests {
         assert_eq!(r.diff_image.get(0, 0), [0xFF, 0xE0, 0x40]);
         assert_eq!(r.diff_image.get(3, 2), [0xFF, 0x20, 0x80]);
         assert_eq!(r.diff_image.get(6, 5), [255 / 4, 40 / 4, 80 / 4]);
+    }
+
+    #[test]
+    fn compare_rgb_images_with_limit_caps_recorded_mismatches() {
+        let exp = make_pattern(8, 8);
+        let mut modified = exp.clone();
+        modified.pixels[..8].fill([10, 0, 0]);
+        let r_zero = compare_rgb_images_with_limit(&exp, &modified, 0).expect("limit 0");
+        assert_eq!(r_zero.gt1_pixels, 8);
+        assert!(r_zero.first_mismatches.is_empty());
+
+        let r_three = compare_rgb_images_with_limit(&exp, &modified, 3).expect("limit 3");
+        assert_eq!(r_three.gt1_pixels, 8);
+        assert_eq!(r_three.first_mismatches.len(), 3);
+        assert_eq!(
+            (r_three.first_mismatches[2].x, r_three.first_mismatches[2].y),
+            (2, 0)
+        );
+
+        let r_many = compare_rgb_images_with_limit(&exp, &modified, 64).expect("limit 64");
+        assert_eq!(r_many.first_mismatches.len(), 8);
     }
 }

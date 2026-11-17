@@ -312,4 +312,27 @@ mod tests {
         assert_eq!(px(81, 150), 0x80FF_A0C0, "S2 subpixel included x=81");
         assert_eq!(px(84, 153), 0x80FF_A0C0, "S2 subpixel included x=84");
     }
+
+    #[test]
+    fn gouraud_and_z_probes_elf_roundtrip_matches_direct_replay() {
+        for (name, rel) in [
+            (
+                "gs_probes/11_gouraud_wide_irrational",
+                "../../tests/gs_probes/11_gouraud_wide_irrational.gsp",
+            ),
+            (
+                "gs_probes/12_gouraud_slanted_all_channels",
+                "../../tests/gs_probes/12_gouraud_slanted_all_channels.gsp",
+            ),
+            (
+                "gs_probes/13_gouraud_z_probe",
+                "../../tests/gs_probes/13_gouraud_z_probe.gsp",
+            ),
+        ] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+            let cycles = verify_gsp_elf_roundtrip(name, &path)
+                .unwrap_or_else(|e| panic!("ELF self-check failed for {name}: {e}"));
+            assert!(cycles > 0, "{name} executed zero cycles");
+        }
+    }
 }

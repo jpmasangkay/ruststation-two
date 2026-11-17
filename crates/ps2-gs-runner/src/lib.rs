@@ -18,7 +18,10 @@ use ps2_gs::{
 use thiserror::Error;
 
 use crate::elf_emit::{build_elf_from_gsp, disassemble_stub, ElfEmitError};
-use crate::png_diff::{compare_rgb_images, decode_png_rgb, write_rgb_png, PngDiffError, RgbImage};
+use crate::png_diff::{
+    compare_rgb_images_with_limit, decode_png_rgb, write_rgb_png, PngDiffError, RgbImage,
+    DEFAULT_MAX_MISMATCHES,
+};
 
 /// CLI arguments for `ps2-gs-runner`.
 #[derive(Parser, Debug, Clone)]
@@ -66,6 +69,10 @@ pub struct Cli {
     /// Maximum allowed absolute per-channel difference `max(|dR|,|dG|,|dB|)` in `--compare-png`.
     #[arg(long, default_value_t = 0, value_name = "N")]
     pub tolerance: u8,
+
+    /// Maximum number of mismatched coordinates printed in `--compare-png` summaries.
+    #[arg(long, default_value_t = DEFAULT_MAX_MISMATCHES, value_name = "N")]
+    pub max_mismatches: usize,
 
     /// One or more `.gsp` packet-stream script paths.
     #[arg(required = true)]
@@ -486,7 +493,7 @@ fn run_compare_png(cli: &Cli, ref_path: &std::path::Path) -> Result<(), RunnerEr
         source,
     })?;
     let reference = decode_png_rgb(BufReader::new(ref_file), &ref_str)?;
-    let report = compare_rgb_images(&expected, &reference)?;
+    let report = compare_rgb_images_with_limit(&expected, &reference, cli.max_mismatches)?;
 
     println!("{}", report.format_summary());
 
@@ -713,5 +720,17 @@ mod tests {
         .expect("emit-elf cli");
         assert!(parsed.emit_elf);
         assert_eq!(parsed.out, Some(PathBuf::from("local/pcsx2/04.elf")));
+        assert_eq!(parsed.max_mismatches, DEFAULT_MAX_MISMATCHES);
+
+        let parsed_cmp = Cli::try_parse_from([
+            "ps2-gs-runner",
+            "--compare-png",
+            "ref.png",
+            "--max-mismatches",
+            "64",
+            "dummy.gsp",
+        ])
+        .expect("compare-png max-mismatches cli");
+        assert_eq!(parsed_cmp.max_mismatches, 64);
     }
 }
