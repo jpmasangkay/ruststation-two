@@ -541,8 +541,8 @@ Unconfirmed sub-pixel rounding, sprite corner normalization, Bresenham endpoint 
 
 - **Vertex assembly & shading** (`Play! Source/gs/GSH_OpenGL/GSH_OpenGL.cpp`, BSD-2-Clause, `FETCHED`): `PRIM` writes clear the vertex queue while `PRMODE`/`PRMODECONT` updates do not (`GsRegs::effective_prim()`); `XYZ2`/`XYZF2` trigger a drawing kick when the primitive's vertex count is met while `XYZ3`/`XYZF3` (`ADC`) advance strip/fan queues without drawing; flat shading (`IIP=0`) takes the final vertex color (`v1` for lines, `v2` for triangles); `Sprite` takes both flat color and depth `Z` from `v1`.
 - **Coordinates, clipping & pixel tests** (`local/ps2tek/index.html`, `FETCHED`): `XYOFFSET_1/2` 12.4 fixed-point offsets are subtracted from `XYZ`/`XYZF`; `SCISSOR_1/2` clips inclusively to `[scax0..=scax1, scay0..=scay1]`; `TEST_1/2` implements `ZTE` and `ZTST` (`0=NEVER`, `1=ALWAYS`, `2=GEQUAL`, `3=GREATER`) alongside `ZBUF_1/2` (`ZMSK`, `PSMZ32`/`24`/`16`/`16S`).
-- **Framebuffer write masking & formats** (`local/ps2tek/index.html`, `FETCHED`; `Play! GSH_OpenGL_Texture.cpp`, `FETCHED`): `FRAME.FBMSK` is applied in 32-bit RGBA space prior to format conversion (`PSMCT32`, `PSMCT24` preserving upper 8 bits `24..=31`, `PSMCT16`/`16S` packing `R[0..4]`, `G[5..9]`, `B[10..14]`, `A[15]` with mask bit 63 controlling alpha bit 15). Texturing/fog/alpha-blending/AA/alpha-test/dithering (`TME`/`FGE`/`ABE`/`AA1`/`ATE`/`DATE`/`DTHE`/`COLCLAMP`/`FBA`) remain deferred to Step 3.
-- **Standalone dumper (`crates/ps2-gs-runner`)**: executes `.gsp` packet streams headless via `ps2-gs` and exports PNG images (defaulting to `local/gs_out/`), supporting `--rect FBP,FBW,PSM,W,H` or `.gsp` `surface` directives (`9/9` suites in `=== GS RENDER GATE ===`).
+- **Framebuffer write masking & formats** (`local/ps2tek/index.html`, `FETCHED`; `Play! GSH_OpenGL_Texture.cpp`, `FETCHED`): `FRAME.FBMSK` is applied in 32-bit RGBA space prior to format conversion (`PSMCT32`, `PSMCT24` preserving upper 8 bits `24..=31`, `PSMCT16`/`16S` packing `R[0..4]`, `G[5..9]`, `B[10..14]`, `A[15]` with mask bit 63 controlling alpha bit 15). Nearest texturing (`TME`) is implemented in Step 3a (§16); fog/alpha-blending/AA/alpha-test/dithering (`FGE`/`ABE`/`AA1`/`ATE`/`DATE`/`DTHE`/`COLCLAMP`/`FBA`) remain deferred to Step 3b/3c.
+- **Standalone dumper (`crates/ps2-gs-runner`)**: executes `.gsp` packet streams headless via `ps2-gs` and exports PNG images (defaulting to `local/gs_out/`), supporting `--rect FBP,FBW,PSM,W,H` or `.gsp` `surface` directives (`9/9` frozen Step 2 suites; `16/16` with Step 3a in `=== GS RENDER GATE ===`).
 
 ---
 
@@ -583,6 +583,35 @@ Unconfirmed sub-pixel rounding, sprite corner normalization, Bresenham endpoint 
     - `M4b_f32_plane_trunc`: `floor(c0 + dC/dx*(x-x0) + dC/dy*(y-y0))` in `f32` -> `06=0, 08=3049, 11=2454 (2440+14), 12=4518`
     - No tested model achieves `0` diffs across `{06, 08, 11, 12}` (`Q7` aligned-row fit leaves `124–192` unaligned diffs on `08` and fails `11`/`12`); exact rational floor is retained in `ps2-gs` with this documented `±1` LSB difference (`G-012`).
   - **Step 3 `UV` & `ST/Q` note**: Truncated fixed-point stepping of non-perspective `UV` (`FST=1`) would lag identically near integer texel boundaries on wide irrational-slope triangles, whereas perspective `ST/Q` (`FST=0`) divides `S/Q, T/Q` in `f32` per pixel; axis-aligned sprites with exact texel steps avoid drift. Test with two wide (`W=281`) contrasting-texel triangles (`dU/dx=13/281` `UV`, `Q=1.0..3.0` `ST/Q`).
+
+---
+
+## 16. Graphics Synthesizer (`crates/ps2-gs`) — Phase 2b Step 3a (Nearest Texturing & CLUT)
+
+### 16.1 `FETCHED` Behavior Implemented (`crates/ps2-gs/src/texture.rs`, `raster.rs`)
+- **Texture coordinates & `TEX0`/`TEX2` (`local/ps2tek/index.html` `#gstextures`, `FETCHED`; `Play!` `commit 1f27232` `BSD-2`, `FETCHED`)**:
+  - `PRIM.FST = 1` (`UV` `12.4` unsigned fixed-point, rounded/stepped by `div_euclid(16)`) and `PRIM.FST = 0` (`ST/Q` perspective coordinates with `U = (S/Q)*TW`, `V = (T/Q)*TH`, `floor()` to integer texel).
+  - `Sprite` (`PRIM=6`) preserves swapped vertex corner pairing (`left_v`/`right_v` for `U`/`S`, `top_v`/`bot_v` for `V`/`T`) while using provoking vertex `v1` for color & `Z`.
+  - `TEX2_1`/`TEX2_2` updates the non-base bits of `TEX0` (`PSM`, `CBP`, `CPSM`, `CSM`, `CSA`, `CLD`) without overwriting `TBP0`/`TBW`/`TW`/`TH`/`TCC`/`TFX`.
+- **`CLAMP` modes (`WMS`/`WMT`) & `TEXA`/`AEM`**:
+  - `0 = REPEAT` (`u & (size - 1)`), `1 = CLAMP` (`clamp(0, size - 1)`), `2 = REGION_CLAMP` (`clamp(MIN, MAX) & (size - 1)`), `3 = REGION_REPEAT` (`((u & MIN) | MAX) & (size - 1)`).
+  - `PSMCT24` expands alpha with `TEXA.AEM` (`AEM=1 && RGB==0 -> A=0`, else `TA0`). `PSMCT16`/`16S` expands `5->8` via `<< 3` (`G-014` convention) and sets alpha to `0` (`AEM=1 && RGB==0`), `TA0` (`A1=0`), or `TA1` (`A1=1`).
+- **Paletted formats & `CLUT` cache (`ClutCache`)**:
+  - Supports `PSMCT32`, `PSMCT24`, `PSMCT16`, `PSMCT16S`, `PSMT8`, `PSMT4`, `PSMT8H`, `PSMT4HL`, and `PSMT4HH` (sharing upper bits `[24..27]` / `[28..31]` of 32-bit pixels with framebuffer formats).
+  - `CSM1` 8-bit CLUT reads `256` entries applying the hardware `0x08 <-> 0x10` entry index swizzle (`Play! GSHandler.cpp::MakeLinearCLUT`, `FETCHED`); `CSM2` reads linear strip starting at `(TEXCLUT.COU*16, TEXCLUT.COV)` with `TEXCLUT.CBW` in `PSMCT16`. `CLD 0..=5` controls `CBP0`/`CBP1` conditional cache reload on `TEX0`/`TEX2` writes.
+- **`TFX` combiner & `TCC`**: Implements `Modulate` (`0`, `(Cv*Ct)>>7` saturating at `255`), `Decal` (`1`, `Ct`), `Highlight` (`2`, `+ Av`), and `Highlight2` (`3`, `+ Av` RGB, `At` when `TCC=1`) with `TCC=0` forcing vertex alpha `Av`.
+- **Gate & ELF Verification**: Suites `10..=16` added to `tests/gs_render/`, verified in `crates/ps2-autotest/src/gs_gate.rs` (`GS_RENDER_GATE_SUITES`, `16/16`) and `crates/ps2-autotest/src/gs_elf_gate.rs` (`STEP3A_GS_ELF_SUITES`, `16/16` `EE -> GIF -> GS` round-trip). `G-014` updated (`TME` implemented); new no-source gaps registered as `G-017`..`G-021` (`GUESS`) in `docs/GS_GUESSES.md`.
+
+### 16.2 Step 3a PCSX2 Checkpoint & Planned Textured-Triangle Probe
+- **Current Step 3a PCSX2 checkpoint scenes (`tests/gs_render/10..12`, sprites `PRIM=0x0116` only, `1x`/`2x` exact UV steps; no textured triangles)**:
+  - `local/pcsx2/3a_psmct32_modulate.{elf,_ours.png}` (`10_tex_psmct32_uv_modulate.gsp`): `PSMCT32` `UV` `1x`/`2x` + `TFX=0 Modulate` (`G-019`, `G-020`).
+  - `local/pcsx2/3a_psmt8_csm1.{elf,_ours.png}` (`11_tex_psmt8_csm1_swizzle.gsp`): `PSMT8` + `CSM1` `16x2` CLUT with entries `8..15` (green/cyan) vs `16..23` (orange/red) testing `0x08 <-> 0x10` swizzle (`G-021`).
+  - `local/pcsx2/3a_psmt4hl_hh.{elf,_ours.png}` (`12_tex_psmt4hl_hh.gsp`): `PSMT4HL` green / `PSMT4HH` magenta pair via `TEX0_1` + `TEX2_1` (`G-008`, `G-021`).
+- **Planned post-decision textured-triangle probe (held until after interpolation decision / Step 3b-3c)**:
+  - **What it will test**: two wide prime-width (`W=281`, contrasting 16- or 32-texel multi-color stripe texture) triangles rendered with `TFX=1 (Decal)`:
+    1. **Linear `UV` (`FST=1`) triangle** with irrational prime-denominator step `dU/dx = 13/281`: tests whether PCSX2 Software steps `U`/`V` with truncated fixed-point increments that lag near integer texel boundaries in the same direction as Gouraud `RGBA` (`08`/`11`/`12`, `§15`), vs exact rational floor.
+    2. **Perspective `ST/Q` (`FST=0`) triangle** with `Q` varying across `1.0..=3.0`: tests per-pixel `S/Q` & `T/Q` perspective division fidelity, non-linear texel boundary shifts along the span (distinct from linear interpolation), and near-zero `Q` fallback stability on triangles (`G-018`, `G-019`).
+
 
 
 

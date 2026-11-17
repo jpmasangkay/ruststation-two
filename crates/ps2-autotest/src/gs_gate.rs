@@ -12,7 +12,7 @@ pub struct GsGateSuite {
     verify: fn(&GsState) -> Result<(), String>,
 }
 
-pub static GS_RENDER_GATE_SUITES: [GsGateSuite; 9] = [
+pub static GS_RENDER_GATE_SUITES: [GsGateSuite; 16] = [
     GsGateSuite {
         name: "gs_render/01_host_to_local_psmct32",
         rel_path: "01_host_to_local_psmct32.gsp",
@@ -57,6 +57,41 @@ pub static GS_RENDER_GATE_SUITES: [GsGateSuite; 9] = [
         name: "gs_render/09_fbmsk_psm16_24_adc",
         rel_path: "09_fbmsk_psm16_24_adc.gsp",
         verify: verify_09_fbmsk_psm16_24_adc,
+    },
+    GsGateSuite {
+        name: "gs_render/10_tex_psmct32_uv_modulate",
+        rel_path: "10_tex_psmct32_uv_modulate.gsp",
+        verify: verify_10_tex_psmct32_uv_modulate,
+    },
+    GsGateSuite {
+        name: "gs_render/11_tex_psmt8_csm1_swizzle",
+        rel_path: "11_tex_psmt8_csm1_swizzle.gsp",
+        verify: verify_11_tex_psmt8_csm1_swizzle,
+    },
+    GsGateSuite {
+        name: "gs_render/12_tex_psmt4hl_hh",
+        rel_path: "12_tex_psmt4hl_hh.gsp",
+        verify: verify_12_tex_psmt4hl_hh,
+    },
+    GsGateSuite {
+        name: "gs_render/13_tex_clamp_modes",
+        rel_path: "13_tex_clamp_modes.gsp",
+        verify: verify_13_tex_clamp_modes,
+    },
+    GsGateSuite {
+        name: "gs_render/14_tex_texa_aem_csm2_cld",
+        rel_path: "14_tex_texa_aem_csm2_cld.gsp",
+        verify: verify_14_tex_texa_aem_csm2_cld,
+    },
+    GsGateSuite {
+        name: "gs_render/15_tex_stq_perspective",
+        rel_path: "15_tex_stq_perspective.gsp",
+        verify: verify_15_tex_stq_perspective,
+    },
+    GsGateSuite {
+        name: "gs_render/16_tex_tfx_tcc",
+        rel_path: "16_tex_tfx_tcc.gsp",
+        verify: verify_16_tex_tfx_tcc,
     },
 ];
 
@@ -727,6 +762,195 @@ fn verify_09_fbmsk_psm16_24_adc(gs: &GsState) -> Result<(), String> {
         0x80FF_4020,
         "TriStrip tri3 after ADC",
     )?;
+    Ok(())
+}
+
+fn verify_10_tex_psmct32_uv_modulate(gs: &GsState) -> Result<(), String> {
+    let f = PixelFormat::Psmct32;
+    // Hand-derived from 10_tex_psmct32_uv_modulate.gsp (320x240, FBP=0, FBW=5):
+    // bg = 0x801C_1410; texel(tx, ty) = (24 + 14*tx, 24 + 14*ty, 0xE0 or 0x20, 0x80).
+    expect_pixel(gs, f, 0, 5, (0, 0), 0x801C_1410, "bg")?;
+    // Sprite A (1x) [24..40, 32..48] with RGBA=(0x80,0x80,0x80,0x80) -> identity
+    expect_pixel(gs, f, 0, 5, (23, 32), 0x801C_1410, "spriteA outside left")?;
+    expect_pixel(gs, f, 0, 5, (24, 32), 0x80E0_1818, "spriteA texel(0,0)")?;
+    expect_pixel(gs, f, 0, 5, (27, 34), 0x8020_3442, "spriteA texel(3,2)")?;
+    expect_pixel(gs, f, 0, 5, (39, 47), 0x80E0_EAEA, "spriteA texel(15,15)")?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (40, 47),
+        0x801C_1410,
+        "spriteA half-open right",
+    )?;
+    // Sprite B (2x) [64..96, 32..64]
+    expect_pixel(gs, f, 0, 5, (64, 32), 0x80E0_1818, "spriteB 2x (0,0) a")?;
+    expect_pixel(gs, f, 0, 5, (65, 33), 0x80E0_1818, "spriteB 2x (0,0) b")?;
+    expect_pixel(gs, f, 0, 5, (66, 32), 0x8020_1826, "spriteB 2x (1,0)")?;
+    expect_pixel(gs, f, 0, 5, (95, 63), 0x80E0_EAEA, "spriteB 2x (15,15)")?;
+    // Sprite C (2x + Modulate RGBA=(0x40, 0xFF, 0x80, 0x80)) [128..160, 32..64]
+    // (0,0): R=(0x40*24)>>7=12(0x0C), G=(0xFF*24)>>7=47(0x2F), B=224(0xE0), A=0x80
+    expect_pixel(gs, f, 0, 5, (128, 32), 0x80E0_2F0C, "spriteC mod (0,0)")?;
+    // (15,15): R=(64*234)>>7=117(0x75), G=min(255,(255*234)>>7)=255(0xFF), B=224(0xE0), A=0x80
+    expect_pixel(gs, f, 0, 5, (158, 62), 0x80E0_FF75, "spriteC mod (15,15)")?;
+    Ok(())
+}
+
+fn verify_11_tex_psmt8_csm1_swizzle(gs: &GsState) -> Result<(), String> {
+    let f = PixelFormat::Psmct32;
+    // Hand-derived from 11_tex_psmt8_csm1_swizzle.gsp (320x240, FBP=0, FBW=5):
+    // In CSM1 8-bit CLUT, bit3 <-> bit4 swap means indices 8..15 live at VRAM row y=1 x=0..7 (green/cyan)
+    // and indices 16..23 live at VRAM row y=0 x=8..15 (orange/red).
+    expect_pixel(gs, f, 0, 5, (0, 0), 0x8000_0000, "bg")?;
+    // 1x sprite [24..40, 32..36]:
+    expect_pixel(gs, f, 0, 5, (24, 32), 0x80A0_3030, "1x idx 0 (blue)")?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (32, 32),
+        0x8020_F010,
+        "1x idx 8 (green, swapped)",
+    )?;
+    expect_pixel(gs, f, 0, 5, (39, 32), 0x80C8_F010, "1x idx 15 (green-cyan)")?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (24, 33),
+        0x8010_20F0,
+        "1x idx 16 (orange, swapped)",
+    )?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (31, 33),
+        0x8010_C8F0,
+        "1x idx 23 (yellow-orange)",
+    )?;
+    expect_pixel(gs, f, 0, 5, (24, 34), 0x8020_F010, "1x row 2 idx 8")?;
+    // 2x sprite [64..96, 48..56]:
+    expect_pixel(gs, f, 0, 5, (80, 48), 0x8020_F010, "2x idx 8 a")?;
+    expect_pixel(gs, f, 0, 5, (81, 49), 0x8020_F010, "2x idx 8 b")?;
+    expect_pixel(gs, f, 0, 5, (64, 50), 0x8010_20F0, "2x idx 16")?;
+    expect_pixel(gs, f, 0, 5, (94, 54), 0x8020_F010, "2x row 3 col 15 idx 8")?;
+    Ok(())
+}
+
+fn verify_12_tex_psmt4hl_hh(gs: &GsState) -> Result<(), String> {
+    let f = PixelFormat::Psmct32;
+    // Hand-derived from 12_tex_psmt4hl_hh.gsp (320x240, FBP=0, FBW=5):
+    // PSMT4HL [24..32, 32..36] & [48..64, 32..40]: nibble=1 GREEN (0x8000_FF00) / nibble=3 BLUE (0x80FF_8000)
+    expect_pixel(gs, f, 0, 5, (24, 32), 0x8000_FF00, "4HL 1x left green")?;
+    expect_pixel(gs, f, 0, 5, (28, 35), 0x80FF_8000, "4HL 1x right blue")?;
+    expect_pixel(gs, f, 0, 5, (48, 32), 0x8000_FF00, "4HL 2x left green")?;
+    expect_pixel(gs, f, 0, 5, (63, 39), 0x80FF_8000, "4HL 2x right blue")?;
+    // PSMT4HH [88..96, 32..36] & [112..128, 32..40]: nibble=2 MAGENTA (0x80FF_00FF) / nibble=4 YELLOW (0x8000_FFFF)
+    expect_pixel(gs, f, 0, 5, (88, 32), 0x80FF_00FF, "4HH 1x left magenta")?;
+    expect_pixel(gs, f, 0, 5, (92, 35), 0x8000_FFFF, "4HH 1x right yellow")?;
+    expect_pixel(gs, f, 0, 5, (112, 32), 0x80FF_00FF, "4HH 2x left magenta")?;
+    expect_pixel(gs, f, 0, 5, (127, 39), 0x8000_FFFF, "4HH 2x right yellow")?;
+    Ok(())
+}
+
+fn verify_13_tex_clamp_modes(gs: &GsState) -> Result<(), String> {
+    let f = PixelFormat::Psmct32;
+    // Texture row y=2 (T=0.25 -> v=2, G=16+2*30=76=0x4C): pixel(u) = 0x8040_4C00 | (16 + u*30)
+    let texel = |u: u32| -> u32 { 0x8040_4C00 | (16 + u * 30) };
+    // S runs from -0.5 (-4) to +1.5 (+12) over x=0..16 -> raw iu = x - 4.
+    // Band 0 (y=0..4): WMS=0 REPEAT -> u = (x - 4) & 7
+    expect_pixel(gs, f, 0, 1, (0, 1), texel(4), "repeat x=0 -> u=4")?;
+    expect_pixel(gs, f, 0, 1, (4, 1), texel(0), "repeat x=4 -> u=0")?;
+    expect_pixel(gs, f, 0, 1, (15, 1), texel(3), "repeat x=15 -> u=3")?;
+    // Band 1 (y=8..12): WMS=1 CLAMP -> clamp(iu, 0, 7)
+    expect_pixel(gs, f, 0, 1, (0, 9), texel(0), "clamp x=0 -> u=0")?;
+    expect_pixel(gs, f, 0, 1, (9, 9), texel(5), "clamp x=9 -> u=5")?;
+    expect_pixel(gs, f, 0, 1, (15, 9), texel(7), "clamp x=15 -> u=7")?;
+    // Band 2 (y=16..20): WMS=2 REGION_CLAMP [2, 5]
+    expect_pixel(gs, f, 0, 1, (0, 17), texel(2), "region_clamp x=0 -> u=2")?;
+    expect_pixel(gs, f, 0, 1, (7, 17), texel(3), "region_clamp x=7 -> u=3")?;
+    expect_pixel(gs, f, 0, 1, (15, 17), texel(5), "region_clamp x=15 -> u=5")?;
+    // Band 3 (y=24..28): WMS=3 REGION_REPEAT (umsk=3, ufix=4) -> (iu & 3) | 4
+    expect_pixel(gs, f, 0, 1, (0, 25), texel(4), "region_repeat x=0 -> u=4")?;
+    expect_pixel(gs, f, 0, 1, (3, 25), texel(7), "region_repeat x=3 -> u=7")?;
+    expect_pixel(gs, f, 0, 1, (4, 25), texel(4), "region_repeat x=4 -> u=4")?;
+    Ok(())
+}
+
+fn verify_14_tex_texa_aem_csm2_cld(gs: &GsState) -> Result<(), String> {
+    let f = PixelFormat::Psmct32;
+    // Part 1: PSMCT16 TEXA (TA0=0x30, AEM=1, TA1=0xB0) at x=0..4, y=0..2
+    expect_pixel(gs, f, 0, 1, (0, 0), 0x0000_0000, "texa aem rgb=0 a1=0")?;
+    expect_pixel(gs, f, 0, 1, (1, 0), 0x3000_00F8, "texa ta0 non-black a1=0")?;
+    expect_pixel(gs, f, 0, 1, (2, 0), 0x0000_0000, "texa aem rgb=0 a1=1")?;
+    expect_pixel(gs, f, 0, 1, (3, 0), 0xB000_F800, "texa ta1 non-black a1=1")?;
+    // Part 2: CSM2 + TEXCLUT + CLD 0..=5 sprites across x=8..60, y=0..2
+    let green = 0xB000_F800;
+    let red = 0xB000_00F8;
+    let blue = 0xB0F8_0000;
+    expect_pixel(gs, f, 0, 1, (8, 0), green, "cld=2 loads green")?;
+    expect_pixel(gs, f, 0, 1, (16, 0), green, "cld=0 retains green")?;
+    expect_pixel(gs, f, 0, 1, (24, 0), green, "cld=4 same cbp retains green")?;
+    expect_pixel(gs, f, 0, 1, (32, 0), red, "cld=1 reloads red")?;
+    expect_pixel(gs, f, 0, 1, (40, 0), blue, "cld=3 cbp1+texclut loads blue")?;
+    expect_pixel(gs, f, 0, 1, (48, 0), blue, "cld=5 same cbp1 retains blue")?;
+    expect_pixel(gs, f, 0, 1, (56, 0), red, "cld=5 diff cbp reloads red")?;
+    Ok(())
+}
+
+fn verify_15_tex_stq_perspective(gs: &GsState) -> Result<(), String> {
+    let f = PixelFormat::Psmct32;
+    let texel =
+        |u: u32| -> u32 { 0x8000_0000 | ((0xFF - 20 * u) << 16) | (0x80 << 8) | (20 + 30 * u) };
+    // Sprite [0..16, 0..8], S=0..2, Q=2..4 (S/Q = 0..0.5 -> texels 0..3)
+    expect_pixel(gs, f, 0, 1, (0, 2), texel(0), "stq sprite x=0 -> texel 0")?;
+    expect_pixel(gs, f, 0, 1, (8, 2), texel(2), "stq sprite x=8 -> texel 2")?;
+    expect_pixel(gs, f, 0, 1, (15, 2), texel(3), "stq sprite x=15 -> texel 3")?;
+    // Sprite Q==0 -> 1.0 [0..8, 10..18]
+    expect_pixel(gs, f, 0, 1, (0, 12), texel(0), "stq q==0 x=0 -> texel 0")?;
+    expect_pixel(gs, f, 0, 1, (6, 12), texel(3), "stq q==0 x=6 -> texel 3")?;
+    // Triangle (8,24)->(56,24)->(8,56), Q=(1,2,1), S=(0,2,0)
+    // Midpoint (32,24): S=1.0, Q=1.5 -> u=(1.0/1.5)*8 = 5.333 -> texel 5 (linear would be 4)
+    expect_pixel(gs, f, 0, 1, (8, 24), texel(0), "stq tri v0 -> texel 0")?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        1,
+        (32, 24),
+        texel(5),
+        "stq tri midpoint -> perspective texel 5",
+    )?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        1,
+        (44, 24),
+        texel(6),
+        "stq tri 3/4 -> perspective texel 6",
+    )?;
+    Ok(())
+}
+
+fn verify_16_tex_tfx_tcc(gs: &GsState) -> Result<(), String> {
+    let f = PixelFormat::Psmct32;
+    // Texel=(100,80,40,60), Vertex=(128,64,192,96)
+    // Row y=0..6 (TCC=0):
+    expect_pixel(gs, f, 0, 1, (1, 1), 0x603C_2864, "tfx=0 mod tcc=0")?;
+    expect_pixel(gs, f, 0, 1, (9, 1), 0x6028_5064, "tfx=1 decal tcc=0")?;
+    expect_pixel(gs, f, 0, 1, (17, 1), 0x609C_88C4, "tfx=2 hi tcc=0")?;
+    expect_pixel(gs, f, 0, 1, (25, 1), 0x609C_88C4, "tfx=3 hi2 tcc=0")?;
+    // Row y=16..22 (TCC=1):
+    expect_pixel(gs, f, 0, 1, (1, 17), 0x2D3C_2864, "tfx=0 mod tcc=1")?;
+    expect_pixel(gs, f, 0, 1, (9, 17), 0x3C28_5064, "tfx=1 decal tcc=1")?;
+    expect_pixel(gs, f, 0, 1, (17, 17), 0x9C9C_88C4, "tfx=2 hi tcc=1")?;
+    expect_pixel(gs, f, 0, 1, (25, 17), 0x3C9C_88C4, "tfx=3 hi2 tcc=1")?;
     Ok(())
 }
 

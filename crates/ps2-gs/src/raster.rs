@@ -1,9 +1,11 @@
-//! Non-textured GS software rasterizer (Phase 2b Step 2).
+//! GS software rasterizer (`Phase 2b Step 2` + `Step 3a` nearest texturing).
 //!
 //! Implements vertex assembly (`XYZ2`/`XYZF2` draw kick, `XYZ3`/`XYZF3` vertex-only / ADC),
-//! flat & Gouraud shading (`PRIM.IIP` / `PRMODECONT`), `XYOFFSET`, `SCISSOR`, `ZBUF` &
-//! `TEST.ZTE`/`ZTST`/`ZMSK`, and `FRAME` (`FBMSK` + 32/24/16-bit formats). All pixel
-//! coverage tests delegate exclusively to [`crate::coverage::is_pixel_covered_active`].
+//! flat & Gouraud shading (`PRIM.IIP` / `PRMODECONT`), nearest-sampled textures (`PRIM.TME`,
+//! `PRIM.FST` `UV`/`STQ`, `TEX0`/`TEX2`/`TEXFLUSH`, `CLUT` `CSM1`/`CSM2`/`TEXCLUT`/`CLD`/`CSA`,
+//! `CLAMP`, `TEXA`, `TCC`/`TFX`), `XYOFFSET`, `SCISSOR`, `ZBUF` & `TEST.ZTE`/`ZTST`/`ZMSK`, and
+//! `FRAME` (`FBMSK` + 32/24/16-bit formats). All pixel coverage tests delegate exclusively to
+//! [`crate::coverage::is_pixel_covered_active`].
 
 use tracing::warn;
 
@@ -11,7 +13,8 @@ use crate::coverage::{
     edge_fn, is_pixel_covered_active, pixel_sample_fp, snap_coord_to_pixel, CoveragePrimitive,
     ACTIVE_COVERAGE,
 };
-use crate::regs::{ContextRegs, GsRegs, PrimReg, PrimitiveType, XyzReg};
+use crate::regs::{ContextRegs, GsRegs, PrimReg, PrimitiveType, TexAReg, XyzReg};
+use crate::texture::{apply_tfx, sample_nearest_texel, sanitize_q, ClutCache};
 use crate::vram::{GsVram, PixelFormat};
 
 /// Latched per-vertex attributes captured on a GS vertex kick (`XYZ2/3` or `XYZF2/3`).
@@ -57,13 +60,14 @@ impl GsVertex {
     }
 }
 
-/// Vertex assembly queue and non-textured primitive rasterizer state.
+/// Vertex assembly queue, CLUT cache, and software primitive rasterizer state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RasterizerState {
     prim_type: PrimitiveType,
     queue: [GsVertex; 3],
     queue_len: u8,
     warned_unsupported_features: bool,
+    clut: ClutCache,
 }
 
 impl Default for RasterizerState {
@@ -93,11 +97,18 @@ impl RasterizerState {
             }; 3],
             queue_len: 0,
             warned_unsupported_features: false,
+            clut: ClutCache::new(),
         }
     }
 
     pub fn reset(&mut self) {
         *self = Self::new();
+    }
+
+    /// Update the cached CLUT when `TEX0_{1,2}` or `TEX2_{1,2}` is written.
+    #[inline]
+    pub fn on_tex_reg_write(&mut self, regs: &GsRegs, vram: &GsVram, ctxt: usize) {
+        self.clut.sync_clut(regs.ctx[ctxt].tex0, regs.texclut, vram);
     }
 
     /// Update active primitive topology on a `PRIM` (`0x00`) write and clear pending vertices.
@@ -141,13 +152,13 @@ impl RasterizerState {
 
         if drawing_kick {
             let eff_prim = regs.effective_prim();
-            if (eff_prim.tme() || eff_prim.fge() || eff_prim.abe() || eff_prim.aa1())
+            if (eff_prim.fge() || eff_prim.abe() || eff_prim.aa1())
                 && !self.warned_unsupported_features
             {
                 self.warned_unsupported_features = true;
                 warn!(
                     prim = eff_prim.0,
-                    "Step 2 non-textured rasterizer ignoring TME/FGE/ABE/AA1 until Step 3"
+                    "Step 3a rasterizer ignoring FGE/ABE/AA1 until Step 3b/3c"
                 );
             }
             self.draw_assembled(regs, vram, eff_prim);
@@ -203,9 +214,13 @@ impl RasterizerState {
 
         let target = RenderTarget {
             ctx,
+            clut: &self.clut,
+            texa: regs.texa,
             scissor: [scax0, scax1, scay0, scay1],
             fb_fmt,
             z_fmt: PixelFormat::from_zbuf_raw(ctx.zbuf.zsm_raw()),
+            tme: eff_prim.tme(),
+            fst: eff_prim.fst(),
         };
         let gouraud = eff_prim.iip();
 
@@ -321,12 +336,53 @@ fn bilerp_u8(a0: u8, a1: u8, a2: u8, w0: u128, w1: u128, w2: u128, denom: u128) 
     ((w0 * u128::from(a0) + w1 * u128::from(a1) + w2 * u128::from(a2)) / denom) as u8
 }
 
+#[inline]
+fn stq_to_texel(s: f64, t: f64, q: f64, tw: u32, th: u32) -> (i32, i32) {
+    let q_eff = sanitize_q(q);
+    let iu = ((s / q_eff) * f64::from(tw)).floor() as i32;
+    let iv = ((t / q_eff) * f64::from(th)).floor() as i32;
+    (iu, iv)
+}
+
+#[inline]
+fn vertex_stq_f64(v: GsVertex) -> (f64, f64, f64) {
+    (
+        f64::from(f32::from_bits(v.s_bits)),
+        f64::from(f32::from_bits(v.t_bits)),
+        f64::from(f32::from_bits(v.q_bits)),
+    )
+}
+
 #[derive(Copy, Clone)]
 struct RenderTarget<'a> {
     ctx: &'a ContextRegs,
+    clut: &'a ClutCache,
+    texa: TexAReg,
     scissor: [i32; 4],
     fb_fmt: PixelFormat,
     z_fmt: Option<PixelFormat>,
+    tme: bool,
+    fst: bool,
+}
+
+#[inline]
+fn shade_fragment(
+    target: RenderTarget<'_>,
+    vram: &mut GsVram,
+    px: u32,
+    py: u32,
+    vert_rgba: [u8; 4],
+    texel_uv: Option<(i32, i32)>,
+    z: u32,
+) {
+    let rgba32 = match texel_uv {
+        Some((iu, iv)) => {
+            let texel = sample_nearest_texel(vram, target.clut, target.ctx, target.texa, iu, iv);
+            apply_tfx(target.ctx.tex0, vert_rgba, texel)
+        }
+        None => pack_rgba32(vert_rgba[0], vert_rgba[1], vert_rgba[2], vert_rgba[3]),
+    };
+    shade_pixel(target, vram, px, py, rgba32, z);
 }
 
 fn shade_pixel(target: RenderTarget<'_>, vram: &mut GsVram, px: u32, py: u32, rgba32: u32, z: u32) {
@@ -415,12 +471,28 @@ fn raster_point(target: RenderTarget<'_>, vram: &mut GsVram, v: GsVertex) {
     let (x_fp, y_fp) = to_screen_fp(target.ctx, v);
     let prim = CoveragePrimitive::Point { x_fp, y_fp };
     let (min_x, max_x, min_y, max_y) = clipped_bbox(x_fp, x_fp, y_fp, y_fp, target.scissor);
-    let rgba32 = pack_rgba32(v.r, v.g, v.b, v.a);
+    let vert_rgba = [v.r, v.g, v.b, v.a];
+    let texel_uv = if target.tme {
+        if target.fst {
+            Some((i32::from(v.u_raw) >> 4, i32::from(v.v_raw) >> 4))
+        } else {
+            let (s, t, q) = vertex_stq_f64(v);
+            Some(stq_to_texel(
+                s,
+                t,
+                q,
+                target.ctx.tex0.width(),
+                target.ctx.tex0.height(),
+            ))
+        }
+    } else {
+        None
+    };
 
     for py in min_y..=max_y {
         for px in min_x..=max_x {
             if is_pixel_covered_active(&prim, px, py) {
-                shade_pixel(target, vram, px as u32, py as u32, rgba32, v.z);
+                shade_fragment(target, vram, px as u32, py as u32, vert_rgba, texel_uv, v.z);
             }
         }
     }
@@ -449,7 +521,11 @@ fn raster_line(
     let adx = ix1.abs_diff(ix0) as u128;
     let ady = iy1.abs_diff(iy0) as u128;
     let steps = adx.max(ady);
-    let flat_rgba32 = pack_rgba32(v1.r, v1.g, v1.b, v1.a);
+    let flat_rgba = [v1.r, v1.g, v1.b, v1.a];
+    let (s0, t0, q0) = vertex_stq_f64(v0);
+    let (s1, t1, q1) = vertex_stq_f64(v1);
+    let tw = target.ctx.tex0.width();
+    let th = target.ctx.tex0.height();
 
     let (min_x, max_x, min_y, max_y) = clipped_bbox(
         x0_fp.min(x1_fp),
@@ -464,8 +540,17 @@ fn raster_line(
             if !is_pixel_covered_active(&prim, px, py) {
                 continue;
             }
-            let (rgba32, z) = if steps == 0 {
-                (flat_rgba32, v1.z)
+            let (vert_rgba, z, texel_uv) = if steps == 0 {
+                let uv = if target.tme {
+                    if target.fst {
+                        Some((i32::from(v1.u_raw) >> 4, i32::from(v1.v_raw) >> 4))
+                    } else {
+                        Some(stq_to_texel(s1, t1, q1, tw, th))
+                    }
+                } else {
+                    None
+                };
+                (flat_rgba, v1.z, uv)
             } else {
                 let t = if adx >= ady {
                     px.abs_diff(ix0) as u128
@@ -473,19 +558,38 @@ fn raster_line(
                     py.abs_diff(iy0) as u128
                 };
                 let z = lerp_u32(v0.z, v1.z, t, steps);
-                let color = if gouraud {
-                    pack_rgba32(
+                let vert_rgba = if gouraud {
+                    [
                         lerp_u8(v0.r, v1.r, t, steps),
                         lerp_u8(v0.g, v1.g, t, steps),
                         lerp_u8(v0.b, v1.b, t, steps),
                         lerp_u8(v0.a, v1.a, t, steps),
-                    )
+                    ]
                 } else {
-                    flat_rgba32
+                    flat_rgba
                 };
-                (color, z)
+                let uv = if target.tme {
+                    if target.fst {
+                        let s_den = steps as i128;
+                        let st = t as i128;
+                        let u_fp = ((s_den - st) * i128::from(v0.u_raw) + st * i128::from(v1.u_raw))
+                            .div_euclid(s_den) as i32;
+                        let v_fp = ((s_den - st) * i128::from(v0.v_raw) + st * i128::from(v1.v_raw))
+                            .div_euclid(s_den) as i32;
+                        Some((u_fp.div_euclid(16), v_fp.div_euclid(16)))
+                    } else {
+                        let frac = (t as f64) / (steps as f64);
+                        let s = (1.0 - frac) * s0 + frac * s1;
+                        let tc = (1.0 - frac) * t0 + frac * t1;
+                        let q = (1.0 - frac) * q0 + frac * q1;
+                        Some(stq_to_texel(s, tc, q, tw, th))
+                    }
+                } else {
+                    None
+                };
+                (vert_rgba, z, uv)
             };
-            shade_pixel(target, vram, px as u32, py as u32, rgba32, z);
+            shade_fragment(target, vram, px as u32, py as u32, vert_rgba, texel_uv, z);
         }
     }
 }
@@ -493,10 +597,16 @@ fn raster_line(
 fn raster_sprite(target: RenderTarget<'_>, vram: &mut GsVram, v0: GsVertex, v1: GsVertex) {
     let (x0_fp, y0_fp) = to_screen_fp(target.ctx, v0);
     let (x1_fp, y1_fp) = to_screen_fp(target.ctx, v1);
-    let min_x_fp = x0_fp.min(x1_fp);
-    let max_x_fp = x0_fp.max(x1_fp);
-    let min_y_fp = y0_fp.min(y1_fp);
-    let max_y_fp = y0_fp.max(y1_fp);
+    let (min_x_fp, max_x_fp, left_v, right_v) = if x0_fp <= x1_fp {
+        (x0_fp, x1_fp, v0, v1)
+    } else {
+        (x1_fp, x0_fp, v1, v0)
+    };
+    let (min_y_fp, max_y_fp, top_v, bot_v) = if y0_fp <= y1_fp {
+        (y0_fp, y1_fp, v0, v1)
+    } else {
+        (y1_fp, y0_fp, v1, v0)
+    };
 
     let prim = CoveragePrimitive::Sprite {
         min_x_fp,
@@ -508,14 +618,49 @@ fn raster_sprite(target: RenderTarget<'_>, vram: &mut GsVram, v0: GsVertex, v1: 
         clipped_bbox(min_x_fp, max_x_fp, min_y_fp, max_y_fp, target.scissor);
 
     // `Play! GSH_OpenGL.cpp` (`BSD-2`, `FETCHED`): sprite uses final vertex `v1`'s color & Z.
-    let rgba32 = pack_rgba32(v1.r, v1.g, v1.b, v1.a);
+    let vert_rgba = [v1.r, v1.g, v1.b, v1.a];
     let z = v1.z;
+    let dx_fp = i64::from(max_x_fp) - i64::from(min_x_fp);
+    let dy_fp = i64::from(max_y_fp) - i64::from(min_y_fp);
+    let tw = f64::from(target.ctx.tex0.width());
+    let th = f64::from(target.ctx.tex0.height());
+    let (sl, _, ql) = vertex_stq_f64(left_v);
+    let (sr, _, qr) = vertex_stq_f64(right_v);
+    let (_, tt, qt) = vertex_stq_f64(top_v);
+    let (_, tb, qb) = vertex_stq_f64(bot_v);
+    let u_left = (sl / sanitize_q(ql)) * tw;
+    let u_right = (sr / sanitize_q(qr)) * tw;
+    let v_top = (tt / sanitize_q(qt)) * th;
+    let v_bot = (tb / sanitize_q(qb)) * th;
 
     for py in min_y..=max_y {
         for px in min_x..=max_x {
-            if is_pixel_covered_active(&prim, px, py) {
-                shade_pixel(target, vram, px as u32, py as u32, rgba32, z);
+            if !is_pixel_covered_active(&prim, px, py) {
+                continue;
             }
+            let texel_uv = if target.tme {
+                let (cx_fp, cy_fp) = pixel_sample_fp(px, py, ACTIVE_COVERAGE);
+                if target.fst {
+                    let u_fp = i64::from(left_v.u_raw)
+                        + ((cx_fp - i64::from(min_x_fp))
+                            * (i64::from(right_v.u_raw) - i64::from(left_v.u_raw)))
+                        .div_euclid(dx_fp);
+                    let v_fp = i64::from(top_v.v_raw)
+                        + ((cy_fp - i64::from(min_y_fp))
+                            * (i64::from(bot_v.v_raw) - i64::from(top_v.v_raw)))
+                        .div_euclid(dy_fp);
+                    Some(((u_fp as i32).div_euclid(16), (v_fp as i32).div_euclid(16)))
+                } else {
+                    let fx = ((cx_fp - i64::from(min_x_fp)) as f64) / (dx_fp as f64);
+                    let fy = ((cy_fp - i64::from(min_y_fp)) as f64) / (dy_fp as f64);
+                    let iu = (u_left + fx * (u_right - u_left)).floor() as i32;
+                    let iv = (v_top + fy * (v_bot - v_top)).floor() as i32;
+                    Some((iu, iv))
+                }
+            } else {
+                None
+            };
+            shade_fragment(target, vram, px as u32, py as u32, vert_rgba, texel_uv, z);
         }
     }
 }
@@ -527,7 +672,7 @@ fn raster_triangle(
     gouraud: bool,
 ) {
     // Capture provoking (last) vertex color before any CW vertex swap (`Play! GSH_OpenGL.cpp`).
-    let flat_rgba32 = pack_rgba32(verts[2].r, verts[2].g, verts[2].b, verts[2].a);
+    let flat_rgba = [verts[2].r, verts[2].g, verts[2].b, verts[2].a];
 
     let (x0_fp, y0_fp) = to_screen_fp(target.ctx, verts[0]);
     let (x1_fp, y1_fp) = to_screen_fp(target.ctx, verts[1]);
@@ -557,6 +702,11 @@ fn raster_triangle(
         core::mem::swap(&mut y1, &mut y2);
     }
     let denom = area2 as u128;
+    let (s0, t0, q0) = vertex_stq_f64(verts[0]);
+    let (s1, t1, q1) = vertex_stq_f64(verts[1]);
+    let (s2, t2, q2) = vertex_stq_f64(verts[2]);
+    let tw = target.ctx.tex0.width();
+    let th = target.ctx.tex0.height();
 
     let (min_x, max_x, min_y, max_y) = clipped_bbox(
         x0_fp.min(x1_fp).min(x2_fp),
@@ -581,17 +731,44 @@ fn raster_triangle(
                 + w2 * u128::from(verts[2].z))
                 / denom) as u32;
 
-            let rgba32 = if gouraud {
-                let r = bilerp_u8(verts[0].r, verts[1].r, verts[2].r, w0, w1, w2, denom);
-                let g = bilerp_u8(verts[0].g, verts[1].g, verts[2].g, w0, w1, w2, denom);
-                let b = bilerp_u8(verts[0].b, verts[1].b, verts[2].b, w0, w1, w2, denom);
-                let a = bilerp_u8(verts[0].a, verts[1].a, verts[2].a, w0, w1, w2, denom);
-                pack_rgba32(r, g, b, a)
+            let vert_rgba = if gouraud {
+                [
+                    bilerp_u8(verts[0].r, verts[1].r, verts[2].r, w0, w1, w2, denom),
+                    bilerp_u8(verts[0].g, verts[1].g, verts[2].g, w0, w1, w2, denom),
+                    bilerp_u8(verts[0].b, verts[1].b, verts[2].b, w0, w1, w2, denom),
+                    bilerp_u8(verts[0].a, verts[1].a, verts[2].a, w0, w1, w2, denom),
+                ]
             } else {
-                flat_rgba32
+                flat_rgba
             };
 
-            shade_pixel(target, vram, px as u32, py as u32, rgba32, z);
+            let texel_uv = if target.tme {
+                if target.fst {
+                    let s_den = denom as i128;
+                    let u_fp = (w0 as i128 * i128::from(verts[0].u_raw)
+                        + w1 as i128 * i128::from(verts[1].u_raw)
+                        + w2 as i128 * i128::from(verts[2].u_raw))
+                    .div_euclid(s_den) as i32;
+                    let v_fp = (w0 as i128 * i128::from(verts[0].v_raw)
+                        + w1 as i128 * i128::from(verts[1].v_raw)
+                        + w2 as i128 * i128::from(verts[2].v_raw))
+                    .div_euclid(s_den) as i32;
+                    Some((u_fp.div_euclid(16), v_fp.div_euclid(16)))
+                } else {
+                    let inv = 1.0 / (denom as f64);
+                    let l0 = (w0 as f64) * inv;
+                    let l1 = (w1 as f64) * inv;
+                    let l2 = (w2 as f64) * inv;
+                    let s = l0 * s0 + l1 * s1 + l2 * s2;
+                    let t = l0 * t0 + l1 * t1 + l2 * t2;
+                    let q = l0 * q0 + l1 * q1 + l2 * q2;
+                    Some(stq_to_texel(s, t, q, tw, th))
+                }
+            } else {
+                None
+            };
+
+            shade_fragment(target, vram, px as u32, py as u32, vert_rgba, texel_uv, z);
         }
     }
 }
@@ -1076,6 +1253,80 @@ mod tests {
             gs.vram
                 .read_page_pixel_raw(PixelFormat::Psmct16s, 20, 1, 4, 2),
             0
+        );
+    }
+
+    #[test]
+    fn textured_point_line_reversed_sprite_and_stq_zero_fallback() {
+        let mut gs = GsState::new();
+        setup_basic_32(&mut gs, 16, 16);
+        // 4x4 PSMCT32 texture at block 64 (`TBP0=64`, `TBW=1`, `TW=2 (4px)`, `TH=2 (4px)`), Decal TCC=1.
+        for ty in 0..4u32 {
+            for tx in 0..4u32 {
+                let c = 0x8000_0000 | (tx * 40 + 10) | ((ty * 50 + 20) << 8) | ((tx + ty) << 16);
+                gs.vram
+                    .write_pixel_raw(PixelFormat::Psmct32, 64, 1, tx, ty, c);
+            }
+        }
+        let tex0 = 64u64 | (1 << 14) | (2 << 26) | (2 << 30) | (1 << 34) | (1 << 35); // Decal TCC=1
+        gs.write_internal_reg(gs_reg::TEX0_1, tex0);
+        gs.write_internal_reg(gs_reg::CLAMP_1, 0x05); // WMS=1 CLAMP, WMT=1 CLAMP
+
+        // 1. Textured Point with FST=1 (`PRIM = Point | TME | FST` = 0 | 16 | 256 = 0x110) at UV=(2.0, 3.0).
+        gs.write_internal_reg(gs_reg::PRIM, 0x110);
+        gs.write_internal_reg(gs_reg::UV, (2 * 16) | ((3 * 16) << 16));
+        gs.write_internal_reg(gs_reg::RGBAQ, pack_rgba(0xFF, 0xFF, 0xFF, 0x80));
+        gs.write_internal_reg(gs_reg::XYZ2, pack_xyz(1, 1, 1));
+        assert_eq!(
+            gs.vram
+                .read_page_pixel_raw(PixelFormat::Psmct32, 0, 1, 1, 1),
+            gs.vram.read_pixel_raw(PixelFormat::Psmct32, 64, 1, 2, 3)
+        );
+
+        // 2. Textured Line with FST=0 ST/Q (`Q == 0` falls back to `1.0`): (4,1)->(8,1) s=0.0..1.0.
+        gs.write_internal_reg(gs_reg::PRIM, 0x011); // Line | TME
+        gs.write_internal_reg(
+            gs_reg::ST,
+            u64::from(0.0f32.to_bits() & !0xFF) | (u64::from(0.0f32.to_bits() & !0xFF) << 32),
+        );
+        gs.write_internal_reg(gs_reg::RGBAQ, 0x0080_8080); // Q=0 -> fallback 1.0
+        gs.write_internal_reg(gs_reg::XYZ2, pack_xyz(4, 1, 1));
+        gs.write_internal_reg(
+            gs_reg::ST,
+            u64::from(1.0f32.to_bits() & !0xFF) | (u64::from(0.0f32.to_bits() & !0xFF) << 32),
+        );
+        gs.write_internal_reg(gs_reg::RGBAQ, 0x0080_8080);
+        gs.write_internal_reg(gs_reg::XYZ2, pack_xyz(8, 1, 1));
+        // Half-open line draws x=4..7 (`s = 0, 0.25, 0.5, 0.75` -> texels `0, 1, 2, 3`) and leaves x=8 clear.
+        for x in 4..8u32 {
+            assert_eq!(
+                gs.vram
+                    .read_page_pixel_raw(PixelFormat::Psmct32, 0, 1, x, 1),
+                gs.vram
+                    .read_pixel_raw(PixelFormat::Psmct32, 64, 1, x - 4, 0)
+            );
+        }
+        assert_eq!(
+            gs.vram
+                .read_page_pixel_raw(PixelFormat::Psmct32, 0, 1, 8, 1),
+            0
+        );
+
+        // 3. Reversed-corner textured Sprite (`PRIM = 6 | 16 | 256 = 0x116`), 2x magnification `(12,12)->(4,4)` UV=(4,4)->(0,0).
+        gs.write_internal_reg(gs_reg::PRIM, 0x116);
+        gs.write_internal_reg(gs_reg::UV, (4 * 16) | ((4 * 16) << 16));
+        gs.write_internal_reg(gs_reg::XYZ2, pack_xyz(12, 12, 1));
+        gs.write_internal_reg(gs_reg::UV, 0);
+        gs.write_internal_reg(gs_reg::XYZ2, pack_xyz(4, 4, 1));
+        assert_eq!(
+            gs.vram
+                .read_page_pixel_raw(PixelFormat::Psmct32, 0, 1, 4, 4),
+            gs.vram.read_pixel_raw(PixelFormat::Psmct32, 64, 1, 0, 0)
+        );
+        assert_eq!(
+            gs.vram
+                .read_page_pixel_raw(PixelFormat::Psmct32, 0, 1, 11, 11),
+            gs.vram.read_pixel_raw(PixelFormat::Psmct32, 64, 1, 3, 3)
         );
     }
 }

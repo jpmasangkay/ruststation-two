@@ -38,6 +38,29 @@ pub const FROZEN_GS_ELF_SUITES: [(&str, &str); 9] = [
     ),
 ];
 
+/// Step 3a nearest-texturing GS Render Gate fixtures (`10..=16`).
+pub const STEP3A_GS_ELF_SUITES: [(&str, &str); 7] = [
+    (
+        "gs_render/10_tex_psmct32_uv_modulate",
+        "10_tex_psmct32_uv_modulate.gsp",
+    ),
+    (
+        "gs_render/11_tex_psmt8_csm1_swizzle",
+        "11_tex_psmt8_csm1_swizzle.gsp",
+    ),
+    ("gs_render/12_tex_psmt4hl_hh", "12_tex_psmt4hl_hh.gsp"),
+    ("gs_render/13_tex_clamp_modes", "13_tex_clamp_modes.gsp"),
+    (
+        "gs_render/14_tex_texa_aem_csm2_cld",
+        "14_tex_texa_aem_csm2_cld.gsp",
+    ),
+    (
+        "gs_render/15_tex_stq_perspective",
+        "15_tex_stq_perspective.gsp",
+    ),
+    ("gs_render/16_tex_tfx_tcc", "16_tex_tfx_tcc.gsp"),
+];
+
 const MAX_ELF_IDLE_CYCLES: u64 = 5_000_000;
 
 fn gs_render_dir() -> PathBuf {
@@ -222,16 +245,20 @@ pub fn verify_gsp_elf_roundtrip(name: &str, gsp_path: &Path) -> Result<u64, Stri
     Ok(cycles)
 }
 
-/// Run EE -> GIF -> GS ELF self-check across all 9 frozen Step 2 GS gate suites.
+/// Run EE -> GIF -> GS ELF self-check across Step 2 (`01..=09`) and Step 3a (`10..=16`) GS gate suites.
 pub fn run_gs_elf_gate() -> (usize, Vec<(&'static str, String)>) {
     let base_dir = gs_render_dir();
-    let total = FROZEN_GS_ELF_SUITES.len();
+    let total = FROZEN_GS_ELF_SUITES.len() + STEP3A_GS_ELF_SUITES.len();
     let mut passed = 0usize;
     let mut failures = Vec::new();
 
     println!("\n|  # | GS ELF Self-Check (EE->GIF->GS)    | Status   |    Cycles |");
     println!("|---:|:-----------------------------------|:---------|----------:|");
-    for (idx, &(name, rel_path)) in FROZEN_GS_ELF_SUITES.iter().enumerate() {
+    for (idx, &(name, rel_path)) in FROZEN_GS_ELF_SUITES
+        .iter()
+        .chain(STEP3A_GS_ELF_SUITES.iter())
+        .enumerate()
+    {
         let path = base_dir.join(rel_path);
         match verify_gsp_elf_roundtrip(name, &path) {
             Ok(cycles) => {
@@ -355,6 +382,17 @@ mod tests {
             ),
         ] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+            let cycles = verify_gsp_elf_roundtrip(name, &path)
+                .unwrap_or_else(|e| panic!("ELF self-check failed for {name}: {e}"));
+            assert!(cycles > 0, "{name} executed zero cycles");
+        }
+    }
+
+    #[test]
+    fn step3a_tex_elf_roundtrip_matches_direct_replay() {
+        let base_dir = gs_render_dir();
+        for &(name, rel_path) in &STEP3A_GS_ELF_SUITES {
+            let path = base_dir.join(rel_path);
             let cycles = verify_gsp_elf_roundtrip(name, &path)
                 .unwrap_or_else(|e| panic!("ELF self-check failed for {name}: {e}"));
             assert!(cycles > 0, "{name} executed zero cycles");

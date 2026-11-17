@@ -8,6 +8,7 @@ pub mod coverage;
 pub mod packet;
 pub mod raster;
 pub mod regs;
+pub mod texture;
 pub mod transfer;
 pub mod vram;
 
@@ -21,6 +22,7 @@ pub use packet::{
 };
 pub use raster::{GsVertex, RasterizerState};
 pub use regs::{gs_reg, GsRegs};
+pub use texture::ClutCache;
 pub use transfer::{TransferMode, TransferState};
 pub use vram::{GsVram, PixelFormat, PixelLocation};
 
@@ -86,6 +88,12 @@ impl GsState {
             gs_reg::XYZ3 => {
                 self.rasterizer
                     .vertex_kick(&self.regs, &mut self.vram, data, false, false);
+            }
+            gs_reg::TEX0_1 | gs_reg::TEX2_1 => {
+                self.rasterizer.on_tex_reg_write(&self.regs, &self.vram, 0);
+            }
+            gs_reg::TEX0_2 | gs_reg::TEX2_2 => {
+                self.rasterizer.on_tex_reg_write(&self.regs, &self.vram, 1);
             }
             gs_reg::TRXDIR => {
                 self.transfer
