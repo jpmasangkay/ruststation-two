@@ -60,6 +60,12 @@ pub static GS_RENDER_GATE_SUITES: [GsGateSuite; 9] = [
     },
 ];
 
+pub static PCSX2_OBSERVED_SUITES: [GsGateSuite; 1] = [GsGateSuite {
+    name: "gs_probes/10_subpixel_probe",
+    rel_path: "10_subpixel_probe.gsp",
+    verify: verify_10_subpixel_probe,
+}];
+
 fn expect_pixel(
     gs: &GsState,
     format: PixelFormat,
@@ -78,13 +84,14 @@ fn expect_pixel(
     Ok(())
 }
 
-fn resolve_fixture_path(rel_path: &str) -> PathBuf {
-    let cwd_path = Path::new("tests/gs_render").join(rel_path);
+fn resolve_fixture_path(subdir: &str, rel_path: &str) -> PathBuf {
+    let cwd_path = Path::new("tests").join(subdir).join(rel_path);
     if cwd_path.exists() {
         return cwd_path;
     }
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/gs_render")
+        .join("../../tests")
+        .join(subdir)
         .join(rel_path)
 }
 
@@ -553,7 +560,20 @@ fn verify_08_scissor_clip(gs: &GsState) -> Result<(), String> {
     const FRAME_BORDER: u32 = 0x80C0_C0C0;
     const CORAL: u32 = 0x8058_68F0;
 
-    // Guide border lines outside [40..=279] x [30..=209] remain untouched.
+    // Guide border LineStrip (39,29)->(280,29)->(280,210)->(39,210)->(39,29) is a closed loop
+    // (`v4 == v0`), so every dropped half-open segment end equals the next/first segment's start:
+    // 0 pixels change under `IntegerCenterHalfOpenLine`, and all 4 corners remain FRAME_BORDER.
+    for corner in [(39, 29), (280, 29), (280, 210), (39, 210)] {
+        expect_pixel(
+            gs,
+            PixelFormat::Psmct32,
+            0,
+            5,
+            corner,
+            FRAME_BORDER,
+            "closed-loop guide border corner",
+        )?;
+    }
     expect_pixel(
         gs,
         PixelFormat::Psmct32,
@@ -628,6 +648,8 @@ fn verify_08_scissor_clip(gs: &GsState) -> Result<(), String> {
 }
 
 fn verify_09_fbmsk_psm16_24_adc(gs: &GsState) -> Result<(), String> {
+    // 09_fbmsk_psm16_24_adc contains only Sprite, Point (12.125,4.25)->(12,4), and TriangleStrip
+    // primitives (no Line/LineStrip), so 0 pixels change under `IntegerCenterHalfOpenLine`.
     // 1. PSMCT24 preserving upper 8H byte 0xAB and masked Green channel 0x22.
     expect_pixel(
         gs,
@@ -708,9 +730,213 @@ fn verify_09_fbmsk_psm16_24_adc(gs: &GsState) -> Result<(), String> {
     Ok(())
 }
 
-/// Run one GS Render Gate suite and return `Ok(())` on pass or `Err(reason)` on mismatch.
-pub fn run_one_gs_suite(suite: &GsGateSuite) -> Result<(), String> {
-    let path = resolve_fixture_path(suite.rel_path);
+fn expect_bbox_pixels(
+    gs: &GsState,
+    label: &str,
+    (x0, y0, x1, y1): (u32, u32, u32, u32),
+    expected_color: u32,
+    expected_coords: &[(u32, u32)],
+) -> Result<(), String> {
+    const BG: u32 = 0x8000_0000;
+    let mut got_coords = Vec::new();
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let raw = gs
+                .vram
+                .read_page_pixel_raw(PixelFormat::Psmct32, 0, 5, x, y);
+            if raw != BG {
+                if raw != expected_color {
+                    return Err(format!(
+                        "{label} at ({x},{y}) expected color {expected_color:#010X}, got {raw:#010X}"
+                    ));
+                }
+                got_coords.push((x, y));
+            }
+        }
+    }
+    let mut expected_sorted = expected_coords.to_vec();
+    expected_sorted.sort_unstable_by_key(|&(x, y)| (y, x));
+    if got_coords != expected_sorted {
+        return Err(format!(
+            "{label} pixel set mismatch: expected {expected_sorted:?}, got {got_coords:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn verify_10_subpixel_probe(gs: &GsState) -> Result<(), String> {
+    // PCSX2 v2.8.2 Software observed exact pixel sets under `IntegerCenterHalfOpenLine`:
+    // Points P0..P6 (`7/7` match, half-up integer centers):
+    expect_bbox_pixels(
+        gs,
+        "P0 (20.0,20.0)",
+        (18, 18, 22, 22),
+        0x8040_40FF,
+        &[(20, 20)],
+    )?;
+    expect_bbox_pixels(
+        gs,
+        "P1 (36.4375,20.0)",
+        (34, 18, 38, 22),
+        0x8040_FF40,
+        &[(36, 20)],
+    )?;
+    expect_bbox_pixels(
+        gs,
+        "P2 (52.5,20.0)",
+        (50, 18, 55, 22),
+        0x80FF_8040,
+        &[(53, 20)],
+    )?;
+    expect_bbox_pixels(
+        gs,
+        "P3 (68.5625,20.0)",
+        (66, 18, 71, 22),
+        0x8040_FFFF,
+        &[(69, 20)],
+    )?;
+    expect_bbox_pixels(
+        gs,
+        "P4 (36.0,40.4375)",
+        (34, 38, 38, 42),
+        0x80FF_FF40,
+        &[(36, 40)],
+    )?;
+    expect_bbox_pixels(
+        gs,
+        "P5 (52.0,40.5)",
+        (50, 38, 54, 43),
+        0x80FF_40FF,
+        &[(52, 41)],
+    )?;
+    expect_bbox_pixels(
+        gs,
+        "P6 (68.0,40.5625)",
+        (66, 38, 70, 43),
+        0x8040_A0FF,
+        &[(68, 41)],
+    )?;
+
+    // Half-open Bresenham lines L0..L5 (`6/6` match; final endpoints dropped):
+    expect_bbox_pixels(
+        gs,
+        "L0 horiz L->R",
+        (19, 79, 29, 81),
+        0x80FF_FFFF,
+        &[
+            (20, 80),
+            (21, 80),
+            (22, 80),
+            (23, 80),
+            (24, 80),
+            (25, 80),
+            (26, 80),
+            (27, 80),
+        ],
+    )?;
+    expect_bbox_pixels(
+        gs,
+        "L1 horiz R->L",
+        (49, 79, 59, 81),
+        0x80FF_FF80,
+        &[
+            (51, 80),
+            (52, 80),
+            (53, 80),
+            (54, 80),
+            (55, 80),
+            (56, 80),
+            (57, 80),
+            (58, 80),
+        ],
+    )?;
+    expect_bbox_pixels(
+        gs,
+        "L2 vert T->B",
+        (89, 75, 91, 85),
+        0x8080_FFFF,
+        &[
+            (90, 76),
+            (90, 77),
+            (90, 78),
+            (90, 79),
+            (90, 80),
+            (90, 81),
+            (90, 82),
+            (90, 83),
+        ],
+    )?;
+    expect_bbox_pixels(
+        gs,
+        "L3 slope 0.5",
+        (19, 109, 29, 115),
+        0x8080_FF80,
+        &[
+            (20, 110),
+            (21, 111),
+            (22, 111),
+            (23, 112),
+            (24, 112),
+            (25, 113),
+            (26, 113),
+            (27, 114),
+        ],
+    )?;
+    expect_bbox_pixels(
+        gs,
+        "L4 steep -dY",
+        (49, 109, 55, 119),
+        0x80C0_80FF,
+        &[
+            (54, 111),
+            (53, 112),
+            (53, 113),
+            (52, 114),
+            (52, 115),
+            (51, 116),
+            (51, 117),
+            (50, 118),
+        ],
+    )?;
+    expect_bbox_pixels(gs, "L5 zero-length", (79, 109, 81, 111), 0x8040_C0FF, &[])?;
+
+    // Sprites S0..S2 (`3/3` match):
+    let rect_coords = |x0: u32, y0: u32, x1: u32, y1: u32| -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                out.push((x, y));
+            }
+        }
+        out
+    };
+    expect_bbox_pixels(
+        gs,
+        "S0 normal",
+        (19, 149, 29, 159),
+        0x80D0_E040,
+        &rect_coords(20, 150, 27, 157),
+    )?;
+    expect_bbox_pixels(
+        gs,
+        "S1 reversed corners",
+        (49, 149, 59, 159),
+        0x8050_70FF,
+        &rect_coords(50, 150, 57, 157),
+    )?;
+    expect_bbox_pixels(
+        gs,
+        "S2 subpixel [80.5,84.5)",
+        (79, 149, 86, 155),
+        0x80FF_A0C0,
+        &rect_coords(81, 150, 84, 153),
+    )?;
+    Ok(())
+}
+
+/// Run one GS suite against `tests/<subdir>/<rel_path>` and return `Ok(())` on pass.
+pub fn run_one_gs_suite(subdir: &str, suite: &GsGateSuite) -> Result<(), String> {
+    let path = resolve_fixture_path(subdir, suite.rel_path);
     let src =
         fs::read_to_string(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
     let mut gs = GsState::new();
@@ -719,15 +945,20 @@ pub fn run_one_gs_suite(suite: &GsGateSuite) -> Result<(), String> {
     (suite.verify)(&gs)
 }
 
-/// Execute all checked-in GS Render Gate suites and print a summary table. Returns `(passed, failures)`.
-pub fn run_gs_render_gate() -> (usize, Vec<(&'static str, String)>) {
-    println!("\n|  # | {:<36} | {:<8} |", "GS Render Suite", "Status");
-    println!("|----|--------------------------------------|----------|");
+fn run_gs_suite_table(
+    col_header: &str,
+    banner_label: &str,
+    subdir: &str,
+    suites: &[GsGateSuite],
+) -> (usize, Vec<(&'static str, String)>) {
+    let col_w = col_header.len().max(36);
+    println!("\n|  # | {:<col_w$} | {:<8} |", col_header, "Status");
+    println!("|----|-{}-|----------|", "-".repeat(col_w));
 
     let mut passed = 0usize;
     let mut failures = Vec::new();
-    for (idx, suite) in GS_RENDER_GATE_SUITES.iter().enumerate() {
-        let status = match run_one_gs_suite(suite) {
+    for (idx, suite) in suites.iter().enumerate() {
+        let status = match run_one_gs_suite(subdir, suite) {
             Ok(()) => {
                 passed += 1;
                 "PASS"
@@ -737,13 +968,38 @@ pub fn run_gs_render_gate() -> (usize, Vec<(&'static str, String)>) {
                 "FAIL"
             }
         };
-        println!("| {:>2} | {:<36} | {:<8} |", idx + 1, suite.name, status);
+        println!(
+            "| {:>2} | {:<col_w$} | {:<8} |",
+            idx + 1,
+            suite.name,
+            status
+        );
     }
 
-    let total = GS_RENDER_GATE_SUITES.len();
+    let total = suites.len();
     let failed = failures.len();
-    println!("\n=== GS RENDER GATE: {passed}/{total} PASSED, {failed} FAILED ===");
+    println!("\n=== {banner_label}: {passed}/{total} PASSED, {failed} FAILED ===");
     (passed, failures)
+}
+
+/// Execute all checked-in GS Render Gate suites and print a summary table. Returns `(passed, failures)`.
+pub fn run_gs_render_gate() -> (usize, Vec<(&'static str, String)>) {
+    run_gs_suite_table(
+        "GS Render Suite",
+        "GS RENDER GATE",
+        "gs_render",
+        &GS_RENDER_GATE_SUITES,
+    )
+}
+
+/// Execute PCSX2-observed (v2.8.2, not hardware) GS probe suites. Returns `(passed, failures)`.
+pub fn run_pcsx2_observed_gate() -> (usize, Vec<(&'static str, String)>) {
+    run_gs_suite_table(
+        "PCSX2-observed (v2.8.2), not hardware",
+        "PCSX2-observed (v2.8.2), not hardware",
+        "gs_probes",
+        &PCSX2_OBSERVED_SUITES,
+    )
 }
 
 #[cfg(test)]
@@ -753,7 +1009,16 @@ mod tests {
     #[test]
     fn gs_render_gate_suites_all_pass() {
         for suite in &GS_RENDER_GATE_SUITES {
-            run_one_gs_suite(suite).unwrap_or_else(|e| panic!("{} failed: {e}", suite.name));
+            run_one_gs_suite("gs_render", suite)
+                .unwrap_or_else(|e| panic!("{} failed: {e}", suite.name));
+        }
+    }
+
+    #[test]
+    fn pcsx2_observed_suites_all_pass() {
+        for suite in &PCSX2_OBSERVED_SUITES {
+            run_one_gs_suite("gs_probes", suite)
+                .unwrap_or_else(|e| panic!("{} failed: {e}", suite.name));
         }
     }
 }

@@ -27,8 +27,10 @@ pub enum CoverageConvention {
 
 /// Active GS coverage convention used by [`crate::raster`].
 ///
-/// Change this single constant to switch pixel-center, sprite-edge, and line-end rules globally.
-pub const ACTIVE_COVERAGE: CoverageConvention = CoverageConvention::IntegerCenter;
+/// Adopted: matches PCSX2 `v2.8.2` Software on Scene 10 (`7/7` Points, `6/6` Lines, `3/3` Sprites);
+/// real PS2 hardware remains unconfirmed (`G-009`, `G-011`). Change this single constant to switch
+/// pixel-center, sprite-edge, and line-end rules globally.
+pub const ACTIVE_COVERAGE: CoverageConvention = CoverageConvention::IntegerCenterHalfOpenLine;
 
 /// Primitive geometry passed in 12.4 fixed-point screen coordinates (after `XYOFFSET` subtraction).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

@@ -289,22 +289,47 @@ mod tests {
         assert_eq!(px(36, 40), 0x80FF_FF40, "P4 (36.0, 40.4375)");
         assert_eq!(px(52, 41), 0x80FF_40FF, "P5 (52.0, 40.5)");
         assert_eq!(px(68, 41), 0x8040_A0FF, "P6 (68.0, 40.5625)");
-        // Line endpoints, half-step diagonal (L3), zero-length (L5):
-        assert_eq!(px(28, 80), 0x80FF_FFFF, "L0 final endpoint (28, 80)");
+        // Half-open line endpoints omitted (matches PCSX2 v2.8.2 Software), half-step diagonal (L3), zero-length (L5):
+        assert_eq!(px(27, 80), 0x80FF_FFFF, "L0 penultimate pixel (27, 80)");
+        assert_eq!(
+            px(28, 80),
+            0x8000_0000,
+            "L0 omitted final endpoint (28, 80)"
+        );
+        assert_eq!(
+            px(51, 80),
+            0x80FF_FF80,
+            "L1 reversed penultimate pixel (51, 80)"
+        );
         assert_eq!(
             px(50, 80),
-            0x80FF_FF80,
-            "L1 reversed final endpoint (50, 80)"
+            0x8000_0000,
+            "L1 reversed omitted final endpoint (50, 80)"
+        );
+        assert_eq!(
+            px(90, 83),
+            0x8080_FFFF,
+            "L2 vertical penultimate pixel (90, 83)"
         );
         assert_eq!(
             px(90, 84),
-            0x8080_FFFF,
-            "L2 vertical final endpoint (90, 84)"
+            0x8000_0000,
+            "L2 vertical omitted final endpoint (90, 84)"
         );
         assert_eq!(px(21, 111), 0x8080_FF80, "L3 slope-0.5 tie-break (21, 111)");
-        assert_eq!(px(28, 114), 0x8080_FF80, "L3 final endpoint (28, 114)");
-        assert_eq!(px(54, 110), 0x80C0_80FF, "L4 final endpoint (54, 110)");
-        assert_eq!(px(80, 110), 0x8040_C0FF, "L5 zero-length line (80, 110)");
+        assert_eq!(px(27, 114), 0x8080_FF80, "L3 penultimate pixel (27, 114)");
+        assert_eq!(
+            px(28, 114),
+            0x8000_0000,
+            "L3 omitted final endpoint (28, 114)"
+        );
+        assert_eq!(px(54, 111), 0x80C0_80FF, "L4 penultimate pixel (54, 111)");
+        assert_eq!(
+            px(54, 110),
+            0x8000_0000,
+            "L4 omitted final endpoint (54, 110)"
+        );
+        assert_eq!(px(80, 110), 0x8000_0000, "L5 zero-length omitted (80, 110)");
         // Sprites: normal (S0), reversed corners (S1), subpixel [80.5, 84.5) (S2):
         assert_eq!(px(20, 150), 0x80D0_E040, "S0 normal top-left");
         assert_eq!(px(50, 150), 0x8050_70FF, "S1 reversed-corner top-left");

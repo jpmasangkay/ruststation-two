@@ -990,13 +990,14 @@ mod tests {
         gs.write_internal_reg(gs_reg::XYZ2, pack_xyz(0, 0, 1));
         gs.write_internal_reg(gs_reg::XYZ3, pack_xyz(4, 0, 1)); // ADC: culled segment (0,0)-(4,0)
         gs.write_internal_reg(gs_reg::XYZ2, pack_xyz(4, 3, 1)); // Drawn segment (4,0)-(4,3)
-                                                                // Pixel (1,0) from culled segment must still be empty; (4,0)..=(4,3) must be red!
+                                                                // Hand derivation (`IntegerCenterHalfOpenLine`): culled segment leaves (1,0)=0;
+                                                                // half-open vertical segment (4,0)->(4,3) draws (4,0),(4,1),(4,2) and omits final (4,3).
         assert_eq!(
             gs.vram
                 .read_page_pixel_raw(PixelFormat::Psmct32, 0, 1, 1, 0),
             0
         );
-        for y in 0..=3u32 {
+        for y in 0..3u32 {
             assert_eq!(
                 gs.vram
                     .read_page_pixel_raw(PixelFormat::Psmct32, 0, 1, 4, y),
@@ -1004,6 +1005,12 @@ mod tests {
                 "line segment missing pixel (4,{y})"
             );
         }
+        assert_eq!(
+            gs.vram
+                .read_page_pixel_raw(PixelFormat::Psmct32, 0, 1, 4, 3),
+            0,
+            "half-open line must omit final endpoint (4,3)"
+        );
 
         // 3. TriangleFan keeps hub vertex v0=(8,8) across 4 kicks, with v3 using XYZ3 ADC.
         gs.write_internal_reg(gs_reg::PRIM, 5); // TriangleFan
@@ -1055,6 +1062,7 @@ mod tests {
         gs.write_internal_reg(gs_reg::XYZF2, pack_xyz(4, 2, 0x12_0400)); // masked to 0x0400
 
         // Midpoint x=2: R=124(15), G=0, B=124(15), A=0x40(0); Z = 0x12_0200 & 0xFFFF = 0x0200.
+        // Half-open rule leaves final endpoint (4,2) unwritten (0).
         let got_mid = gs
             .vram
             .read_page_pixel_raw(PixelFormat::Psmct16s, 20, 1, 2, 2);
@@ -1063,6 +1071,11 @@ mod tests {
             gs.vram
                 .read_page_pixel_raw(PixelFormat::Psmz16, 80, 1, 2, 2),
             0x0200
+        );
+        assert_eq!(
+            gs.vram
+                .read_page_pixel_raw(PixelFormat::Psmct16s, 20, 1, 4, 2),
+            0
         );
     }
 }
