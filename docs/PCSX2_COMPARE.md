@@ -76,6 +76,34 @@ cargo run -p ps2-gs-runner -- tests/gs_render/08_scissor_clip.gsp     --compare-
 cargo run -p ps2-gs-runner -- tests/gs_probes/10_subpixel_probe.gsp   --compare-png local/pcsx2/10_pcsx2.png --diff-out local/pcsx2/10_diff.png
 ```
 
+### Step 3a Checkpoint Sprites (`76800/76800` exact on PCSX2 `v2.8.2` Software) & Textured-Triangle Probes (`14`–`16`)
+
+Settings (unchanged): PCSX2 `v2.8.2`, `Software` renderer, `Deinterlacing: No Deinterlacing`, `Bilinear Filtering: None`, `Anti-Blur` off, `Auto Flush` on, `Software Rendering Threads: 3`, `Texture Filtering: Nearest`, `Mipmapping` off, no post-processing, screenshots `Internal Resolution (No Aspect Correction)`, PNG.
+
+Emit ELFs and `*_ours.png` for the three Step 3a textured-triangle probes (`tests/gs_probes/14..16_*.gsp`, predictions frozen in `docs/GS_GUESSES.md` commit `98ea99d`):
+
+```powershell
+cargo run -p ps2-gs-runner -- --emit-elf tests/gs_probes/14_tex_tri_wide_uv.gsp         -o local/pcsx2/14_tex_tri_wide_uv.elf
+cargo run -p ps2-gs-runner -- tests/gs_probes/14_tex_tri_wide_uv.gsp                    -o local/pcsx2/14_tex_tri_wide_uv_ours.png
+cargo run -p ps2-gs-runner -- --emit-elf tests/gs_probes/15_tex_tri_stq_perspective.gsp -o local/pcsx2/15_tex_tri_stq_perspective.elf
+cargo run -p ps2-gs-runner -- tests/gs_probes/15_tex_tri_stq_perspective.gsp            -o local/pcsx2/15_tex_tri_stq_perspective_ours.png
+cargo run -p ps2-gs-runner -- --emit-elf tests/gs_probes/16_tex_tri_narrow.gsp          -o local/pcsx2/16_tex_tri_narrow.elf
+cargo run -p ps2-gs-runner -- tests/gs_probes/16_tex_tri_narrow.gsp                     -o local/pcsx2/16_tex_tri_narrow_ours.png
+```
+
+Expected PCSX2 screenshot filenames under `local/pcsx2/`:
+- `local/pcsx2/14_tex_tri_wide_uv_pcsx2.png` (from `local/pcsx2/14_tex_tri_wide_uv.elf`)
+- `local/pcsx2/15_tex_tri_stq_perspective_pcsx2.png` (from `local/pcsx2/15_tex_tri_stq_perspective.elf`)
+- `local/pcsx2/16_tex_tri_narrow_pcsx2.png` (from `local/pcsx2/16_tex_tri_narrow.elf`)
+
+Compare commands once screenshots are saved:
+
+```powershell
+cargo run -p ps2-gs-runner -- tests/gs_probes/14_tex_tri_wide_uv.gsp         --compare-png local/pcsx2/14_tex_tri_wide_uv_pcsx2.png         --diff-out local/pcsx2/14_tex_tri_wide_uv_diff.png         --max-mismatches 16
+cargo run -p ps2-gs-runner -- tests/gs_probes/15_tex_tri_stq_perspective.gsp --compare-png local/pcsx2/15_tex_tri_stq_perspective_pcsx2.png --diff-out local/pcsx2/15_tex_tri_stq_perspective_diff.png --max-mismatches 16
+cargo run -p ps2-gs-runner -- tests/gs_probes/16_tex_tri_narrow.gsp          --compare-png local/pcsx2/16_tex_tri_narrow_pcsx2.png          --diff-out local/pcsx2/16_tex_tri_narrow_diff.png          --max-mismatches 16
+```
+
 Add `--tolerance 1` to permit `±1` channel LSB differences (`PMODE.ALP` scaling or fixed-point rounding) while still catching `>1` coverage/color errors.
 
 ### Output & Diff Color Legend

@@ -398,4 +398,111 @@ mod tests {
             assert!(cycles > 0, "{name} executed zero cycles");
         }
     }
+
+    #[test]
+    fn textured_triangle_probes_elf_roundtrip_and_predictions_match() {
+        let check_probe = |name: &str, rel: &str, expected: &[((u32, u32), u32, &str)]| {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+            let cycles = verify_gsp_elf_roundtrip(name, &path)
+                .unwrap_or_else(|e| panic!("ELF self-check failed for {name}: {e}"));
+            assert!(cycles > 0, "{name} executed zero cycles");
+
+            let src = fs::read_to_string(&path).expect("read probe");
+            let mut gs = GsState::new();
+            execute_gsp_script(&mut gs, &src).expect("execute probe");
+            for &((x, y), color, label) in expected {
+                let got = gs
+                    .vram
+                    .read_pixel_raw(ps2_gs::PixelFormat::Psmct32, 0, 5, x, y);
+                assert_eq!(
+                    got, color,
+                    "{name} {label} at ({x},{y}) expected {color:#010X}, got {got:#010X}"
+                );
+            }
+        };
+
+        // Frozen predictions from docs/GS_GUESSES.md (commit 98ea99d):
+        check_probe(
+            "gs_probes/14_tex_tri_wide_uv",
+            "../../tests/gs_probes/14_tex_tri_wide_uv.gsp",
+            &[
+                ((20, 30), 0x8020_20E0, "dx=0 u=0.0 -> texel 0"),
+                ((84, 40), 0x8010_70F0, "dx=64 u=832/281 -> texel 2"),
+                ((85, 40), 0x80E0_1030, "dx=65 u=845/281 (+2/281) -> texel 3"),
+                (
+                    (128, 40),
+                    0x8030_F0D0,
+                    "dx=108 u=1404/281 (-1/281) -> texel 4",
+                ),
+                (
+                    (193, 40),
+                    0x8020_B040,
+                    "dx=173 u=2249/281 (+1/281) -> texel 8",
+                ),
+                (
+                    (236, 40),
+                    0x8090_20C0,
+                    "dx=216 u=2808/281 (-2/281) -> texel 9",
+                ),
+            ],
+        );
+
+        check_probe(
+            "gs_probes/15_tex_tri_stq_perspective",
+            "../../tests/gs_probes/15_tex_tri_stq_perspective.gsp",
+            &[
+                ((36, 40), 0x80F0_D020, "dx=16 u=624/313 (-2/313) -> texel 1"),
+                (
+                    (68, 40),
+                    0x8030_F0D0,
+                    "dx=48 u=1872/377 (-13/377) -> texel 4",
+                ),
+                (
+                    (83, 40),
+                    0x8050_E010,
+                    "dx=63 u=2457/407 (+15/407) -> texel 6",
+                ),
+                (
+                    (160, 40),
+                    0x8090_20C0,
+                    "dx=140 midpoint u=5460/561 -> texel 9",
+                ),
+                (
+                    (168, 40),
+                    0x80F0_9020,
+                    "dx=148 u=5772/577 (+2/577) -> texel 10",
+                ),
+                (
+                    (245, 40),
+                    0x80C0_3050,
+                    "dx=225 u=8775/731 (+3/731) -> texel 12",
+                ),
+            ],
+        );
+
+        check_probe(
+            "gs_probes/16_tex_tri_narrow",
+            "../../tests/gs_probes/16_tex_tri_narrow.gsp",
+            &[
+                ((40, 20), 0x8020_20E0, "dx=0,dy=0 N=0 -> texel 0"),
+                (
+                    (41, 33),
+                    0x8020_20E0,
+                    "dx=1,dy=13 N=189 (-1/190) -> texel 0",
+                ),
+                (
+                    (41, 34),
+                    0x80F0_D020,
+                    "dx=1,dy=14 N=192 (+2/190) -> texel 1",
+                ),
+                ((45, 23), 0x80E0_1030, "dx=5,dy=3 N=759 (-1/190) -> texel 3"),
+                ((45, 24), 0x8030_F0D0, "dx=5,dy=4 N=762 (+2/190) -> texel 4"),
+                (
+                    (53, 67),
+                    0x8040_E0F0,
+                    "dx=13,dy=47 N=2091 (+1/190) -> texel 11",
+                ),
+            ],
+        );
+    }
 }

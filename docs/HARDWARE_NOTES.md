@@ -614,10 +614,11 @@ Unconfirmed sub-pixel rounding, sprite corner normalization, Bresenham endpoint 
   - `local/pcsx2/3a_psmct32_modulate.{elf,_ours.png}` (`10_tex_psmct32_uv_modulate.gsp`): `PSMCT32` `UV` `1x`/`2x` + `TFX=0 Modulate` (`G-019`, `G-020`).
   - `local/pcsx2/3a_psmt8_csm1.{elf,_ours.png}` (`11_tex_psmt8_csm1_swizzle.gsp`): `PSMT8` + `CSM1` `16x2` CLUT with entries `8..15` (green/cyan) vs `16..23` (orange/red) testing `0x08 <-> 0x10` swizzle (`G-021`).
   - `local/pcsx2/3a_psmt4hl_hh.{elf,_ours.png}` (`12_tex_psmt4hl_hh.gsp`): `PSMT4HL` green / `PSMT4HH` magenta pair via `TEX0_1` + `TEX2_1` (`G-008`, `G-021`).
-- **Planned post-decision textured-triangle probe (held until after interpolation decision / Step 3b-3c)**:
-  - **What it will test**: two wide prime-width (`W=281`, contrasting 16- or 32-texel multi-color stripe texture) triangles rendered with `TFX=1 (Decal)`:
-    1. **Linear `UV` (`FST=1`) triangle** with irrational prime-denominator step `dU/dx = 13/281`: tests whether PCSX2 Software steps `U`/`V` with truncated fixed-point increments that lag near integer texel boundaries in the same direction as Gouraud `RGBA` (`08`/`11`/`12`, `§15`), vs exact rational floor.
-    2. **Perspective `ST/Q` (`FST=0`) triangle** with `Q` varying across `1.0..=3.0`: tests per-pixel `S/Q` & `T/Q` perspective division fidelity, non-linear texel boundary shifts along the span (distinct from linear interpolation), and near-zero `Q` fallback stability on triangles (`G-018`, `G-019`).
+- **Textured-triangle probes emitted (`tests/gs_probes/14..16_*.gsp`, predictions frozen in `docs/GS_GUESSES.md` commit `98ea99d` before ELF/PNG generation)**:
+  - Uses a 16-column high-contrast `PSMCT32` stripe texture (`|ΔR| >= 80, |ΔG| >= 80, |ΔB| >= 80` between every adjacent texel pair `u` and `u+1`) with `TFX=1 (Decal)`:
+    1. **`tests/gs_probes/14_tex_tri_wide_uv.gsp`** (`local/pcsx2/14_tex_tri_wide_uv.{elf,_ours.png}`): wide linear `UV` (`FST=1`, `W=281, H=140, dU/dx = 13/281`) with pixels within `1/281..11/281` (`< 1/16`) texel of every integer boundary `k = 1..=12`.
+    2. **`tests/gs_probes/15_tex_tri_stq_perspective.gsp`** (`local/pcsx2/15_tex_tri_stq_perspective.{elf,_ours.png}`): wide perspective `ST/Q` (`FST=0`, `W=281, H=140, Q = 1.0..3.0, u(dx) = 39*dx/(281+2*dx)`) testing per-pixel `S/Q` division and boundary crossings within `2/577..15/407` (`< 1/16`) texel.
+    3. **`tests/gs_probes/16_tex_tri_narrow.gsp`** (`local/pcsx2/16_tex_tri_narrow.{elf,_ours.png}`): narrow linear `UV` (`FST=1`, `W=19, H=190, u(dx,dy) = (150*dx+3*dy)/190`) isolating short-span `X/Y` setup rounding within `1/190` (`< 1/16`) texel of boundaries (`G-018`, `G-019`).
 
 
 
