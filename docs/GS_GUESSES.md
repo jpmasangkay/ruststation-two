@@ -88,3 +88,47 @@ Written **before** emitting any PCSX2 ELF or capturing any PCSX2 screenshot, so 
 - **Verified sign rule (`pcsx2 - ours` across all pixels)**: where `dC/dx < 0`, PCSX2 lags higher (`+1`, `0` violations on `08`, `11_narrow`, `12`; `2` violations on `11_wide` R); where `dC/dx > 0`, PCSX2 lags lower (`-1`, `0` violations on `11`, `12`; `1` violation on `08` G at `(68,150)` exact `G=126.997553`); where `dC/dx == 0` (`B` in `08` and `11_wide`), `0` differences (`0` violations).
 - **Row distance & `Q7` model fit**: mismatch rates grow monotonically with `(px - min_x)` (`1.91%->26.17%` on `08`, `2.43%->39.02%` on `11_wide`, `4.88%->52.74%` on `12`; narrow `W<=19` `11_narrow` is `1.48%`). Testing models parameterized on `08` ONLY (`Q8`/`Q9`/`Q10` exact/edge start, `4`-px `Q7` SIMD `min_x`/`align4`, `f32` iter/plane) yielded **zero models with `0` diffs across `{06, 08, 11, 12}`** (`M3a_simd4_Q7_min_x`: `0/124/62/125`; `M1_exact_start_trunc_Q9`: `0/191/76/157`; `M3b_simd4_Q7_align4`: `0/192/117/239`; `M3a`/`M3b` **fit aligned rows on `08`, may not generalize**). Per the 1-round time box, exact rational floor is kept with this documented `±1` LSB difference (details & tables in `docs/HARDWARE_NOTES.md` §15).
 - **Step 3 note (`UV` vs `ST/Q`)**: Linear `UV` (`FST=1`) uses planar screen stepping analogous to `RGBA`, so truncated fixed-point `dU/dx`/`dV/dx` increments would plausibly exhibit the same directional lag near integer texel boundaries on wide prime-slope triangles; perspective `ST/Q` (`FST=0`) divides `S/Q` and `T/Q` in `f32` per pixel (just as `13_gouraud_z_probe` showed exact `32`-bit `Z` fidelity at `0x0100_0000`), while axis-aligned unit/dyadic sprites avoid irrational-step drift. Test with wide prime-width (`W=281`) contrasting-texel triangles: one `UV` (`dU/dx = 13/281`) and one `ST/Q` (`Q = 1.0..3.0`).
+
+## Textured-Triangle Probe Predictions (`tests/gs_probes/14..16_*.gsp`, frozen pre-measurement)
+
+Written and committed **alone** before emitting the probe `.gsp` / `.elf` / `*_ours.png` files or capturing any PCSX2 screenshots (`320x240` `PSMCT32`, `FBP=0, FBW=5`, background `0x8000_0000` `#000000`, `XYOFFSET_1 = (2048.0, 2048.0)`, `TEX0_1` `16x4` `PSMCT32` at `TBP0=0x0640, TBW=1, TW=4, TH=2, TCC=1, TFX=1` Decal, `CLAMP_1 = 0x0005`).
+
+### Shared 16-Column High-Contrast Stripe Texture `C[0..15]` (`|ΔR| >= 80, |ΔG| >= 80, |ΔB| >= 80` between adjacent columns)
+All 4 texel rows `v in 0..=3` contain the identical 16-column sequence (`0x80BB_GGRR` / `#RRGGBB`):
+- `C[0]  = 0x8020_20E0` (`#E02020`) | `C[1]  = 0x80F0_D020` (`#20D0F0`) | `C[2]  = 0x8010_70F0` (`#F07010`) | `C[3]  = 0x80E0_1030` (`#3010E0`)
+- `C[4]  = 0x8030_F0D0` (`#D0F030`) | `C[5]  = 0x80B0_3070` (`#7030B0`) | `C[6]  = 0x8050_E010` (`#10E050`) | `C[7]  = 0x80D0_40E0` (`#E040D0`)
+- `C[8]  = 0x8020_B040` (`#40B020`) | `C[9]  = 0x8090_20C0` (`#C02090`) | `C[10] = 0x80F0_9020` (`#2090F0`) | `C[11] = 0x8040_E0F0` (`#F0E040`)
+- `C[12] = 0x80C0_3050` (`#5030C0`) | `C[13] = 0x8060_D0B0` (`#B0D060`) | `C[14] = 0x80E0_6030` (`#3060E0`) | `C[15] = 0x8080_C0F0` (`#F0C080`)
+
+### 1. Probe (a) `tests/gs_probes/14_tex_tri_wide_uv.gsp` — Wide Linear-`UV` Triangle (`W = 281`, `H = 140`, `PRIM = 0x0113`)
+- **Vertices**: `v0 = (20, 30), UV = (0.0, 1.0)` (`u_raw = 0, v_raw = 16`); `v1 = (301, 30), UV = (13.0, 1.0)` (`u_raw = 208, v_raw = 16`); `v2 = (20, 170), UV = (0.0, 1.0)` (`u_raw = 0, v_raw = 16`).
+- **Hand derivation**: At any covered `(px, py)` with `dx = px - 20` (`0 <= dx < 281`), `w1 / area2 = dx / 281`, `u_exact(dx) = (13 * dx) / 281`, `u_fp(dx) = floor((208 * dx) / 281)`, and `texel_u = floor(u_fp / 16) = floor((13 * dx) / 281)`. All 12 integer texel boundaries `k = 1..=12` have adjacent pixels on both sides within `<= 13/281 = 0.04626 < 1/16` texel of `k`.
+- **Frozen hand-derived pixel predictions (`6` pixels)**:
+  1. **`(20, 30)`** (`dx = 0`): `u_exact = 0 / 281 = 0.000000`, `u_fp = 0` -> **texel `0`**: **`0x8020_20E0` (`#E02020`)**.
+  2. **`(84, 40)`** (`dx = 64`): `13*64 = 832 = 3*281 - 11`, `u_exact = 2.960854` (`-11/281 = -0.03915 < 1/16` texel below `3.0`), `u_fp = floor(13312/281) = 47` -> **texel `2`**: **`0x8010_70F0` (`#F07010`)** *(nearest-rounding would cross early to texel `3` `#3010E0`)*.
+  3. **`(85, 40)`** (`dx = 65`): `13*65 = 845 = 3*281 + 2`, `u_exact = 3.007117` (`+2/281 = +0.00712 < 1/16` texel above `3.0`), `u_fp = floor(13520/281) = 48` -> **texel `3`**: **`0x80E0_1030` (`#3010E0`)** *(truncated `dU/dx > 0` lag would stay at texel `2` `#F07010`)*.
+  4. **`(128, 40)`** (`dx = 108`): `13*108 = 1404 = 5*281 - 1`, `u_exact = 4.996441` (`-1/281 = -0.00356 < 1/16` texel below `5.0`), `u_fp = floor(22464/281) = 79` -> **texel `4`**: **`0x8030_F0D0` (`#D0F030`)** *(+1/281 upward drift would cross to texel `5` `#7030B0`)*.
+  5. **`(193, 40)`** (`dx = 173`): `13*173 = 2249 = 8*281 + 1`, `u_exact = 8.003559` (`+1/281 = +0.00356 < 1/16` texel above `8.0`), `u_fp = floor(35984/281) = 128` -> **texel `8`**: **`0x8020_B040` (`#40B020`)** *(truncated `dU/dx > 0` lag of even `1/281` texel stays at texel `7` `#E040D0`)*.
+  6. **`(236, 40)`** (`dx = 216`): `13*216 = 2808 = 10*281 - 2`, `u_exact = 9.992883` (`-2/281 = -0.00712 < 1/16` texel below `10.0`), `u_fp = floor(44928/281) = 159` -> **texel `9`**: **`0x8090_20C0` (`#C02090`)**.
+
+### 2. Probe (b) `tests/gs_probes/15_tex_tri_stq_perspective.gsp` — Wide Perspective `ST/Q` Triangle (`Q = 1.0..3.0`, `W = 281`, `H = 140`, `PRIM = 0x0013`)
+- **Vertices**: `v0 = (20, 30), S = 0.0 (0x0000_0000), T = 0.25 (0x3E80_0000), Q = 1.0 (0x3F80_0000)`; `v1 = (301, 30), S = 2.4375 = 39/16 (0x401C_0000), T = 0.25 (0x3E80_0000), Q = 3.0 (0x4040_0000)` (`U1 = (S1/Q1)*16 = 13.0`); `v2 = (20, 170), S = 0.0, T = 0.25, Q = 1.0`.
+- **Hand derivation**: At `dx = px - 20` (`0 <= dx < 281`), `S(dx) = (39 * dx) / (16 * 281)` and `Q(dx) = (281 + 2 * dx) / 281`, so `u_persp(dx) = (S(dx) / Q(dx)) * 16 = (39 * dx) / (281 + 2 * dx)` and `texel_u = floor((39 * dx) / (281 + 2 * dx))`.
+- **Frozen hand-derived pixel predictions (`6` pixels)**:
+  1. **`(36, 40)`** (`dx = 16`): `u_persp = 624 / 313 = 2 - 2/313 = 1.993610` (`-0.00639 < 1/16` texel below `2.0`) -> **texel `1`**: **`0x80F0_D020` (`#20D0F0`)**.
+  2. **`(68, 40)`** (`dx = 48`): `u_persp = 1872 / 377 = 5 - 13/377 = 4.965517` (`-0.03448 < 1/16` texel below `5.0`) -> **texel `4`**: **`0x8030_F0D0` (`#D0F030`)**.
+  3. **`(83, 40)`** (`dx = 63`): `u_persp = 2457 / 407 = 6 + 15/407 = 6.036855` (`+0.03686 < 1/16` texel above `6.0`) -> **texel `6`**: **`0x8050_E010` (`#10E050`)**.
+  4. **`(160, 40)`** (`dx = 140`, span midpoint): `u_persp = 5460 / 561 = 9.732620` -> **texel `9`**: **`0x8090_20C0` (`#C02090`)** *(non-perspective linear interpolation at midpoint would sample texel `6` `#10E050`)*.
+  5. **`(168, 40)`** (`dx = 148`): `u_persp = 5772 / 577 = 10 + 2/577 = 10.003466` (`+0.00347 < 1/16` texel above `10.0`) -> **texel `10`**: **`0x80F0_9020` (`#2090F0`)** *(a `-0.035%` reciprocal `1/Q` underestimate drops to texel `9` `#C02090`)*.
+  6. **`(245, 40)`** (`dx = 225`): `u_persp = 8775 / 731 = 12 + 3/731 = 12.004104` (`+0.00410 < 1/16` texel above `12.0`) -> **texel `12`**: **`0x80C0_3050` (`#5030C0`)** *(underestimate drops to texel `11` `#F0E040`)*.
+
+### 3. Probe (c) `tests/gs_probes/16_tex_tri_narrow.gsp` — Narrow Linear-`UV` Triangle (`W = 19`, `H = 190`, `PRIM = 0x0113`)
+- **Vertices**: `v0 = (40, 20), UV = (0.0, 1.0)` (`u_raw = 0, v_raw = 16`); `v1 = (59, 20), UV = (15.0, 1.0)` (`u_raw = 240, v_raw = 16`); `v2 = (40, 210), UV = (3.0, 1.0)` (`u_raw = 48, v_raw = 16`).
+- **Hand derivation**: At `(px, py) = (40 + dx, 20 + dy)` (`dx >= 0, dy >= 0, 10*dx + dy < 190`), `w1 / area2 = dx / 19 = (10*dx) / 190` and `w2 / area2 = dy / 190`. Thus `u_exact(dx, dy) = (150 * dx + 3 * dy) / 190`, `u_fp(dx, dy) = floor((16 * (150 * dx + 3 * dy)) / 190)`, and `texel_u = floor((150 * dx + 3 * dy) / 190)`.
+- **Frozen hand-derived pixel predictions (`6` pixels)**:
+  1. **`(40, 20)`** (`dx = 0, dy = 0`): `N = 0`, `u_exact = 0.000000`, `u_fp = 0` -> **texel `0`**: **`0x8020_20E0` (`#E02020`)**.
+  2. **`(41, 33)`** (`dx = 1, dy = 13`): `N = 150 + 39 = 189 = 1*190 - 1`, `u_exact = 0.994737` (`-1/190 = -0.00526 < 1/16` texel below `1.0`), `u_fp = 15` -> **texel `0`**: **`0x8020_20E0` (`#E02020`)**.
+  3. **`(41, 34)`** (`dx = 1, dy = 14`): `N = 150 + 42 = 192 = 1*190 + 2`, `u_exact = 1.010526` (`+2/190 = +0.01053 < 1/16` texel above `1.0`), `u_fp = 16` -> **texel `1`**: **`0x80F0_D020` (`#20D0F0`)**.
+  4. **`(45, 23)`** (`dx = 5, dy = 3`): `N = 750 + 9 = 759 = 4*190 - 1`, `u_exact = 3.994737` (`-1/190 = -0.00526 < 1/16` texel below `4.0`), `u_fp = 63` -> **texel `3`**: **`0x80E0_1030` (`#3010E0`)**.
+  5. **`(45, 24)`** (`dx = 5, dy = 4`): `N = 750 + 12 = 762 = 4*190 + 2`, `u_exact = 4.010526` (`+2/190 = +0.01053 < 1/16` texel above `4.0`), `u_fp = 64` -> **texel `4`**: **`0x8030_F0D0` (`#D0F030`)**.
+  6. **`(53, 67)`** (`dx = 13, dy = 47`): `N = 1950 + 141 = 2091 = 11*190 + 1`, `u_exact = 11.005263` (`+1/190 = +0.00526 < 1/16` texel above `11.0`), `u_fp = 176` -> **texel `11`**: **`0x8040_E0F0` (`#F0E040`)** *(lag of `1/190` texel drops to texel `10` `#2090F0`)*.
