@@ -95,11 +95,28 @@ pub static GS_RENDER_GATE_SUITES: [GsGateSuite; 16] = [
     },
 ];
 
-pub static PCSX2_OBSERVED_SUITES: [GsGateSuite; 1] = [GsGateSuite {
-    name: "gs_probes/10_subpixel_probe",
-    rel_path: "10_subpixel_probe.gsp",
-    verify: verify_10_subpixel_probe,
-}];
+pub static PCSX2_OBSERVED_SUITES: [GsGateSuite; 4] = [
+    GsGateSuite {
+        name: "gs_probes/10_subpixel_probe",
+        rel_path: "10_subpixel_probe.gsp",
+        verify: verify_10_subpixel_probe,
+    },
+    GsGateSuite {
+        name: "gs_render/10_tex_psmct32_uv_modulate",
+        rel_path: "gs_render/10_tex_psmct32_uv_modulate.gsp",
+        verify: verify_10_tex_psmct32_uv_modulate,
+    },
+    GsGateSuite {
+        name: "gs_render/11_tex_psmt8_csm1_swizzle",
+        rel_path: "gs_render/11_tex_psmt8_csm1_swizzle.gsp",
+        verify: verify_11_tex_psmt8_csm1_swizzle,
+    },
+    GsGateSuite {
+        name: "gs_render/12_tex_psmt4hl_hh",
+        rel_path: "gs_render/12_tex_psmt4hl_hh.gsp",
+        verify: verify_12_tex_psmt4hl_hh,
+    },
+];
 
 fn expect_pixel(
     gs: &GsState,
@@ -120,9 +137,20 @@ fn expect_pixel(
 }
 
 fn resolve_fixture_path(subdir: &str, rel_path: &str) -> PathBuf {
-    let cwd_path = Path::new("tests").join(subdir).join(rel_path);
-    if cwd_path.exists() {
-        return cwd_path;
+    for candidate in [
+        Path::new("tests").join(subdir).join(rel_path),
+        Path::new("tests").join(rel_path),
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests")
+            .join(subdir)
+            .join(rel_path),
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests")
+            .join(rel_path),
+    ] {
+        if candidate.exists() {
+            return candidate;
+        }
     }
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests")
