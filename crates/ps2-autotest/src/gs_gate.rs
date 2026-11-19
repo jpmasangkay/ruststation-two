@@ -95,26 +95,165 @@ pub static GS_RENDER_GATE_SUITES: [GsGateSuite; 16] = [
     },
 ];
 
-pub static PCSX2_OBSERVED_SUITES: [GsGateSuite; 4] = [
-    GsGateSuite {
-        name: "gs_probes/10_subpixel_probe",
-        rel_path: "10_subpixel_probe.gsp",
-        verify: verify_10_subpixel_probe,
+/// One pixel where our exact-floor expectation intentionally stays as the gate check while
+/// PCSX2 v2.8.2 Software is documented as selecting a different texel (`KNOWN-DIFFERENCE`).
+pub struct KnownDiffPixel {
+    pub x: u32,
+    pub y: u32,
+    pub our_texel: u8,
+    pub pcsx2_texel: u8,
+    pub our_color: u32,
+    pub pcsx2_color: u32,
+}
+
+pub struct Pcsx2ObservedSuite {
+    pub suite: GsGateSuite,
+    pub known_difference_reason: Option<&'static str>,
+    pub known_diff_pixels: &'static [KnownDiffPixel],
+}
+
+/// All 9 interior positive exact-integer `u` pixels in `gs_probes/16_tex_tri_narrow` where
+/// PCSX2 v2.8.2 Software selects `u - 1` while `ps2-gs` retains exact rational floor (`G-022`).
+pub static PROBE_16_KNOWN_DIFF_PIXELS: [KnownDiffPixel; 9] = [
+    KnownDiffPixel {
+        x: 55,
+        y: 30,
+        our_texel: 12,
+        pcsx2_texel: 11,
+        our_color: 0x80C0_3050,
+        pcsx2_color: 0x8040_E0F0,
     },
-    GsGateSuite {
-        name: "gs_render/10_tex_psmct32_uv_modulate",
-        rel_path: "gs_render/10_tex_psmct32_uv_modulate.gsp",
-        verify: verify_10_tex_psmct32_uv_modulate,
+    KnownDiffPixel {
+        x: 51,
+        y: 40,
+        our_texel: 9,
+        pcsx2_texel: 8,
+        our_color: 0x8090_20C0,
+        pcsx2_color: 0x8020_B040,
     },
-    GsGateSuite {
-        name: "gs_render/11_tex_psmt8_csm1_swizzle",
-        rel_path: "gs_render/11_tex_psmt8_csm1_swizzle.gsp",
-        verify: verify_11_tex_psmt8_csm1_swizzle,
+    KnownDiffPixel {
+        x: 47,
+        y: 50,
+        our_texel: 6,
+        pcsx2_texel: 5,
+        our_color: 0x8050_E010,
+        pcsx2_color: 0x80B0_3070,
     },
-    GsGateSuite {
-        name: "gs_render/12_tex_psmt4hl_hh",
-        rel_path: "gs_render/12_tex_psmt4hl_hh.gsp",
-        verify: verify_12_tex_psmt4hl_hh,
+    KnownDiffPixel {
+        x: 43,
+        y: 60,
+        our_texel: 3,
+        pcsx2_texel: 2,
+        our_color: 0x80E0_1030,
+        pcsx2_color: 0x8010_70F0,
+    },
+    KnownDiffPixel {
+        x: 50,
+        y: 90,
+        our_texel: 9,
+        pcsx2_texel: 8,
+        our_color: 0x8090_20C0,
+        pcsx2_color: 0x8020_B040,
+    },
+    KnownDiffPixel {
+        x: 46,
+        y: 100,
+        our_texel: 6,
+        pcsx2_texel: 5,
+        our_color: 0x8050_E010,
+        pcsx2_color: 0x80B0_3070,
+    },
+    KnownDiffPixel {
+        x: 42,
+        y: 110,
+        our_texel: 3,
+        pcsx2_texel: 2,
+        our_color: 0x80E0_1030,
+        pcsx2_color: 0x8010_70F0,
+    },
+    KnownDiffPixel {
+        x: 45,
+        y: 150,
+        our_texel: 6,
+        pcsx2_texel: 5,
+        our_color: 0x8050_E010,
+        pcsx2_color: 0x80B0_3070,
+    },
+    KnownDiffPixel {
+        x: 41,
+        y: 160,
+        our_texel: 3,
+        pcsx2_texel: 2,
+        our_color: 0x80E0_1030,
+        pcsx2_color: 0x8010_70F0,
+    },
+];
+
+pub static PCSX2_OBSERVED_SUITES: [Pcsx2ObservedSuite; 7] = [
+    Pcsx2ObservedSuite {
+        suite: GsGateSuite {
+            name: "gs_probes/10_subpixel_probe",
+            rel_path: "10_subpixel_probe.gsp",
+            verify: verify_10_subpixel_probe,
+        },
+        known_difference_reason: None,
+        known_diff_pixels: &[],
+    },
+    Pcsx2ObservedSuite {
+        suite: GsGateSuite {
+            name: "gs_render/10_tex_psmct32_uv_modulate",
+            rel_path: "gs_render/10_tex_psmct32_uv_modulate.gsp",
+            verify: verify_10_tex_psmct32_uv_modulate,
+        },
+        known_difference_reason: None,
+        known_diff_pixels: &[],
+    },
+    Pcsx2ObservedSuite {
+        suite: GsGateSuite {
+            name: "gs_render/11_tex_psmt8_csm1_swizzle",
+            rel_path: "gs_render/11_tex_psmt8_csm1_swizzle.gsp",
+            verify: verify_11_tex_psmt8_csm1_swizzle,
+        },
+        known_difference_reason: None,
+        known_diff_pixels: &[],
+    },
+    Pcsx2ObservedSuite {
+        suite: GsGateSuite {
+            name: "gs_render/12_tex_psmt4hl_hh",
+            rel_path: "gs_render/12_tex_psmt4hl_hh.gsp",
+            verify: verify_12_tex_psmt4hl_hh,
+        },
+        known_difference_reason: None,
+        known_diff_pixels: &[],
+    },
+    Pcsx2ObservedSuite {
+        suite: GsGateSuite {
+            name: "gs_probes/14_tex_tri_wide_uv",
+            rel_path: "14_tex_tri_wide_uv.gsp",
+            verify: verify_14_tex_tri_wide_uv,
+        },
+        known_difference_reason: None,
+        known_diff_pixels: &[],
+    },
+    Pcsx2ObservedSuite {
+        suite: GsGateSuite {
+            name: "gs_probes/15_tex_tri_stq_perspective",
+            rel_path: "15_tex_tri_stq_perspective.gsp",
+            verify: verify_15_tex_tri_stq_perspective,
+        },
+        known_difference_reason: None,
+        known_diff_pixels: &[],
+    },
+    Pcsx2ObservedSuite {
+        suite: GsGateSuite {
+            name: "gs_probes/16_tex_tri_narrow",
+            rel_path: "16_tex_tri_narrow.gsp",
+            verify: verify_16_tex_tri_narrow,
+        },
+        known_difference_reason: Some(
+            "9/1900 exact-integer u>0 ties differ from PCSX2 v2.8.2 Software (PCSX2=u-1; see G-022 & HARDWARE_NOTES.md §15)",
+        ),
+        known_diff_pixels: &PROBE_16_KNOWN_DIFF_PIXELS,
     },
 ];
 
@@ -1186,6 +1325,188 @@ fn verify_10_subpixel_probe(gs: &GsState) -> Result<(), String> {
     Ok(())
 }
 
+/// Frozen hand-derived predictions from `docs/GS_GUESSES.md` (commit `98ea99d`).
+fn verify_14_tex_tri_wide_uv(gs: &GsState) -> Result<(), String> {
+    let f = PixelFormat::Psmct32;
+    expect_pixel(gs, f, 0, 5, (20, 30), 0x8020_20E0, "dx=0 u=0 -> texel 0")?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (84, 40),
+        0x8010_70F0,
+        "dx=64 u=832/281 -> texel 2",
+    )?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (85, 40),
+        0x80E0_1030,
+        "dx=65 u=845/281 (+2/281) -> texel 3",
+    )?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (128, 40),
+        0x8030_F0D0,
+        "dx=108 u=1404/281 (-1/281) -> texel 4",
+    )?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (193, 40),
+        0x8020_B040,
+        "dx=173 u=2249/281 (+1/281) -> texel 8",
+    )?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (236, 40),
+        0x8090_20C0,
+        "dx=216 u=2808/281 (-2/281) -> texel 9",
+    )?;
+    Ok(())
+}
+
+/// Frozen hand-derived predictions from `docs/GS_GUESSES.md` (commit `98ea99d`).
+fn verify_15_tex_tri_stq_perspective(gs: &GsState) -> Result<(), String> {
+    let f = PixelFormat::Psmct32;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (36, 40),
+        0x80F0_D020,
+        "dx=16 u=624/313 (-2/313) -> texel 1",
+    )?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (68, 40),
+        0x8030_F0D0,
+        "dx=48 u=1872/377 (-13/377) -> texel 4",
+    )?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (83, 40),
+        0x8050_E010,
+        "dx=63 u=2457/407 (+15/407) -> texel 6",
+    )?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (160, 40),
+        0x8090_20C0,
+        "dx=140 midpoint u=5460/561 -> texel 9",
+    )?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (168, 40),
+        0x80F0_9020,
+        "dx=148 u=5772/577 (+2/577) -> texel 10",
+    )?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (245, 40),
+        0x80C0_3050,
+        "dx=225 u=8775/731 (+3/731) -> texel 12",
+    )?;
+    Ok(())
+}
+
+/// Frozen exact-floor expectations for `16_tex_tri_narrow` (commit `98ea99d`) plus verification
+/// that all 9 `PROBE_16_KNOWN_DIFF_PIXELS` retain our exact-floor texels (`KNOWN-DIFFERENCE` vs PCSX2).
+fn verify_16_tex_tri_narrow(gs: &GsState) -> Result<(), String> {
+    let f = PixelFormat::Psmct32;
+    // 6 frozen hand-derived predictions from commit 98ea99d:
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (40, 20),
+        0x8020_20E0,
+        "dx=0,dy=0 u=0 -> texel 0",
+    )?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (41, 33),
+        0x8020_20E0,
+        "dx=1,dy=13 N=189 (-1/190) -> texel 0",
+    )?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (41, 34),
+        0x80F0_D020,
+        "dx=1,dy=14 N=192 (+2/190) -> texel 1",
+    )?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (45, 23),
+        0x80E0_1030,
+        "dx=5,dy=3 N=759 (-1/190) -> texel 3",
+    )?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (45, 24),
+        0x8030_F0D0,
+        "dx=5,dy=4 N=762 (+2/190) -> texel 4",
+    )?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (53, 67),
+        0x8040_E0F0,
+        "dx=13,dy=47 N=2091 (+1/190) -> texel 11",
+    )?;
+    // Verify our exact-floor output remains intact at all 9 KNOWN-DIFFERENCE integer-tie pixels:
+    for p in &PROBE_16_KNOWN_DIFF_PIXELS {
+        let label = format!(
+            "exact-floor u={} (KNOWN-DIFF: PCSX2 v2.8.2 observes u={} {:#010X})",
+            p.our_texel, p.pcsx2_texel, p.pcsx2_color
+        );
+        expect_pixel(gs, f, 0, 5, (p.x, p.y), p.our_color, &label)?;
+    }
+    Ok(())
+}
+
 /// Run one GS suite against `tests/<subdir>/<rel_path>` and return `Ok(())` on pass.
 pub fn run_one_gs_suite(subdir: &str, suite: &GsGateSuite) -> Result<(), String> {
     let path = resolve_fixture_path(subdir, suite.rel_path);
@@ -1245,13 +1566,58 @@ pub fn run_gs_render_gate() -> (usize, Vec<(&'static str, String)>) {
 }
 
 /// Execute PCSX2-observed (v2.8.2, not hardware) GS probe suites. Returns `(passed, failures)`.
+/// Entries with `known_difference_reason` verify our exact-floor output and report `KNOWN-DIFF`
+/// without failing the gate (analogous to EFU `DEFERRED`).
 pub fn run_pcsx2_observed_gate() -> (usize, Vec<(&'static str, String)>) {
-    run_gs_suite_table(
-        "PCSX2-observed (v2.8.2), not hardware",
-        "PCSX2-observed (v2.8.2), not hardware",
-        "gs_probes",
-        &PCSX2_OBSERVED_SUITES,
-    )
+    let col_header = "PCSX2-observed (v2.8.2), not hardware";
+    let col_w = col_header.len().max(38);
+    println!("\n|  # | {:<col_w$} | {:<10} | Notes", col_header, "Status");
+    println!("|----|-{}-|------------|------", "-".repeat(col_w));
+
+    let mut passed = 0usize;
+    let mut known_diff = 0usize;
+    let mut failures = Vec::new();
+    for (idx, entry) in PCSX2_OBSERVED_SUITES.iter().enumerate() {
+        match run_one_gs_suite("gs_probes", &entry.suite) {
+            Ok(()) => {
+                if let Some(reason) = entry.known_difference_reason {
+                    known_diff += 1;
+                    println!(
+                        "| {:>2} | {:<col_w$} | {:<10} | {} ({} px)",
+                        idx + 1,
+                        entry.suite.name,
+                        "KNOWN-DIFF",
+                        reason,
+                        entry.known_diff_pixels.len()
+                    );
+                } else {
+                    passed += 1;
+                    println!(
+                        "| {:>2} | {:<col_w$} | {:<10} |",
+                        idx + 1,
+                        entry.suite.name,
+                        "PASS"
+                    );
+                }
+            }
+            Err(err) => {
+                failures.push((entry.suite.name, err));
+                println!(
+                    "| {:>2} | {:<col_w$} | {:<10} |",
+                    idx + 1,
+                    entry.suite.name,
+                    "FAIL"
+                );
+            }
+        }
+    }
+
+    let total = PCSX2_OBSERVED_SUITES.len();
+    let failed = failures.len();
+    println!(
+        "\n=== {col_header}: {passed}/{total} PASSED, {known_diff} KNOWN-DIFFERENCE, {failed} FAILED ==="
+    );
+    (passed, failures)
 }
 
 #[cfg(test)]
@@ -1268,9 +1634,16 @@ mod tests {
 
     #[test]
     fn pcsx2_observed_suites_all_pass() {
-        for suite in &PCSX2_OBSERVED_SUITES {
-            run_one_gs_suite("gs_probes", suite)
-                .unwrap_or_else(|e| panic!("{} failed: {e}", suite.name));
+        for entry in &PCSX2_OBSERVED_SUITES {
+            run_one_gs_suite("gs_probes", &entry.suite)
+                .unwrap_or_else(|e| panic!("{} failed: {e}", entry.suite.name));
+            if entry.known_difference_reason.is_some() {
+                assert!(
+                    !entry.known_diff_pixels.is_empty(),
+                    "{} marked KNOWN-DIFFERENCE without listing differing pixels",
+                    entry.suite.name
+                );
+            }
         }
     }
 }
