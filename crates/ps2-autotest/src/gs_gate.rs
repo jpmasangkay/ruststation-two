@@ -96,12 +96,12 @@ pub static GS_RENDER_GATE_SUITES: [GsGateSuite; 16] = [
 ];
 
 /// One pixel where our exact-floor expectation intentionally stays as the gate check while
-/// PCSX2 v2.8.2 Software is documented as selecting a different texel (`KNOWN-DIFFERENCE`).
+/// PCSX2 v2.8.2 Software is documented as selecting a different `(u, v)` texel (`KNOWN-DIFFERENCE`).
 pub struct KnownDiffPixel {
     pub x: u32,
     pub y: u32,
-    pub our_texel: u8,
-    pub pcsx2_texel: u8,
+    pub our_texel: (u8, u8),
+    pub pcsx2_texel: (u8, u8),
     pub our_color: u32,
     pub pcsx2_color: u32,
 }
@@ -113,83 +113,232 @@ pub struct Pcsx2ObservedSuite {
 }
 
 /// All 9 interior positive exact-integer `u` pixels in `gs_probes/16_tex_tri_narrow` where
-/// PCSX2 v2.8.2 Software selects `u - 1` while `ps2-gs` retains exact rational floor (`G-022`).
+/// PCSX2 v2.8.2 Software selects `(u - 1, 1)` while `ps2-gs` retains exact rational floor (`G-022`).
 pub static PROBE_16_KNOWN_DIFF_PIXELS: [KnownDiffPixel; 9] = [
     KnownDiffPixel {
         x: 55,
         y: 30,
-        our_texel: 12,
-        pcsx2_texel: 11,
+        our_texel: (12, 1),
+        pcsx2_texel: (11, 1),
         our_color: 0x80C0_3050,
         pcsx2_color: 0x8040_E0F0,
     },
     KnownDiffPixel {
         x: 51,
         y: 40,
-        our_texel: 9,
-        pcsx2_texel: 8,
+        our_texel: (9, 1),
+        pcsx2_texel: (8, 1),
         our_color: 0x8090_20C0,
         pcsx2_color: 0x8020_B040,
     },
     KnownDiffPixel {
         x: 47,
         y: 50,
-        our_texel: 6,
-        pcsx2_texel: 5,
+        our_texel: (6, 1),
+        pcsx2_texel: (5, 1),
         our_color: 0x8050_E010,
         pcsx2_color: 0x80B0_3070,
     },
     KnownDiffPixel {
         x: 43,
         y: 60,
-        our_texel: 3,
-        pcsx2_texel: 2,
+        our_texel: (3, 1),
+        pcsx2_texel: (2, 1),
         our_color: 0x80E0_1030,
         pcsx2_color: 0x8010_70F0,
     },
     KnownDiffPixel {
         x: 50,
         y: 90,
-        our_texel: 9,
-        pcsx2_texel: 8,
+        our_texel: (9, 1),
+        pcsx2_texel: (8, 1),
         our_color: 0x8090_20C0,
         pcsx2_color: 0x8020_B040,
     },
     KnownDiffPixel {
         x: 46,
         y: 100,
-        our_texel: 6,
-        pcsx2_texel: 5,
+        our_texel: (6, 1),
+        pcsx2_texel: (5, 1),
         our_color: 0x8050_E010,
         pcsx2_color: 0x80B0_3070,
     },
     KnownDiffPixel {
         x: 42,
         y: 110,
-        our_texel: 3,
-        pcsx2_texel: 2,
+        our_texel: (3, 1),
+        pcsx2_texel: (2, 1),
         our_color: 0x80E0_1030,
         pcsx2_color: 0x8010_70F0,
     },
     KnownDiffPixel {
         x: 45,
         y: 150,
-        our_texel: 6,
-        pcsx2_texel: 5,
+        our_texel: (6, 1),
+        pcsx2_texel: (5, 1),
         our_color: 0x8050_E010,
         pcsx2_color: 0x80B0_3070,
     },
     KnownDiffPixel {
         x: 41,
         y: 160,
-        our_texel: 3,
-        pcsx2_texel: 2,
+        our_texel: (3, 1),
+        pcsx2_texel: (2, 1),
         our_color: 0x80E0_1030,
         pcsx2_color: 0x8010_70F0,
     },
 ];
 
-pub static PCSX2_OBSERVED_SUITES: [Pcsx2ObservedSuite; 7] = [
+/// All 18 interior (`dx > 0`) exact-integer `u`/`v` pixels in `gs_probes/18_tex_tri_non_dyadic_uv`
+/// where PCSX2 v2.8.2 Software decrements the tying axis while `ps2-gs` retains exact floor (`G-022`).
+pub static PROBE_18_KNOWN_DIFF_PIXELS: [KnownDiffPixel; 18] = [
+    KnownDiffPixel {
+        x: 135,
+        y: 30,
+        our_texel: (3, 1),
+        pcsx2_texel: (3, 0),
+        our_color: 0x8044_CEE2,
+        pcsx2_color: 0x80C6_32EC,
+    },
+    KnownDiffPixel {
+        x: 173,
+        y: 35,
+        our_texel: (5, 1),
+        pcsx2_texel: (4, 1),
+        our_color: 0x8058_BAE2,
+        pcsx2_color: 0x80B2_C41E,
+    },
+    KnownDiffPixel {
+        x: 116,
+        y: 40,
+        our_texel: (3, 1),
+        pcsx2_texel: (2, 1),
+        our_color: 0x8044_CEE2,
+        pcsx2_color: 0x80C6_D81E,
+    },
+    KnownDiffPixel {
+        x: 59,
+        y: 45,
+        our_texel: (1, 1),
+        pcsx2_texel: (0, 0),
+        our_color: 0x8030_E2E2,
+        pcsx2_color: 0x801C_1414,
+    },
+    KnownDiffPixel {
+        x: 154,
+        y: 45,
+        our_texel: (4, 2),
+        pcsx2_texel: (4, 1),
+        our_color: 0x8058_3C28,
+        pcsx2_color: 0x80B2_C41E,
+    },
+    KnownDiffPixel {
+        x: 192,
+        y: 50,
+        our_texel: (6, 2),
+        pcsx2_texel: (5, 2),
+        our_color: 0x801C_5028,
+        pcsx2_color: 0x809E_46D8,
+    },
+    KnownDiffPixel {
+        x: 135,
+        y: 55,
+        our_texel: (4, 2),
+        pcsx2_texel: (3, 2),
+        our_color: 0x8058_3C28,
+        pcsx2_color: 0x80B2_32D8,
+    },
+    KnownDiffPixel {
+        x: 78,
+        y: 60,
+        our_texel: (2, 2),
+        pcsx2_texel: (1, 1),
+        our_color: 0x8044_2828,
+        pcsx2_color: 0x8030_E2E2,
+    },
+    KnownDiffPixel {
+        x: 173,
+        y: 60,
+        our_texel: (5, 3),
+        pcsx2_texel: (5, 2),
+        our_color: 0x801C_BACE,
+        pcsx2_color: 0x809E_46D8,
+    },
+    KnownDiffPixel {
+        x: 154,
+        y: 70,
+        our_texel: (5, 3),
+        pcsx2_texel: (4, 3),
+        our_color: 0x801C_BACE,
+        pcsx2_color: 0x809E_C432,
+    },
+    KnownDiffPixel {
+        x: 97,
+        y: 75,
+        our_texel: (3, 3),
+        pcsx2_texel: (2, 2),
+        our_color: 0x8058_CECE,
+        pcsx2_color: 0x8044_2828,
+    },
+    KnownDiffPixel {
+        x: 116,
+        y: 90,
+        our_texel: (4, 4),
+        pcsx2_texel: (3, 3),
+        our_color: 0x801C_3C3C,
+        pcsx2_color: 0x8058_CECE,
+    },
+    KnownDiffPixel {
+        x: 59,
+        y: 95,
+        our_texel: (2, 3),
+        pcsx2_texel: (1, 3),
+        our_color: 0x80B2_D832,
+        pcsx2_color: 0x8044_E2CE,
+    },
+    KnownDiffPixel {
+        x: 78,
+        y: 110,
+        our_texel: (3, 4),
+        pcsx2_texel: (2, 4),
+        our_color: 0x809E_32C4,
+        pcsx2_color: 0x8058_283C,
+    },
+    KnownDiffPixel {
+        x: 59,
+        y: 120,
+        our_texel: (2, 5),
+        pcsx2_texel: (2, 4),
+        our_color: 0x809E_D846,
+        pcsx2_color: 0x8058_283C,
+    },
+    KnownDiffPixel {
+        x: 97,
+        y: 125,
+        our_texel: (4, 5),
+        pcsx2_texel: (3, 5),
+        our_color: 0x80DA_C446,
+        pcsx2_color: 0x801C_CEBA,
+    },
+    KnownDiffPixel {
+        x: 78,
+        y: 135,
+        our_texel: (3, 6),
+        pcsx2_texel: (3, 5),
+        our_color: 0x80DA_32B0,
+        pcsx2_color: 0x801C_CEBA,
+    },
+    KnownDiffPixel {
+        x: 59,
+        y: 145,
+        our_texel: (3, 6),
+        pcsx2_texel: (2, 6),
+        our_color: 0x80DA_32B0,
+        pcsx2_color: 0x801C_2850,
+    },
+];
+
+pub static PCSX2_OBSERVED_SUITES: [Pcsx2ObservedSuite; 10] = [
     Pcsx2ObservedSuite {
         suite: GsGateSuite {
             name: "gs_probes/10_subpixel_probe",
@@ -254,6 +403,35 @@ pub static PCSX2_OBSERVED_SUITES: [Pcsx2ObservedSuite; 7] = [
             "9/1900 exact-integer u>0 ties differ from PCSX2 v2.8.2 Software (PCSX2=u-1; see G-022 & HARDWARE_NOTES.md §15)",
         ),
         known_diff_pixels: &PROBE_16_KNOWN_DIFF_PIXELS,
+    },
+    Pcsx2ObservedSuite {
+        suite: GsGateSuite {
+            name: "gs_probes/17_tex_tri_neg_dudx",
+            rel_path: "17_tex_tri_neg_dudx.gsp",
+            verify: verify_17_tex_tri_neg_dudx,
+        },
+        known_difference_reason: None,
+        known_diff_pixels: &[],
+    },
+    Pcsx2ObservedSuite {
+        suite: GsGateSuite {
+            name: "gs_probes/18_tex_tri_non_dyadic_uv",
+            rel_path: "18_tex_tri_non_dyadic_uv.gsp",
+            verify: verify_18_tex_tri_non_dyadic_uv,
+        },
+        known_difference_reason: Some(
+            "18 dx>0 exact-integer u/v ties differ from PCSX2 v2.8.2 Software (row starts dx=0 match; see G-022 & HARDWARE_NOTES.md §15)",
+        ),
+        known_diff_pixels: &PROBE_18_KNOWN_DIFF_PIXELS,
+    },
+    Pcsx2ObservedSuite {
+        suite: GsGateSuite {
+            name: "gs_probes/19_tex_tri_dyadic",
+            rel_path: "19_tex_tri_dyadic.gsp",
+            verify: verify_19_tex_tri_dyadic,
+        },
+        known_difference_reason: None,
+        known_diff_pixels: &[],
     },
 ];
 
@@ -1499,11 +1677,116 @@ fn verify_16_tex_tri_narrow(gs: &GsState) -> Result<(), String> {
     // Verify our exact-floor output remains intact at all 9 KNOWN-DIFFERENCE integer-tie pixels:
     for p in &PROBE_16_KNOWN_DIFF_PIXELS {
         let label = format!(
-            "exact-floor u={} (KNOWN-DIFF: PCSX2 v2.8.2 observes u={} {:#010X})",
-            p.our_texel, p.pcsx2_texel, p.pcsx2_color
+            "exact-floor ({},{}) (KNOWN-DIFF: PCSX2 v2.8.2 observes ({},{}) {:#010X})",
+            p.our_texel.0, p.our_texel.1, p.pcsx2_texel.0, p.pcsx2_texel.1, p.pcsx2_color
         );
         expect_pixel(gs, f, 0, 5, (p.x, p.y), p.our_color, &label)?;
     }
+    Ok(())
+}
+
+/// Frozen hand-derived predictions from `docs/GS_GUESSES.md` (commit `77306c3`).
+fn verify_17_tex_tri_neg_dudx(gs: &GsState) -> Result<(), String> {
+    let f = PixelFormat::Psmct32;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (42, 40),
+        0x8040_E0F0,
+        "dx=22 u=11+1/67 -> texel 11",
+    )?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (65, 40),
+        0x8090_20C0,
+        "dx=45 u=10-1/67 -> texel 9",
+    )?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (87, 40),
+        0x8090_20C0,
+        "dx=67 u=9.0 exact -> texel 9",
+    )?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (154, 40),
+        0x8050_E010,
+        "dx=134 u=6.0 exact -> texel 6",
+    )?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (199, 40),
+        0x80E0_1030,
+        "dx=179 u=4-1/67 -> texel 3",
+    )?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (221, 40),
+        0x80E0_1030,
+        "dx=201 u=3.0 exact -> texel 3",
+    )?;
+    Ok(())
+}
+
+/// Frozen exact-floor expectations for `18_tex_tri_non_dyadic_uv` (commit `77306c3`) plus
+/// verification of all 18 `PROBE_18_KNOWN_DIFF_PIXELS` (`KNOWN-DIFFERENCE` vs PCSX2).
+fn verify_18_tex_tri_non_dyadic_uv(gs: &GsState) -> Result<(), String> {
+    let f = PixelFormat::Psmct32;
+    // Frozen predictions from commit 77306c3 (row-start (40,80) and near-int (62,40) match PCSX2):
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (40, 80),
+        0x80C6_1ED8,
+        "dx=0,dy=50 row-start u=1.0 -> (1,2)",
+    )?;
+    expect_pixel(
+        gs,
+        f,
+        0,
+        5,
+        (62, 40),
+        0x80DA_1EEC,
+        "dx=22,dy=10 +2/190 near-int -> (1,0)",
+    )?;
+    // Verify our exact-floor output remains intact at all 18 KNOWN-DIFFERENCE dx>0 integer ties:
+    for p in &PROBE_18_KNOWN_DIFF_PIXELS {
+        let label = format!(
+            "exact-floor ({},{}) (KNOWN-DIFF: PCSX2 v2.8.2 observes ({},{}) {:#010X})",
+            p.our_texel.0, p.our_texel.1, p.pcsx2_texel.0, p.pcsx2_texel.1, p.pcsx2_color
+        );
+        expect_pixel(gs, f, 0, 5, (p.x, p.y), p.our_color, &label)?;
+    }
+    Ok(())
+}
+
+/// Frozen hand-derived predictions from `docs/GS_GUESSES.md` (commit `77306c3`).
+fn verify_19_tex_tri_dyadic(gs: &GsState) -> Result<(), String> {
+    let f = PixelFormat::Psmct32;
+    expect_pixel(gs, f, 0, 5, (40, 30), 0x8018_1414, "dx=0,dy=0 -> (0,0)")?;
+    expect_pixel(gs, f, 0, 5, (41, 30), 0x80E3_19EC, "dx=1,dy=0 -> (1,0)")?;
+    expect_pixel(gs, f, 0, 5, (40, 31), 0x80E3_EC19, "dx=0,dy=1 -> (0,1)")?;
+    expect_pixel(gs, f, 0, 5, (45, 34), 0x80BB_2DD8, "dx=5,dy=4 -> (5,4)")?;
+    expect_pixel(gs, f, 0, 5, (47, 37), 0x805E_C9C9, "dx=7,dy=7 -> (7,7)")?;
     Ok(())
 }
 
