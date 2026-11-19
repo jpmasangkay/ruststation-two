@@ -133,3 +133,60 @@ All 4 texel rows `v in 0..=3` contain the identical 16-column sequence (`0x80BB_
   4. **`(45, 23)`** (`dx = 5, dy = 3`): `N = 750 + 9 = 759 = 4*190 - 1`, `u_exact = 3.994737` (`-1/190 = -0.00526 < 1/16` texel below `4.0`), `u_fp = 63` -> **texel `3`**: **`0x80E0_1030` (`#3010E0`)**.
   5. **`(45, 24)`** (`dx = 5, dy = 4`): `N = 750 + 12 = 762 = 4*190 + 2`, `u_exact = 4.010526` (`+2/190 = +0.01053 < 1/16` texel above `4.0`), `u_fp = 64` -> **texel `4`**: **`0x8030_F0D0` (`#D0F030`)**.
   6. **`(53, 67)`** (`dx = 13, dy = 47`): `N = 1950 + 141 = 2091 = 11*190 + 1`, `u_exact = 11.005263` (`+1/190 = +0.00526 < 1/16` texel above `11.0`), `u_fp = 176` -> **texel `11`**: **`0x8040_E0F0` (`#F0E040`)** *(lag of `1/190` texel drops to texel `10` `#2090F0`)*.
+
+## Pre-Registered UV Tie-Break Probe Predictions (`tests/gs_probes/17..19_*.gsp`, frozen pre-measurement)
+
+Written and committed **alone** before creating `tests/gs_probes/17..19_*.gsp`, emitting `*.elf` / `*_ours.png`, or capturing any PCSX2 screenshots (`320x240` `PSMCT32`, `FBP=0, FBW=5`, background `0x8000_0000` `#000000`, `XYOFFSET_1 = (2048.0, 2048.0)`, `CLAMP_1 = 0x0005`, `TFX = 1` Decal, `TCC = 1`, `PRIM = 0x0113`).
+
+Surviving candidate models from `{14, 15, 16, 10, 11, 12}` (each fit labeled *"fits 6 scenes; may not generalize"*):
+- **`ExactFloor`** (current `ps2-gs`): exact rational floor `u_fp.div_euclid(16)`.
+- **`A1_trunc_Qn`** (`n >= 16` for `UV`, `n >= 18` if quantized `ST/Q`): exact `v0` start, `dU/dx`, `dU/dy`, `dV/dx`, `dV/dy` **truncated toward zero** at `Qn` fractional bits per texel.
+- **`A2_row_trunc_Qn`** (`n >= 16` for `UV`): exact row start `floor(u_exact(min_x, y) * 2^n)`, horizontal step `dU/dx` **truncated toward zero** at `Qn`.
+- **`A1_floor_Qn`** (`n >= 16` for `UV`): exact `v0` start, gradients **floored toward `-∞`** at `Qn` fractional bits per texel (identical to `A1_trunc_Qn` when gradients `>= 0`, diverges on negative gradients in Probe `17`).
+- **`C2_tri_eps`** (`0 < eps < 2/577 ≈ 0.003466`): `floor(u_exact - eps)` on triangles only.
+*(Ruled out prior to this probe batch: Family `(B)` `f32` plane evaluation failed Probe `16` on `7..9` pixels; `C1` `floor(u - eps)` on all primitives failed `3a` sprites `10..12`.)*
+
+### 1. Probe `17` (`tests/gs_probes/17_tex_tri_neg_dudx.gsp`) — Negative `dU/dx` (`dU/dx = -3/67 < 0`, `dU/dy = 0`)
+- **Texture**: Shared `16x4` high-contrast stripe texture `C[0..15]` (`TBP0=0x0640, TBW=1, TW=4, TH=2`, `TEX0_1=0x0000_000C_9000_4640`).
+- **Vertices**: `v0 = (20, 30), UV = (12.0, 1.0)` (`u_raw = 192`); `v1 = (288, 30), UV = (0.0, 1.0)` (`W = 268`); `v2 = (20, 170), UV = (12.0, 1.0)` (`H = 140`).
+- **Hand derivation**: At `(20 + dx, 30 + dy)` (`dx >= 0, dy >= 0, 140*dx + 268*dy < 37520`), `u_exact(dx) = 12 - (3 * dx) / 67`. Exact interior integer `u` columns occur at `dx = 67 (u=9)`, `134 (u=6)`, `201 (u=3)`. Because `dU/dx = -3/67 < 0`, truncating toward zero (`A1_trunc_Qn`, `A2_row_trunc_Qn`) makes `step_x` less negative (larger than exact), keeping `u_q > k * 2^n` (no flip!), whereas flooring toward `-∞` (`A1_floor_Qn`) and `C2_tri_eps` drop `u` below `k` (flip to `k - 1`!).
+- **Frozen hand-derived pixel predictions (`6` pixels, all on row `y = 40` where covered `dx <= 248`)**:
+  | Pixel `(x, y)` | `dx` | Exact `u` | `ExactFloor` / `A1_trunc` / `A2_row_trunc` | `A1_floor` / `C2_tri_eps` |
+  |---|---:|---|---|---|
+  | `(42, 40)` | `22` | `11 + 1/67 = 11.014925` (`+1/67` near-int) | texel `11`: `0x8040_E0F0` (`#F0E040`) | texel `11`: `0x8040_E0F0` (`#F0E040`) |
+  | `(65, 40)` | `45` | `10 - 1/67 = 9.985075` (`-1/67` near-int) | texel `9`: `0x8090_20C0` (`#C02090`) | texel `9`: `0x8090_20C0` (`#C02090`) |
+  | `(87, 40)` | `67` | `9.000000` (exact integer `9`) | texel `9`: `0x8090_20C0` (`#C02090`) | texel `8`: `0x8020_B040` (`#40B020`) |
+  | `(154, 40)` | `134` | `6.000000` (exact integer `6`) | texel `6`: `0x8050_E010` (`#10E050`) | texel `5`: `0x80B0_3070` (`#7030B0`) |
+  | `(199, 40)` | `179` | `4 - 1/67 = 3.985075` (`-1/67` near-int) | texel `3`: `0x80E0_1030` (`#3010E0`) | texel `3`: `0x80E0_1030` (`#3010E0`) |
+  | `(221, 40)` | `201` | `3.000000` (exact integer `3`) | texel `3`: `0x80E0_1030` (`#3010E0`) | texel `2`: `0x8010_70F0` (`#F07010`) |
+
+### 2. Probe `18` (`tests/gs_probes/18_tex_tri_non_dyadic_uv.gsp`) — Non-Dyadic `U` AND `V` Gradients (2D Plaid)
+- **Texture (`8x8` `PSMCT32` at `TBP0=0x0640, TBW=1, TW=3, TH=3`, `TEX0_1=0x0000_000C_CC00_4640`)**:
+  Unique 2D plaid color for every `(u, v) in 0..8 x 0..8` (`A = 0x80`; any 1-texel error in `U`, `V`, or both jumps `>= 60` in at least two channels):
+  `R = even(u) ? 20+10*v : 236-10*v`, `G = even(v) ? 20+10*u : 236-10*u`, `B = even(u^v) ? 28+10*((u+v)&7) : 228-10*((u+v)&7)`.
+- **Vertices**: `v0 = (40, 30), UV = (0.0, 0.0)`; `v1 = (230, 30), UV = (7.0, 2.0)` (`W = 190`); `v2 = (40, 180), UV = (3.0, 8.0)` (`H = 150`).
+- **Hand derivation**: At `(40 + dx, 30 + dy)` (`dx >= 0, dy >= 0, 15*dx + 19*dy < 2850`), `u_exact = 7*dx/190 + dy/50` and `v_exact = dx/95 + 4*dy/75`. Note `(40, 80)` (`dx = 0, dy = 50`) reaches exact `u = 1.0` purely along `y` (`min_x = 40`), separating 2D-stepping `A1_trunc`/`A1_floor` (`(0, 2)`) from exact-row-start `A2_row_trunc` (`(1, 2)`).
+- **Frozen hand-derived pixel predictions (`6` pixels)**:
+  | Pixel `(x, y)` | `(dx, dy)` | Exact `(u, v)` | `ExactFloor` | `A2_row_trunc` | `A1_trunc` / `A1_floor` / `C2_tri_eps` |
+  |---|---|---|---|---|---|
+  | `(40, 80)` | `(0, 50)` | `(1.000000, 2.666667)` (`U` tie via `dU/dy`) | `(1,2)` `0x80C6_1ED8` (`#D81EC6`) | `(1,2)` `0x80C6_1ED8` (`#D81EC6`) | `(0,2)` `0x8030_1428` (`#281430`) |
+  | `(116, 40)` | `(76, 10)` | `(3.000000, 1.333333)` (`U` tie only) | `(3,1)` `0x8044_CEE2` (`#E2CE44`) | `(2,1)` `0x80C6_D81E` (`#1ED8C6`) | `(2,1)` `0x80C6_D81E` (`#1ED8C6`) |
+  | `(154, 45)` | `(114, 15)` | `(4.500000, 2.000000)` (`V` tie only) | `(4,2)` `0x8058_3C28` (`#283C58`) | `(4,1)` `0x80B2_C41E` (`#1EC4B2`) | `(4,1)` `0x80B2_C41E` (`#1EC4B2`) |
+  | `(78, 60)` | `(38, 30)` | `(2.000000, 2.000000)` (`U` & `V` tie) | `(2,2)` `0x8044_2828` (`#282844`) | `(1,1)` `0x8030_E2E2` (`#E2E230`) | `(1,1)` `0x8030_E2E2` (`#E2E230`) |
+  | `(116, 90)` | `(76, 60)` | `(4.000000, 4.000000)` (`U` & `V` tie) | `(4,4)` `0x801C_3C3C` (`#3C3C1C`) | `(3,3)` `0x8058_CECE` (`#CECE58`) | `(3,3)` `0x8058_CECE` (`#CECE58`) |
+  | `(62, 40)` | `(22, 10)` | `(1.010526, 0.764912)` (`+2/190` near-int `U`) | `(1,0)` `0x80DA_1EEC` (`#EC1EDA`) | `(1,0)` `0x80DA_1EEC` (`#EC1EDA`) | `(1,0)` `0x80DA_1EEC` (`#EC1EDA`) |
+
+### 3. Probe `19` (`tests/gs_probes/19_tex_tri_dyadic.gsp`) — Dyadic `1` Texel/Pixel Triangle (`dU/dx = 1, dV/dy = 1`)
+- **Texture (`16x16` `PSMCT32` at `TBP0=0x0640, TBW=1, TW=4, TH=4`, `TEX0_1=0x0000_000D_1000_4640`)**:
+  Unique 2D plaid for every `(u, v) in 0..16 x 0..16` (`A = 0x80`):
+  `R = even(u) ? 20+5*v : 236-5*v`, `G = even(v) ? 20+5*u : 236-5*u`, `B = even(u^v) ? 24+5*((u+v)&15) : 232-5*((u+v)&15)`.
+- **Vertices**: `v0 = (40, 30), UV = (0.0, 0.0)`; `v1 = (56, 30), UV = (16.0, 0.0)` (`W = 16`); `v2 = (40, 46), UV = (0.0, 16.0)` (`H = 16`).
+- **Hand derivation**: At `(40 + dx, 30 + dy)` (`dx >= 0, dy >= 0, dx + dy < 16`), `u_exact = dx`, `v_exact = dy` (`dU/dx = 1`, `dU/dy = 0`, `dV/dx = 0`, `dV/dy = 1` — all exact integers in any `Qn`). All fixed-point models (`A1_trunc`, `A2_row_trunc`, `A1_floor`) have zero quantization error and match `ExactFloor` (no ties flip!), whereas `C2_tri_eps` flips every interior pixel to `(max(0, dx - 1), max(0, dy - 1))`.
+- **Frozen hand-derived pixel predictions (`5` pixels)**:
+  | Pixel `(x, y)` | `(dx, dy)` | Exact `(u, v)` | `ExactFloor` / `A1_trunc` / `A2_row_trunc` / `A1_floor` | `C2_tri_eps` |
+  |---|---|---|---|---|
+  | `(40, 30)` | `(0, 0)` | `(0, 0)` (`v0` / clamped) | `(0,0)` `0x8018_1414` (`#141418`) | `(0,0)` `0x8018_1414` (`#141418`) |
+  | `(41, 30)` | `(1, 0)` | `(1, 0)` | `(1,0)` `0x80E3_19EC` (`#EC19E3`) | `(0,0)` `0x8018_1414` (`#141418`) |
+  | `(40, 31)` | `(0, 1)` | `(0, 1)` | `(0,1)` `0x80E3_EC19` (`#19ECE3`) | `(0,0)` `0x8018_1414` (`#141418`) |
+  | `(45, 34)` | `(5, 4)` | `(5, 4)` | `(5,4)` `0x80BB_2DD8` (`#D82DBB`) | `(4,3)` `0x80C5_D823` (`#23D8C5`) |
+  | `(47, 37)` | `(7, 7)` | `(7, 7)` | `(7,7)` `0x805E_C9C9` (`#C9C95E`) | `(6,6)` `0x8054_3232` (`#323254`) |
