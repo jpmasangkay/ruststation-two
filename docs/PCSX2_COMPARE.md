@@ -1,4 +1,4 @@
-# PCSX2 Black-Box Screenshot Comparison Workflow (Step 2.5)
+# PCSX2 Black-Box Screenshot Comparison Workflow
 
 This document describes how to emit standalone `320x240` test ELFs from `.gsp` fixtures, capture
 unfiltered PCSX2 **Software** GS screenshots under `local/pcsx2/`, and compare them against
@@ -10,10 +10,9 @@ unfiltered PCSX2 **Software** GS screenshots under `local/pcsx2/`, and compare t
 > `local/`. Keep all PCSX2 screenshots, ELFs, and diff PNGs inside `local/pcsx2/`.
 
 > [!NOTE]
-> **Verification Status (`SEARCH-ONLY`)**: PCSX2 was **not** launched during Step 2.5 harness
-> creation. Every PCSX2 menu path, setting name, screenshot option, and hotkey listed below comes
-> from public web documentation (`SEARCH-ONLY`) and is **`DRAFT, unverified`** against the local
-> binary at `C:\Users\My Laptop\Downloads\PCSX2`.
+> **Verification Status**: Menu tabs and setting labels in §2 below were verified from the owner's
+> PCSX2 `v2.8.2` screenshots. Any item not yet verified against the local install (or left as a
+> placeholder for the owner to fill in) is explicitly marked as unverified.
 
 ---
 
@@ -49,18 +48,32 @@ What each generated ELF does (`G-016`):
 
 ---
 
-## 2. Capturing Unfiltered Screenshots in PCSX2 (`DRAFT, unverified`)
+## 2. Capturing Unfiltered Screenshots in PCSX2 (`v2.8.2`)
 
-Every menu name, option label, and hotkey in Steps 2–4 below is **`DRAFT, unverified`** (`SEARCH-ONLY` web docs; exact labels in your installed Qt version may differ slightly):
-
-1. Launch PCSX2 from the directory configured in `local/PCSX2_PATH.txt` and ensure a valid PS2 BIOS is configured (`Settings > BIOS` — **`DRAFT, unverified`**).
-2. Configure **Software** GS rendering before booting the ELF (`Settings > Graphics` — all item names below **`DRAFT, unverified`**):
-   - **Rendering > Renderer**: select **`Software`** (or toggle in-game with **`F9`** — **`DRAFT, unverified`**).
-   - **Rendering > Internal Resolution**: **`1x (Native)`** (`Software` mode inherently uses `1x` — **`DRAFT, unverified`**).
-   - **Display > Filtering / Bilinear / Sharp Bilinear**: set **`Nearest`** or disable display smoothing/filtering (**`DRAFT, unverified`**) so screenshots do not blur texels.
-   - **Display > Aspect Ratio / Cropping**: prefer unstretched / internal-resolution screenshot capture if available; check **`Settings > Hotkeys > Graphics`** (**`DRAFT, unverified`**) for a raw/unscaled **`Save Internal Resolution Screenshot`** binding alongside default **`F8`** (**`DRAFT, unverified`**, legacy docs also cite **`F12`** — **`DRAFT, unverified`**).
-3. Boot each generated ELF via **`System > Boot ELF...`** / **`System > Start File...`** (**`DRAFT, unverified`**) or CLI `--elf="<path>"` (**`DRAFT, unverified`**). Wait ~1 second for the static frame to settle.
-4. Press the raw screenshot hotkey (**`F8`** / internal-res hotkey — **`DRAFT, unverified`**) and copy the resulting PNG from PCSX2's configured `snaps/` folder into `local/pcsx2/<NN>_pcsx2.png` (`04_pcsx2.png`, `05_pcsx2.png`, `06_pcsx2.png`, `08_pcsx2.png`, `10_pcsx2.png`).
+1. Launch PCSX2 from the directory configured in `local/PCSX2_PATH.txt` and ensure a valid PS2 BIOS is configured (`Settings > BIOS` — `unverified` exact menu label).
+2. Open **`Settings > Graphics`** (tabs: **`Display`**, **`Rendering`**, **`Post-Processing`**, **`Media Capture`**) and configure **Software** GS rendering before booting the ELF:
+   - **`Graphics API`**: **`Software Renderer`**.
+   - **`Display` tab**:
+     - `Deinterlacing`: **`No Deinterlacing`**
+     - `Bilinear Filtering`: **`None`**
+     - `Anti-Blur`: **off**
+     - `Integer Scaling`: **off**
+     - `Screen Offsets`: **off**
+     - `Show Overscan`: **off**
+     - Crop: **`0`**
+   - **`Rendering` tab**:
+     - `Texture Filtering`: **`Nearest`**
+     - `Software Rendering Threads`: **`3`**
+     - `Auto Flush`: **on**
+     - `Mipmapping`: **off**
+   - **`Post-Processing` tab**: all **off**.
+   - **`Media Capture` tab**:
+     - `Screenshot Capture Setup` -> `Resolution`: **`Internal Resolution (No Aspect Correction)`**
+     - Format: **`PNG`**
+3. Boot each generated ELF via **`Start File`** (CLI `--elf="<path>"` — `unverified`). Wait ~1 second for the static frame to settle.
+4. Capture a screenshot and copy the resulting PNG into `local/pcsx2/<name>_pcsx2.png`:
+   - Screenshot hotkey: `<owner to fill in>` (`unverified`).
+   - Screenshots saved to: `<owner to fill in>` (`unverified`).
 
 ---
 
@@ -109,7 +122,7 @@ Add `--tolerance 1` to permit `±1` channel LSB differences (`PMODE.ALP` scaling
 ### Output & Diff Color Legend
 - **Console output**: matched size, reference PNG dimensions, detected uniform `(sx, sy)` integer upscale and black-border `(crop_x, crop_y)` alignment, exact pixel `%`, `±1` count, `>1` count, max `|ΔR|, |ΔG|, |ΔB|`, `MAE` / `RMSE`, up to `16` sample mismatches (`ours=#RRGGBB pcsx2=#RRGGBB`), and a `shift_hint` if shifting by `(dx, dy)` reduces mismatches.
 - **Diff PNG (`--diff-out`)**: `0.25x` darkened reference pixels where exact; **yellow (`#FFE040`)** for `max(|ΔR|, |ΔG|, |ΔB|) == 1`; **bright magenta (`#FF2080`)** for `> 1`.
-- **Non-uniform scaling error**: aborts cleanly if PCSX2 captured display-scaled / bilinear-filtered output; verify **`Nearest`** / internal-resolution screenshot settings (**`DRAFT, unverified`**).
+- **Non-uniform scaling error**: aborts cleanly if PCSX2 captured display-scaled / bilinear-filtered output; verify **`Display` > `Bilinear Filtering: None`**, **`Rendering` > `Texture Filtering: Nearest`**, and **`Media Capture` > `Screenshot Capture Setup` > `Resolution: Internal Resolution (No Aspect Correction)`**.
 
 ### How to Read Diagnostic Outcomes Against `docs/GS_GUESSES.md`
 1. **Whole-image uniform `-1` LSB (yellow across all colored pixels in `04_sprite_flat`)**: points to `G-016` CRTC `PMODE.ALP = 0xFF` (`255/256`) scaling, not Gouraud interpolation. (~50% brightness indicates `MMOD=0` or `ALP=0x80` regression.)
@@ -123,5 +136,5 @@ Add `--tolerance 1` to permit `±1` channel LSB differences (`PMODE.ALP` scaling
 
 ## 4. Two-Attempt Time Box & Fallback Rule
 
-- Cap manual PCSX2 GUI screenshot troubleshooting at **2 attempts** (for example: BIOS setup missing, PCSX2 hangs without an explicit `SetGsCrt` syscall, or the installed PCSX2 build forces non-integer window scaling on all screenshots).
-- If unblocked screenshots cannot be captured cleanly within 2 attempts, log the exact observed blocker in Step 4 and continue with Step 3a (`ps2-gs` textures/CLUT/alpha/fog/dither using hand-derived + `ps2tek`/`Play!` tests) without holding up the roadmap; `--emit-elf`, `--compare-png`, and the automated `EE -> GIF -> GS` gate self-check remain valuable regression checks regardless.
+- Cap manual PCSX2 GUI screenshot troubleshooting for any new probe batch at **2 attempts** (for example: an ELF hangs on a future display/CRTC setup, or a PCSX2 update alters internal-resolution capture behavior).
+- If unblocked screenshots cannot be captured cleanly within 2 attempts, log the exact observed blocker in `docs/HARDWARE_NOTES.md` and proceed with the remaining Phase 2b work (Step 3b/3c fragment features and Step 4 verification using hand-derived + `ps2tek`/`Play!` tests) without holding up the roadmap; `--emit-elf`, `--compare-png`, and the automated `EE -> GIF -> GS` gate self-check remain active regression checks regardless.
