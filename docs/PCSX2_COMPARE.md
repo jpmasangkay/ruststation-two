@@ -117,6 +117,32 @@ cargo run -p ps2-gs-runner -- tests/gs_probes/15_tex_tri_stq_perspective.gsp --c
 cargo run -p ps2-gs-runner -- tests/gs_probes/16_tex_tri_narrow.gsp          --compare-png local/pcsx2/16_tex_tri_narrow_pcsx2.png          --diff-out local/pcsx2/16_tex_tri_narrow_diff.png          --max-mismatches 16
 ```
 
+### Pre-Registered UV Tie-Break Probes (`17`–`19`, predictions frozen in `docs/GS_GUESSES.md` commit `77306c3`)
+
+Emit ELFs and `*_ours.png` (same PCSX2 `v2.8.2` Software settings as §2):
+
+```powershell
+cargo run -p ps2-gs-runner -- --emit-elf tests/gs_probes/17_tex_tri_neg_dudx.gsp      -o local/pcsx2/17_tex_tri_neg_dudx.elf
+cargo run -p ps2-gs-runner -- tests/gs_probes/17_tex_tri_neg_dudx.gsp                 -o local/pcsx2/17_tex_tri_neg_dudx_ours.png
+cargo run -p ps2-gs-runner -- --emit-elf tests/gs_probes/18_tex_tri_non_dyadic_uv.gsp -o local/pcsx2/18_tex_tri_non_dyadic_uv.elf
+cargo run -p ps2-gs-runner -- tests/gs_probes/18_tex_tri_non_dyadic_uv.gsp            -o local/pcsx2/18_tex_tri_non_dyadic_uv_ours.png
+cargo run -p ps2-gs-runner -- --emit-elf tests/gs_probes/19_tex_tri_dyadic.gsp        -o local/pcsx2/19_tex_tri_dyadic.elf
+cargo run -p ps2-gs-runner -- tests/gs_probes/19_tex_tri_dyadic.gsp                   -o local/pcsx2/19_tex_tri_dyadic_ours.png
+```
+
+Expected PCSX2 screenshot filenames under `local/pcsx2/`:
+- `local/pcsx2/17_tex_tri_neg_dudx_pcsx2.png` (from `local/pcsx2/17_tex_tri_neg_dudx.elf`)
+- `local/pcsx2/18_tex_tri_non_dyadic_uv_pcsx2.png` (from `local/pcsx2/18_tex_tri_non_dyadic_uv.elf`)
+- `local/pcsx2/19_tex_tri_dyadic_pcsx2.png` (from `local/pcsx2/19_tex_tri_dyadic.elf`)
+
+Compare commands once screenshots are saved:
+
+```powershell
+cargo run -p ps2-gs-runner -- tests/gs_probes/17_tex_tri_neg_dudx.gsp      --compare-png local/pcsx2/17_tex_tri_neg_dudx_pcsx2.png      --diff-out local/pcsx2/17_tex_tri_neg_dudx_diff.png      --max-mismatches 32
+cargo run -p ps2-gs-runner -- tests/gs_probes/18_tex_tri_non_dyadic_uv.gsp --compare-png local/pcsx2/18_tex_tri_non_dyadic_uv_pcsx2.png --diff-out local/pcsx2/18_tex_tri_non_dyadic_uv_diff.png --max-mismatches 32
+cargo run -p ps2-gs-runner -- tests/gs_probes/19_tex_tri_dyadic.gsp        --compare-png local/pcsx2/19_tex_tri_dyadic_pcsx2.png        --diff-out local/pcsx2/19_tex_tri_dyadic_diff.png        --max-mismatches 32
+```
+
 Add `--tolerance 1` to permit `±1` channel LSB differences (`PMODE.ALP` scaling or fixed-point rounding) while still catching `>1` coverage/color errors.
 
 ### Output & Diff Color Legend

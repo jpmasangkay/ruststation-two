@@ -637,7 +637,11 @@ Unconfirmed sub-pixel rounding, sprite corner normalization, Bresenham endpoint 
   - Uses a 16-column high-contrast `PSMCT32` stripe texture (`|ΔR| >= 80, |ΔG| >= 80, |ΔB| >= 80` between every adjacent texel pair `u` and `u+1`) with `TFX=1 (Decal)`:
     1. **`tests/gs_probes/14_tex_tri_wide_uv.gsp`** (`local/pcsx2/14_tex_tri_wide_uv.{elf,_ours.png}`): wide linear `UV` (`FST=1`, `W=281, H=140, dU/dx = 13/281`) with pixels within `1/281..11/281` (`< 1/16`) texel of every integer boundary `k = 1..=12`.
     2. **`tests/gs_probes/15_tex_tri_stq_perspective.gsp`** (`local/pcsx2/15_tex_tri_stq_perspective.{elf,_ours.png}`): wide perspective `ST/Q` (`FST=0`, `W=281, H=140, Q = 1.0..3.0, u(dx) = 39*dx/(281+2*dx)`) testing per-pixel `S/Q` division and boundary crossings within `2/577..15/407` (`< 1/16`) texel.
-    3. **`tests/gs_probes/16_tex_tri_narrow.gsp`** (`local/pcsx2/16_tex_tri_narrow.{elf,_ours.png}`): narrow linear `UV` (`FST=1`, `W=19, H=190, u(dx,dy) = (150*dx+3*dy)/190`) isolating short-span `X/Y` setup rounding within `1/190` (`< 1/16`) texel of boundaries (`G-018`, `G-019`).
+    3. **`tests/gs_probes/16_tex_tri_narrow.gsp`** (`local/pcsx2/16_tex_tri_narrow.{elf,_ours.png}`): narrow linear `UV` (`FST=1`, `W=19, H=190, u(dx,dy) = (150*dx+3*dy)/190`) isolating short-span `X/Y` setup rounding within `1/190` (`< 1/16`) texel of boundaries (`G-018`, `G-019`, `G-022`).
+- **Pre-registered UV tie-break probes emitted (`tests/gs_probes/17..19_*.gsp`, predictions frozen in `docs/GS_GUESSES.md` commit `77306c3` before `.gsp`/ELF/PNG generation)**:
+  1. **`tests/gs_probes/17_tex_tri_neg_dudx.gsp`** (`local/pcsx2/17_tex_tri_neg_dudx.{elf,_ours.png}`): negative `dU/dx = -3/67` (`W=268, H=140, dU/dy=0`) separating `A1_trunc`/`A2_row_trunc` (no flip at `u=9,6,3`) from `A1_floor`/`C2_tri_eps` (flips to `8,5,2`).
+  2. **`tests/gs_probes/18_tex_tri_non_dyadic_uv.gsp`** (`local/pcsx2/18_tex_tri_non_dyadic_uv.{elf,_ours.png}`): non-dyadic 2D `U` & `V` (`W=190, H=150`, `8x8` plaid) separating `A1` vs `A2` at `(40, 80)` (`dx=0, dy=50, u=1`) and testing independent `V` and simultaneous `(U, V)` ties.
+  3. **`tests/gs_probes/19_tex_tri_dyadic.gsp`** (`local/pcsx2/19_tex_tri_dyadic.{elf,_ours.png}`): dyadic `1` texel/pixel triangle (`W=16, H=16`, `16x16` plaid, `dU/dx=1, dV/dy=1`) separating fixed-point models (`0` flips) from `C2_tri_eps` (flips every interior pixel).
 
 
 

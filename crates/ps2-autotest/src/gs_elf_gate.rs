@@ -504,5 +504,44 @@ mod tests {
                 ),
             ],
         );
+
+        // Frozen exact-floor predictions from docs/GS_GUESSES.md (commit 77306c3):
+        check_probe(
+            "gs_probes/17_tex_tri_neg_dudx",
+            "../../tests/gs_probes/17_tex_tri_neg_dudx.gsp",
+            &[
+                ((42, 40), 0x8040_E0F0, "dx=22 u=11+1/67 -> texel 11"),
+                ((65, 40), 0x8090_20C0, "dx=45 u=10-1/67 -> texel 9"),
+                ((87, 40), 0x8090_20C0, "dx=67 u=9.0 exact -> texel 9"),
+                ((154, 40), 0x8050_E010, "dx=134 u=6.0 exact -> texel 6"),
+                ((199, 40), 0x80E0_1030, "dx=179 u=4-1/67 -> texel 3"),
+                ((221, 40), 0x80E0_1030, "dx=201 u=3.0 exact -> texel 3"),
+            ],
+        );
+
+        check_probe(
+            "gs_probes/18_tex_tri_non_dyadic_uv",
+            "../../tests/gs_probes/18_tex_tri_non_dyadic_uv.gsp",
+            &[
+                ((40, 80), 0x80C6_1ED8, "dx=0,dy=50 (1,2) U tie via dU/dy"),
+                ((116, 40), 0x8044_CEE2, "dx=76,dy=10 (3,1) U tie"),
+                ((154, 45), 0x8058_3C28, "dx=114,dy=15 (4,2) V tie"),
+                ((78, 60), 0x8044_2828, "dx=38,dy=30 (2,2) U&V tie"),
+                ((116, 90), 0x801C_3C3C, "dx=76,dy=60 (4,4) U&V tie"),
+                ((62, 40), 0x80DA_1EEC, "dx=22,dy=10 (1,0) +2/190 near-int"),
+            ],
+        );
+
+        check_probe(
+            "gs_probes/19_tex_tri_dyadic",
+            "../../tests/gs_probes/19_tex_tri_dyadic.gsp",
+            &[
+                ((40, 30), 0x8018_1414, "dx=0,dy=0 (0,0)"),
+                ((41, 30), 0x80E3_19EC, "dx=1,dy=0 (1,0)"),
+                ((40, 31), 0x80E3_EC19, "dx=0,dy=1 (0,1)"),
+                ((45, 34), 0x80BB_2DD8, "dx=5,dy=4 (5,4)"),
+                ((47, 37), 0x805E_C9C9, "dx=7,dy=7 (7,7)"),
+            ],
+        );
     }
 }
